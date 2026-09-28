@@ -5,7 +5,7 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 在 ChatGPT 网页版（chatgpt.com）右侧添加一个 DeepSeek 风格的"对话导航 / 快速跳转"轨道：
 实时索引当前会话的全部用户提问，点击即平滑跳转，滚动时自动高亮当前正在阅读的问题。
 
-全部处理在浏览器本地完成，**不上传、不存储、不泄露任何聊天内容**。
+全部处理在浏览器本地完成，**不上传、不泄露任何聊天内容**；用户主动缓存的导航元数据仅保存在本机扩展存储中（见下文「Local conversation cache」）。
 
 ---
 
@@ -21,6 +21,7 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
   - 「加载全部历史」：受控向上滚动渐进收获历史（有超时/迭代上限，结束恢复阅读位置）
   - 点击未加载问题自动受控滚动查找（recover），失败安全回退
 - 目录内搜索（大小写不敏感子串匹配）
+- ⚡ Cached conversation navigation：为选定的会话主动缓存导航元数据，重新打开时目录立即出现（ChatGPT 历史在后台继续加载，TurnRail 自动与真实 DOM 调和绑定）
 - 深浅色自动跟随 ChatGPT / 系统
 - 无障碍：rail 为 navigation 语义、每个 marker 是带 aria-label 的按钮、面板支持键盘焦点与 Esc 关闭
 
@@ -37,7 +38,7 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 - `https://chatgpt.com/*`
 - `https://www.chatgpt.com/*`
 
-不申请 `<all_urls>`，未申请任何额外权限（无 storage / tabs / cookies / webRequest 等）。
+不申请 `<all_urls>`，仅申请 `storage` 权限（本地保存用户主动缓存的导航元数据；未申请 tabs / cookies / webRequest 等）。
 
 ## Development
 
@@ -45,6 +46,7 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 npm install
 npm run dev       # watch 模式构建（输出到 dist/）
 npm run typecheck # TypeScript strict 检查
+npm test          # Node 单元测试（18 项，无需浏览器）
 ```
 
 修改代码后，在 `chrome://extensions/` 中点击扩展的「重新加载」，再刷新 ChatGPT 页面。
@@ -80,9 +82,11 @@ MutationObserver      ScrollSpy (navigation/scrollSpy.ts)
     └──────────┬───────────┘
                ▼
         ConversationStore (conversation/store.ts)
-               │
-               ▼
-        Navigation UI (ui/, 全部位于 Shadow DOM)
+               │                │
+               ▼                ▼
+        Navigation UI      Cache 服务 (cache/)
+        (ui/, Shadow DOM)  serialize → hydrate → reconcile
+                           落地 chrome.storage.local
         ┌─────┴─────┐
         ▼           ▼
     marker rail   outline panel
@@ -105,15 +109,40 @@ MutationObserver      ScrollSpy (navigation/scrollSpy.ts)
 | `navigation/scrollAnchor.ts` | 阅读位置锚点的捕获/恢复 |
 | `ui/createShadowRoot.ts` | Shadow DOM host、rail+panel 编排、hover/pin、主题跟随 |
 | `ui/rail.ts` / `ui/outline.ts` / `ui/styles.ts` | 轨道 marker、目录面板、全部样式 |
-| `content/main.ts` / `bootstrap.ts` / `routeWatcher.ts` / `observers.ts` | 入口与生命周期、SPA 路由检测、DOM 观察器 |
+| `cache/types.ts` / `validate.ts` | 缓存 schema（CachedConversation DTO）与全部入读校验（损坏 / 未来版本 → 忽略） |
+| `cache/serializer.ts` / `hydrator.ts` | Runtime Store ↔ 缓存 DTO 显式双向转换（纯数据，无 DOM 依赖） |
+| `cache/reconciler.ts` | 缓存与 Live 零重叠时的 stale 判定（分支切换防护） |
+| `cache/cacheStore.ts` | chrome.storage.local 持久层（索引 + 全链路容错，失败即 Live-only） |
+| `content/main.ts` / `bootstrap.ts` / `routeWatcher.ts` / `observers.ts` | 入口与生命周期、SPA 路由检测、DOM 观察器、缓存桥接 |
+
+## Local conversation cache
+
+TurnRail 支持由用户**主动**缓存所选会话的导航元数据（面板头部 ☆/★ 按钮）：
+重新打开已缓存的长会话时，导航目录立即出现，无需等待 ChatGPT 完整挂载全部历史 DOM；
+随后 TurnRail 在后台与真实 DOM 调和（Reconcile），以 Live 数据为准自动绑定。
+
+**缓存内容**（仅导航元数据）：turn 稳定 ID 与顺序、问题标题（本地截断 ≤60 字符）、
+短 preview（本地截断 ≤160 字符）。
+
+**不缓存**：assistant 回答正文 / Markdown、页面 HTML、图片、附件、完整 prompt 全文。
+
+**complete 标记**：仅当「加载全部历史」确认到达顶部（无更多历史）后重写缓存才置 true；
+自然打开会话产生的缓存始终为 partial（目录只含已加载部分的 turn）。
+
+存储位置：`chrome.storage.local`（key：`turnrail:conversation:chatgpt:<conversationId>`）。
+所有数据保存在本机浏览器内，**TurnRail 不上传任何缓存数据**。缓存永远只是加速层：
+损坏或版本不符的缓存会被忽略并回退 Live 重建，任何缓存失败都不影响 TurnRail 正常工作。
 
 ## Privacy
 
+TurnRail runs locally in your browser.
+
 - 所有索引、标题、搜索全部在页面本地内存中完成
-- 不发送任何网络请求，不集成任何统计/遥测
-- 不写入 `chrome.storage`（V1 仅内存存储）
+- 不发送任何网络请求，不集成任何统计/遥测，无任何后端
+- 用户主动缓存的导航元数据使用 `chrome.storage.local` 本地保存；TurnRail 不上传缓存数据
+- 缓存只含导航元数据（turn ID / 顺序 / 标题 / 短 preview），绝不含回答正文、HTML 或附件
 - 聊天正文仅以 `textContent` 渲染进 Shadow DOM，绝不作为 HTML 注入（防 XSS）
-- Manifest 未申请任何 API 权限，仅有 content script 匹配两条 host
+- Manifest 仅申请 `storage` 权限 + content script 匹配两条 host
 
 ## How message detection works（selector 策略）
 
@@ -164,7 +193,10 @@ MutationObserver      ScrollSpy (navigation/scrollSpy.ts)
 - 无原生 ID（`data-turn-key` / `data-chatgpt-search-message-ids` 均缺失）时，完全相同文本的问题
   在虚拟化滚动时可能出现序号漂移（ID 重新分配），目录顺序可能短暂重排。
 - 分支切换靠启发式检测（"大量卸载 + 大量全新 id"同时出现时重置离线索引），极端场景可能残留少量"未加载"条目。
-- 未实现（ roadmap）：书签/重命名、快捷键（Alt+↑/↓、Alt+J）、设置面板、Claude/Gemini/DeepSeek 支持、导出目录。
+- 导航缓存只让"已见过的 turn"提前可见：缓存无法凭空提供未加载过的历史；partial 缓存在发现更多 turn 前保持 partial。
+- 缓存的分支 / edit / regenerate 行为是 best-effort：Live 与缓存零重叠（判定为另一分支）时丢弃缓存 turn 并以 Live 重建。
+- v1.2（性能，roadmap）：document_end 注入、MutationObserver 范围收窄、增量 dirty-turn 扫描、流式输出过滤、虚拟 marker 列表；缓存 LRU 自动清理（v1.3）。
+- 未实现（roadmap）：书签/重命名、快捷键（Alt+↑/↓、Alt+J）、设置面板、Claude/Gemini/DeepSeek 支持、导出目录。
 - 已在 Chrome 114+ 目标下验证；未测其他 Chromium 分支。
 
 ## Troubleshooting
@@ -178,6 +210,10 @@ MutationObserver      ScrollSpy (navigation/scrollSpy.ts)
 
 ## 测试
 
+- `test/unit/`：Node 原生 runner（`npm test`）的 18 项单元测试 —— serialize 纯净性、
+  缓存校验（合法 / 损坏 / 未来 schema）、hydrate、缓存×Live reconcile（保序 + Live 胜出 + 不重复）、
+  route 竞态隔离、stale 判定与清理、CacheStore 索引 / 清除 / touch、storage 失败降级 Live-only、
+  live→cache→hydrate 端到端往返。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
