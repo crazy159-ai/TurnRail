@@ -1,7 +1,7 @@
 import { collapseWhitespace } from '../utils/dom'
 import { debugLog } from '../utils/logger'
 import { fnv1a } from '../conversation/stableId'
-import type { ChatProvider, LocatedMessage, LocatedTurn, ProviderRole } from './types'
+import type { ChatProvider, LocatedMessage, LocatedTurn, LocatedTurnRoot, ProviderRole } from './types'
 
 /**
  * 2026-09 真实 chatgpt.com DOM 的正式 selector（已由 DevTools 诊断验证）。
@@ -114,6 +114,96 @@ export class ChatGptProvider implements ChatProvider {
     return this.getConversationRoot() !== null
   }
 
+  /** 廉价定位：仅收集 turn root（原生顺序 → 按视觉顺序规整），不做正文提取 */
+  locateTurnRoots(): LocatedTurnRoot[] {
+    const root = this.getConversationRoot()
+    if (!root) return []
+    const turnRoots = Array.from(root.querySelectorAll<HTMLElement>(SELECTORS.turn)).filter((n) => n.isConnected)
+    const located: LocatedTurnRoot[] = turnRoots.map((el) => ({
+      id: el.getAttribute('data-turn-key')?.trim() || null,
+      root: el
+    }))
+    // 顺序规整：column-reverse 布局下 DOM 顺序可能与视觉顺序相反。
+    // 用首尾 turn 的视口位置判定，保证输出恒为"视觉从上到下"（时间从旧到新），
+    // 使 Q 编号 / scrollSpy / 恢复方向在两种布局下语义一致。
+    if (located.length >= 2) {
+      const firstTop = located[0]!.root.getBoundingClientRect().top
+      const lastTop = located[located.length - 1]!.root.getBoundingClientRect().top
+      if (firstTop > lastTop) located.reverse()
+    }
+    return located
+  }
+
+  /**
+   * 单 turn 解析：full scan 与 incremental scan 共用的唯一 parser（禁止复制解析逻辑）。
+   * includeText=false 时只绑定元素 / 读取 ID（跳过 cloneNode + innerText 的文本提取），
+   * 供增量路径对"已知 turn 重挂载"做轻量重绑。
+   */
+  parseTurn(turnRoot: HTMLElement, options?: { includeText?: boolean; positionHint?: number }): LocatedTurn | null {
+    const includeText = options?.includeText !== false
+    const index = options?.positionHint ?? 0
+    const nativeId = turnRoot.getAttribute('data-turn-key')?.trim() || null
+
+    // user unit：不依赖 "fallback-turn-N:0:user" 中的数字，只匹配 ":user" 后缀
+    const userUnit =
+      turnRoot.querySelector<HTMLElement>(SELECTORS.userUnit) ??
+      turnRoot.querySelector<HTMLElement>(SELECTORS.userUnitFallback)
+    // assistant unit：同理只匹配 ":assistant" 后缀
+    const assistantUnit =
+      turnRoot.querySelector<HTMLElement>(SELECTORS.assistantUnit) ??
+      turnRoot.querySelector<HTMLElement>(SELECTORS.assistantUnitFallback)
+
+    if (!userUnit && !assistantUnit) return null
+
+    // user 正文：markdown 语气节点 → 气泡 → 整个 unit
+    const userContent = userUnit
+      ? (userUnit.querySelector<HTMLElement>(SELECTORS.userMarkdown) ??
+        userUnit.querySelector<HTMLElement>(SELECTORS.userBubble) ??
+        userUnit)
+      : null
+    const userText = userContent && includeText ? extractCleanText(userContent) : ''
+
+    // assistant 正文：markdown 样式节点 → 整个 unit
+    // 注意 [data-conversation-role="assistant"] 是 sr-only H4，不作正文与滚动目标
+    const assistantContent = assistantUnit
+      ? (assistantUnit.querySelector<HTMLElement>(SELECTORS.assistantMarkdown) ?? assistantUnit)
+      : null
+    const assistantText = assistantContent && includeText ? extractCleanText(assistantContent) : ''
+
+    const userMessageId = userUnit ? this.getUserMessageId(userUnit, nativeId ?? '') : null
+    const assistantMessageId = assistantUnit ? this.getAssistantMessageId(assistantUnit) : undefined
+
+    // Turn 稳定 ID：优先 data-turn-key 原生 UUID；仅缺失时才 fallback
+    let turnId = nativeId ?? userMessageId
+    if (!turnId) {
+      turnId = userText ? `hash-${fnv1a('turn\u0000' + userText)}` : `turn-pos-${index}`
+    }
+
+    const user: LocatedMessage | undefined = userUnit
+      ? {
+          role: 'user',
+          text: userText,
+          // 导航/跳转目标是 userUnit 本身，而不是 markdown 内部某个 p
+          element: userUnit,
+          turnContainer: turnRoot,
+          externalId: userMessageId ?? turnId
+        }
+      : undefined
+
+    const assistant: LocatedMessage | undefined = assistantUnit
+      ? {
+          role: 'assistant',
+          text: assistantText,
+          element: assistantUnit,
+          turnContainer: turnRoot,
+          externalId: assistantMessageId ?? null
+        }
+      : undefined
+
+    return { id: turnId, root: turnRoot, user, assistant }
+  }
+
+  /** 主路径：按 conversation root → [data-turn-key] 解析全部 turn（full scan 用） */
   locateTurns(): LocatedTurn[] {
     const root = this.getConversationRoot()
     if (!root) {
@@ -121,81 +211,12 @@ export class ChatGptProvider implements ChatProvider {
       this.lastLocatedCount = 0
       return []
     }
-    const turnRoots = Array.from(root.querySelectorAll<HTMLElement>(SELECTORS.turn)).filter((n) => n.isConnected)
+    const located = this.locateTurnRoots()
     const turns: LocatedTurn[] = []
-
-    for (let index = 0; index < turnRoots.length; index++) {
-      const turnRoot = turnRoots[index]!
-      const nativeId = turnRoot.getAttribute('data-turn-key')?.trim() || null
-
-      // user unit：不依赖 "fallback-turn-N:0:user" 中的数字，只匹配 ":user" 后缀
-      const userUnit =
-        turnRoot.querySelector<HTMLElement>(SELECTORS.userUnit) ??
-        turnRoot.querySelector<HTMLElement>(SELECTORS.userUnitFallback)
-      // assistant unit：同理只匹配 ":assistant" 后缀
-      const assistantUnit =
-        turnRoot.querySelector<HTMLElement>(SELECTORS.assistantUnit) ??
-        turnRoot.querySelector<HTMLElement>(SELECTORS.assistantUnitFallback)
-
-      if (!userUnit && !assistantUnit) continue
-
-      // user 正文：markdown 语气节点 → 气泡 → 整个 unit
-      const userContent = userUnit
-        ? (userUnit.querySelector<HTMLElement>(SELECTORS.userMarkdown) ??
-          userUnit.querySelector<HTMLElement>(SELECTORS.userBubble) ??
-          userUnit)
-        : null
-      const userText = userContent ? extractCleanText(userContent) : ''
-
-      // assistant 正文：markdown 样式节点 → 整个 unit
-      // 注意 [data-conversation-role="assistant"] 是 sr-only H4，不作正文与滚动目标
-      const assistantContent = assistantUnit
-        ? (assistantUnit.querySelector<HTMLElement>(SELECTORS.assistantMarkdown) ?? assistantUnit)
-        : null
-      const assistantText = assistantContent ? extractCleanText(assistantContent) : ''
-
-      const userMessageId = userUnit ? this.getUserMessageId(userUnit, nativeId ?? '') : null
-      const assistantMessageId = assistantUnit ? this.getAssistantMessageId(assistantUnit) : undefined
-
-      // Turn 稳定 ID：优先 data-turn-key 原生 UUID；仅缺失时才 fallback
-      let turnId = nativeId ?? userMessageId
-      if (!turnId) {
-        turnId = userText ? `hash-${fnv1a('turn\u0000' + userText)}` : `turn-pos-${index}`
-      }
-
-      const user: LocatedMessage | undefined = userUnit
-        ? {
-            role: 'user',
-            text: userText,
-            // 导航/跳转目标是 userUnit 本身，而不是 markdown 内部某个 p
-            element: userUnit,
-            turnContainer: turnRoot,
-            externalId: userMessageId ?? turnId
-          }
-        : undefined
-
-      const assistant: LocatedMessage | undefined = assistantUnit
-        ? {
-            role: 'assistant',
-            text: assistantText,
-            element: assistantUnit,
-            turnContainer: turnRoot,
-            externalId: assistantMessageId ?? null
-          }
-        : undefined
-
-      turns.push({ id: turnId, root: turnRoot, user, assistant })
+    for (let index = 0; index < located.length; index++) {
+      const turn = this.parseTurn(located[index]!.root, { includeText: true, positionHint: index })
+      if (turn) turns.push(turn)
     }
-
-    // 顺序规整：column-reverse 布局下 DOM 顺序可能与视觉顺序相反。
-    // 用首尾 turn 的视口位置判定，保证输出恒为"视觉从上到下"（时间从旧到新），
-    // 使 Q 编号 / scrollSpy / 恢复方向在两种布局下语义一致。
-    if (turns.length >= 2) {
-      const firstTop = turns[0]!.root.getBoundingClientRect().top
-      const lastTop = turns[turns.length - 1]!.root.getBoundingClientRect().top
-      if (firstTop > lastTop) turns.reverse()
-    }
-
     this.lastStrategyLabel = 'turn-first'
     this.lastLocatedCount = turns.length
     return turns

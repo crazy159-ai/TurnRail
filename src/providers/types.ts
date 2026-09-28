@@ -24,6 +24,15 @@ export interface LocatedTurn {
 }
 
 /**
+ * 廉价定位结果：只含 turn root 与原生 id（不做正文提取）。
+ * id 为 null 表示该 DOM 缺少 data-turn-key（legacy DOM），增量扫描应回退 full scan。
+ */
+export interface LocatedTurnRoot {
+  id: string | null
+  root: HTMLElement
+}
+
+/**
  * 站点适配层：所有"针对 ChatGPT DOM 的查询"必须集中在这里，
  * 其余模块只依赖本接口。站点改版时只改这个实现。
  */
@@ -32,6 +41,19 @@ export interface ChatProvider {
 
   /** 主路径：按 conversation root → [data-turn-key] 解析 turn */
   locateTurns(): LocatedTurn[]
+
+  /** 廉价定位：turn root 列表（已按视觉顺序规整），不做正文提取（增量扫描用） */
+  locateTurnRoots(): LocatedTurnRoot[]
+
+  /**
+   * 单 turn 解析：full 与 incremental 共用的唯一 parser。
+   * includeText=false 时仅绑定元素 / 读取 ID（跳过 cloneNode+innerText），
+   * 供增量路径对已知 turn 的重挂载做轻量重绑。
+   */
+  parseTurn(
+    turnRoot: HTMLElement,
+    options?: { includeText?: boolean; positionHint?: number }
+  ): LocatedTurn | null
 
   /** Legacy fallback：旧 DOM 的消息流式定位 */
   locateMessages(): LocatedMessage[]
