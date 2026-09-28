@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>真实 DOM Fixture — TurnRail 单元验收</title>
+<script>
+  // 在 content.js 执行前开启 DEBUG（模块加载时求值），以暴露 __tn 调试钩子
+  localStorage.setItem('tn-debug', '1')
+</script>
+<style>
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; padding: 24px; background: #fff; color: #0d0d0d; }
+  #results { margin-top: 20px; font-family: Consolas, monospace; font-size: 13px; }
+  .pass { color: #0a8f6f; }
+  .fail { color: #c0392b; }
+  [data-user-message-bubble] { background: #f4f4f4; border-radius: 10px; padding: 8px 12px; width: fit-content; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<h3>真实 DOM 最小 Fixture（按 2026-09 诊断结构）</h3>
+
+<!-- 按 spec 第十九节构建的最小真实结构 -->
+<div data-thread-find-target="conversation">
+  <div data-turn-key="user-id-1">
+    <div data-content-search-turn-key="fallback-turn-2">
+
+      <div
+        data-chatgpt-search-unit-key="fallback-turn-2:0:user"
+        data-chatgpt-search-message-ids="user-id-1"
+      >
+        <div data-user-message-bubble="true">
+          <div data-markdown-text-tone="user-message">Hello</div>
+        </div>
+      </div>
+
+      <div
+        data-chatgpt-search-unit-key="fallback-turn-2:2:assistant"
+        data-chatgpt-search-message-ids="assistant-id-1 assistant-id-1"
+      >
+        <h4 data-conversation-role="assistant" class="sr-only">Assistant</h4>
+        <div data-chatgpt-selection-message-id="assistant-id-1">
+          <div data-markdown-text-style="assistant-message">Hi</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div id="results">running…</div>
+
+<script src="/dist/content.js"></script>
+<script>
+  // 等扩展首扫完成（bootstrap 立即扫描 + 重试），然后运行断言
+  setTimeout(() => {
+    const tn = globalThis.__tn
+    const out = document.getElementById('results')
+    if (!tn) {
+      out.innerHTML = '<span class="fail">FAIL: __tn 调试钩子不存在（tn-debug 未生效或扩展未加载）</span>'
+      window.__fixture = { ok: false, reason: 'no-hook' }
+      return
+    }
+    const turns = tn.store.turns
+    const t = turns[0]
+    const checks = [
+      ['turns.length === 1', turns.length === 1, String(turns.length)],
+      ['turn.id === "user-id-1"', t?.id === 'user-id-1', String(t?.id)],
+      ['turn.user.id === "user-id-1"', t?.user?.id === 'user-id-1', String(t?.user?.id)],
+      ['turn.user.text === "Hello"', t?.user?.text === 'Hello', JSON.stringify(t?.user?.text)],
+      ['turn.assistant.id === "assistant-id-1"', t?.assistant?.id === 'assistant-id-1', String(t?.assistant?.id)],
+      ['turn.assistant.text === "Hi"', t?.assistant?.text === 'Hi', JSON.stringify(t?.assistant?.text)]
+    ]
+    const allPass = checks.every(([, ok]) => ok)
+    out.innerHTML = checks
+      .map(([label, ok, got]) => `<div class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}  ${label}${ok ? '' : '  got=' + got}</div>`)
+      .join('')
+    window.__fixture = { ok: allPass, checks }
+  }, 1500)
+</script>
+</body>
+</html>

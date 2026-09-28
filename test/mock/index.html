@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>ChatGPT Mock 2026-09 — TurnRail 测试台</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; display: flex; background: #ffffff; color: #0d0d0d; }
+  body.dark { background: #212121; color: #ececec; }
+  aside {
+    width: 240px; flex: none; border-right: 1px solid rgba(0,0,0,.08); padding: 12px;
+    display: flex; flex-direction: column; gap: 8px; background: #f9f9f9;
+  }
+  body.dark aside { background: #171717; border-right-color: rgba(255,255,255,.08); }
+  aside button { text-align: left; padding: 8px 10px; border-radius: 8px; border: 0; background: transparent; cursor: pointer; color: inherit; font-size: 13px; }
+  aside button:hover { background: rgba(0,0,0,.06); }
+  body.dark aside button:hover { background: rgba(255,255,255,.08); }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  header {
+    height: 52px; flex: none; position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; padding: 0 24px; font-weight: 600;
+    background: rgba(255,255,255,.85); border-bottom: 1px solid rgba(0,0,0,.06);
+  }
+  body.dark header { background: rgba(33,33,33,.85); border-bottom-color: rgba(255,255,255,.08); }
+  #scroller { flex: 1; overflow-y: auto; padding: 8px 0 120px; }
+  #thread { max-width: 760px; margin: 0 auto; padding: 0 24px; display: flex; flex-direction: column; gap: 18px; }
+  [data-turn-key] { border-radius: 14px; }
+  [data-user-message-bubble] {
+    background: #f4f4f4; border-radius: 14px; padding: 10px 16px; margin-left: auto;
+    max-width: 70%; width: fit-content;
+  }
+  body.dark [data-user-message-bubble] { background: #2f2f2f; }
+  [data-thread-find-skip] { font-size: 11px; opacity: .5; margin-top: 6px; }
+  [data-markdown-text-style="assistant-message"] p { margin: 0.4em 0; }
+  [data-markdown-text-tone="user-message"] { white-space: pre-wrap; word-break: break-word; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  #toolbar {
+    position: fixed; left: 250px; top: 8px; z-index: 500; display: flex; flex-wrap: wrap; gap: 6px;
+    background: rgba(20,90,70,.08); border: 1px solid rgba(16,163,127,.35); padding: 6px; border-radius: 10px;
+  }
+  body.dark #toolbar { background: rgba(16,163,127,.12); }
+  #toolbar button { font-size: 12px; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(16,163,127,.4); background: #fff; cursor: pointer; }
+  body.dark #toolbar button { background: #2f2f2f; color: #ececec; }
+  #route { position: fixed; left: 250px; bottom: 8px; z-index: 500; font-size: 11px; opacity: .6; }
+</style>
+</head>
+<body>
+<aside>
+  <strong style="font-size:13px">ChatGPT Mock（2026-09 真实 DOM）</strong>
+  <button data-act="conv-a">会话 A（/c/mock-aaaa…）</button>
+  <button data-act="conv-b">会话 B（/c/mock-bbbb…）</button>
+  <button data-act="home">首页路由（/）</button>
+</aside>
+<main>
+  <header id="topbar">ChatGPT Mock — sticky header</header>
+  <div id="scroller" data-app-action-timeline-scroll class="overflow-y-auto">
+    <div id="thread" data-thread-find-target="conversation"></div>
+  </div>
+</main>
+<div id="toolbar">
+  <button data-act="add1">+1 轮</button>
+  <button data-act="stream">发送并流式回复</button>
+  <button data-act="add8">+8 轮</button>
+  <button data-act="add60">+60 轮</button>
+  <button data-act="add150-dup">+150 轮（含重复“继续”）</button>
+  <button data-act="prepend10">向上懒加载 10 轮</button>
+  <button data-act="virt-on">开启虚拟化卸载</button>
+  <button data-act="virt-off">关闭虚拟化</button>
+  <button data-act="theme">深/浅色切换</button>
+  <button data-act="clear">清空会话</button>
+</div>
+<div id="route">route: /</div>
+
+<script src="/dist/content.js"></script>
+<script>
+  // 全局错误计数（测试用）
+  window.__tnErrCount = 0
+  window.addEventListener('error', () => { window.__tnErrCount++ })
+  window.addEventListener('unhandledrejection', () => { window.__tnErrCount++ })
+
+  // ================= 模拟 2026-09 真实 ChatGPT DOM =================
+  const scroller = document.getElementById('scroller')
+  const thread = document.getElementById('thread')
+  const routeLabel = document.getElementById('route')
+  let turnCounter = 0
+  let uuidCounter = 0
+  let turnSeq = [] // { root, userText, assistantText, p }
+
+  function uuid(prefix) {
+    uuidCounter++
+    return `${prefix}-${uuidCounter.toString().padStart(4, '0')}-${Math.random().toString(36).slice(2, 8)}`
+  }
+
+  // 构建单个真实结构 turn：
+  // [data-turn-key] > [data-content-search-turn-key] > (user unit + assistant unit)
+  function makeTurn(userText, assistantText) {
+    turnCounter++
+    const userUuid = uuid('user')
+    const assistantUuid = uuid('assistant')
+
+    const turnRoot = document.createElement('div')
+    turnRoot.dataset.turnKey = userUuid
+
+    const inner = document.createElement('div')
+    inner.dataset.contentSearchTurnKey = `fallback-turn-${turnCounter}`
+
+    // ---- user unit（序号 0，但不依赖数字）----
+    const userUnit = document.createElement('div')
+    userUnit.dataset.chatgptSearchUnitKey = `fallback-turn-${turnCounter}:0:user`
+    userUnit.dataset.chatgptSearchMessageIds = userUuid
+    const bubble = document.createElement('div')
+    bubble.dataset.userMessageBubble = 'true'
+    const userMd = document.createElement('div')
+    userMd.dataset.markdownTextTone = 'user-message'
+    userMd.textContent = userText
+    bubble.appendChild(userMd)
+    // 每 4 轮注入一个站点 UI 噪声节点（data-thread-find-skip），验证正文清理
+    if (turnCounter % 4 === 0) {
+      const skip = document.createElement('div')
+      skip.dataset.threadFindSkip = 'true'
+      skip.textContent = '[编辑/复制按钮 UI 噪声]'
+      bubble.appendChild(skip)
+    }
+    userUnit.appendChild(bubble)
+
+    // ---- assistant unit（序号 2，但不依赖数字）----
+    const assistantUnit = document.createElement('div')
+    assistantUnit.dataset.chatgptSearchUnitKey = `fallback-turn-${turnCounter}:2:assistant`
+    assistantUnit.dataset.chatgptSearchMessageIds = `${assistantUuid} ${assistantUuid}`
+    const h4 = document.createElement('h4')
+    h4.dataset.conversationRole = 'assistant'
+    h4.className = 'sr-only'
+    h4.textContent = 'Assistant'
+    const selection = document.createElement('div')
+    selection.dataset.chatgptSelectionMessageId = assistantUuid
+    const assistantMd = document.createElement('div')
+    assistantMd.dataset.markdownTextStyle = 'assistant-message'
+    const p = document.createElement('p')
+    p.textContent = assistantText
+    assistantMd.appendChild(p)
+    selection.appendChild(assistantMd)
+    assistantUnit.append(h4, selection)
+
+    inner.append(userUnit, assistantUnit)
+    turnRoot.appendChild(inner)
+    return { root: turnRoot, userText, assistantText, p }
+  }
+
+  function appendTurn(userText, assistantText) {
+    const item = makeTurn(userText, assistantText)
+    thread.appendChild(item.root)
+    turnSeq.push(item)
+  }
+
+  function questionText(i) {
+    const samples = [
+      '请详细解释简支桥梁 PINN 边界条件如何处理？',
+      '两个网络分别训练还是联合训练效果更好？',
+      '有没有相关论文推荐？最好 2024 年之后的',
+      '理论推导部分可以再详细一点吗',
+      '这个方法的创新点到底是什么',
+      '损失函数权重应该如何设置',
+      '帮我写一段数据预处理的 Python 代码',
+      '训练不收敛可能是什么原因'
+    ]
+    return `Q${i}: ${samples[i % samples.length]}（第 ${i} 次提问）`
+  }
+
+  function addTurns(n, offset = 0, duplicateText = null) {
+    const frag = document.createDocumentFragment()
+    for (let i = 0; i < n; i++) {
+      const text = duplicateText !== null && i % 5 === 2 ? duplicateText : questionText(offset + i + 1)
+      const item = makeTurn(text, `这是对「${text.slice(0, 24)}…」的模拟回复，内容若干。`)
+      frag.appendChild(item.root)
+      turnSeq.push(item)
+    }
+    thread.appendChild(frag)
+  }
+
+  function clearThread() {
+    thread.textContent = ''
+    turnSeq = []
+    turnCounter = 0
+  }
+
+  // ================= 流式回复模拟 =================
+  let streamingTimer = 0
+  function simulateStreaming() {
+    const text = '这是正在流式生成的模拟回复，每隔几十毫秒追加一个词。'.repeat(3)
+    const item = makeTurn(`流式测试问题 ${turnCounter + 1}`, '')
+    thread.appendChild(item.root)
+    turnSeq.push(item)
+    const p = item.root.querySelector('[data-markdown-text-style="assistant-message"] p')
+    let i = 0
+    clearInterval(streamingTimer)
+    streamingTimer = setInterval(() => {
+      if (i >= text.length) return clearInterval(streamingTimer)
+      p.textContent += text[i++]
+      scroller.scrollTop = scroller.scrollHeight
+    }, 45)
+  }
+
+  // ================= 懒加载历史（prepend）模拟 =================
+  function prependHistory(n) {
+    const before = scroller.scrollHeight
+    const frag = document.createDocumentFragment()
+    for (let i = 0; i < n; i++) {
+      const item = makeTurn(`（历史）H${n - i}: 很久以前提出的问题 ${n - i}`, `（历史回复 ${n - i}）`)
+      turnSeq.unshift(item)
+      frag.appendChild(item.root)
+    }
+    thread.prepend(frag)
+    // 保持视口位置（模拟 ChatGPT 的 scroll anchoring）
+    scroller.scrollTop += scroller.scrollHeight - before
+  }
+
+  // ================= 虚拟化卸载模拟（按 turn root 卸载）=================
+  let virtTimer = 0
+  function applyVirtualization() {
+    if (turnSeq.length === 0) return
+    const total = turnSeq.length
+    const ratio = scroller.scrollHeight > scroller.clientHeight
+      ? scroller.scrollTop / (scroller.scrollHeight - scroller.clientHeight)
+      : 0
+    const center = Math.round(ratio * (total - 1))
+    const start = Math.max(0, center - 40)
+    const end = Math.min(total, center + 40)
+    const mountedCount = turnSeq.filter((it) => it.root.isConnected).length
+    if (mountedCount !== end - start) {
+      thread.textContent = ''
+      for (let i = start; i < end; i++) thread.appendChild(turnSeq[i].root)
+      const newRatio = (center + 0.5) / total
+      scroller.scrollTop = newRatio * Math.max(1, scroller.scrollHeight - scroller.clientHeight)
+    }
+  }
+  function setVirtualization(on) {
+    if (virtTimer) { clearInterval(virtTimer); virtTimer = 0 }
+    if (on) virtTimer = setInterval(applyVirtualization, 250)
+    applyVirtualization()
+  }
+
+  // ================= 会话路由模拟 =================
+  function setRoute(path) {
+    history.pushState(null, '', path)
+    routeLabel.textContent = 'route: ' + path
+  }
+  function loadConversationA() {
+    clearThread()
+    addTurns(12)
+  }
+  function loadConversationB() {
+    clearThread()
+    addTurns(8, 100)
+  }
+
+  document.body.addEventListener('click', (event) => {
+    const act = event.target?.dataset?.act
+    if (!act) return
+    switch (act) {
+      case 'conv-a': setRoute('/c/mock-aaaa-1111-4444'); loadConversationA(); break
+      case 'conv-b': setRoute('/c/mock-bbbb-2222-4444'); loadConversationB(); break
+      case 'home': setRoute('/'); clearThread(); break
+      case 'add1': addTurns(1, turnSeq.length); break
+      case 'stream': simulateStreaming(); break
+      case 'add8': addTurns(8, turnSeq.length); break
+      case 'add60': addTurns(60, turnSeq.length); break
+      case 'add150-dup': addTurns(150, turnSeq.length, '继续'); break
+      case 'prepend10': prependHistory(10); break
+      case 'virt-on': setVirtualization(true); break
+      case 'virt-off': setVirtualization(false); break
+      case 'theme': document.body.classList.toggle('dark'); break
+      case 'clear': clearThread(); break
+    }
+  })
+
+  // 初始：模拟落在会话 A 路由
+  history.replaceState(null, '', '/c/mock-aaaa-1111-4444')
+  routeLabel.textContent = 'route: /c/mock-aaaa-1111-4444'
+  loadConversationA()
+</script>
+</body>
+</html>
