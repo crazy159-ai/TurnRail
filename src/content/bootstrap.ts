@@ -1,4 +1,4 @@
-import { ChatGptProvider } from '../providers/chatgpt'
+import { ChatGptProvider, SELECTORS } from '../providers/chatgpt'
 import { ConversationStore } from '../conversation/store'
 import { ConversationIndexer } from '../conversation/indexer'
 import { captureFullHistory, isCaptureRunning } from '../conversation/historyCapture'
@@ -6,8 +6,11 @@ import { ScrollSpy } from '../navigation/scrollSpy'
 import { jumpToTurn } from '../navigation/jump'
 import { isRecoverRunning, recoverAndJump, getRecoverLog } from '../navigation/recoverTarget'
 import { createNavigationUi } from '../ui/createShadowRoot'
-import { startDomObserver } from './observers'
+import { watchConversationRoot, observeConversationTurns } from './observers'
 import { createRouteWatcher } from './routeWatcher'
+import { createMutationPipeline } from './mutationPipeline'
+import { startStartupScan } from './startupScan'
+import { perf } from '../utils/performance'
 import { isAtVisualBottom, isAtVisualTop, getScrollBounds } from '../navigation/scrollGeometry'
 import { DEBUG, reportError } from '../utils/logger'
 import { debounce } from '../utils/debounce'
@@ -26,6 +29,7 @@ import { isLikelyStale } from '../cache/reconciler'
  * 原有 Live-only 行为，绝不影响 TurnRail 正常启动。
  */
 export function bootstrap(): void {
+  perf.reset()
   const provider = new ChatGptProvider()
   const store = new ConversationStore()
   const indexer = new ConversationIndexer(provider, store)
@@ -109,7 +113,9 @@ export function bootstrap(): void {
   async function loadCachedConversation(conversationId: string): Promise<void> {
     const gen = conversationGeneration
     try {
+      const readStart = performance.now()
       const cached = await cacheStore.get('chatgpt', conversationId)
+      perf.markCacheRead(performance.now() - readStart)
       if (gen !== conversationGeneration) return
       if (provider.getConversationId() !== conversationId) return
       if (!cached) {
@@ -128,6 +134,7 @@ export function bootstrap(): void {
         const hydrateStart = performance.now()
         hydrated = hydrateCachedConversation(store, cached)
         lastHydrateMs = performance.now() - hydrateStart
+        perf.markCacheHydrate(lastHydrateMs)
         if (hydrated > 0) {
           // 缓存命中：立即渲染目录（先于 ChatGPT 历史挂载），随后与已存在的 Live DOM 调和
           store.commit('structure')
@@ -165,10 +172,110 @@ export function bootstrap(): void {
     store.dropTurns(dropIds)
   }
 
+  // ---------- 两层 Observer + Mutation 管道（v1.2） ----------
+  // RootWatch 只管 conversation root 生命周期；Conversation Observer 只管 turn 生命周期。
+  // streaming 判定用 Store 元素身份比对（不依赖 id 关系），assistant 首次挂载不会被误忽略。
+  let activeRoot: HTMLElement | null = null
+  let stopConversationObserver: (() => void) | null = null
+  let stopRootWatch: (() => void) | null = null
+  let stopStartupScan: (() => void) | null = null
+
+  /** streaming / 流式输出导致的布局漂移 → 去抖 geometry refresh（不触发索引） */
+  const debouncedSpyRefresh = debounce(() => spy.refresh(), 300)
+
+  const pipeline = createMutationPipeline(
+    {
+      turnSelector: SELECTORS.turn,
+      assistantUnitSelectors: [SELECTORS.assistantUnit, SELECTORS.assistantUnitFallback],
+      // streaming 判定：target 位于 Store 中已挂载 assistant unit 内部（元素身份比对）。
+      // assistant 首次挂载时 Store 尚无绑定 → 不满足 → 走 dirty 路径，不会被误忽略（#23/#63）
+      isMountedAssistantTarget: (target) => {
+        for (const selector of [SELECTORS.assistantUnit, SELECTORS.assistantUnitFallback]) {
+          const unit = target.closest<HTMLElement>(selector)
+          if (!unit) continue
+          if (
+            store.turns.some(
+              (turn) => turn.assistant?.isMounted === true && turn.assistant.element === unit
+            )
+          ) {
+            return true
+          }
+        }
+        return false
+      }
+    },
+    {
+      onDirty: (roots) => {
+        // root 已断连（路由切换窗口内的迟到回调）→ 丢弃，防止 A 会话数据写入 B Store（#12/#67）
+        if (!activeRoot?.isConnected) return
+        indexer.scanDirty(roots)
+      },
+      onFullScan: () => {
+        if (!activeRoot?.isConnected) return
+        indexer.scan(true)
+      },
+      onAssistantStream: () => {
+        debouncedSpyRefresh()
+      }
+    }
+  )
+
+  function attachConversationObserver(root: HTMLElement): void {
+    stopConversationObserver?.()
+    activeRoot = root
+    perf.markRootDetected()
+    stopConversationObserver = observeConversationTurns(
+      root,
+      (records) => pipeline.handle(records),
+      handleRootLost
+    )
+    runStartupScan()
+  }
+
+  /** root 被替换 / 移除（未伴随路由变化的罕见情况）：重新发现 */
+  function handleRootLost(): void {
+    stopConversationObserver = null
+    activeRoot = null
+    startRootWatch()
+  }
+
+  function startRootWatch(): void {
+    stopRootWatch?.()
+    stopRootWatch = watchConversationRoot(provider, (root) => {
+      stopRootWatch = null
+      attachConversationObserver(root)
+    })
+  }
+
+  /** 启动扫描：立即 full scan + 稳定性退避重试（连续 2 次签名不变即停，交给 Observer） */
+  function runStartupScan(): void {
+    stopStartupScan?.()
+    const gen = conversationGeneration
+    indexer.scan(true)
+    if (provider.lastLocatedCount > 0) {
+      perf.markFirstLiveScan()
+      perf.markFirstLiveReconcile()
+    }
+    stopStartupScan = startStartupScan({
+      scan: () => {
+        if (gen !== conversationGeneration) return null
+        indexer.scan()
+        if (provider.lastLocatedCount > 0) perf.markFirstLiveScan()
+        return { turnCount: store.turns.length, lastTurnId: store.turns[store.turns.length - 1]?.id }
+      },
+      hasRoot: () => activeRoot !== null && activeRoot.isConnected,
+      onSettled: () => {
+        stopStartupScan = null
+      }
+    })
+  }
+
+
   // ---------- Store → UI / spy / 缓存自动保存 ----------
   store.onChange((kind) => {
     ui.syncFromStore(store, kind)
-    if (kind === 'structure' || kind === 'elements') spy.refresh()
+    if (kind === 'structure') spy.refresh()
+    else if (kind === 'elements') debouncedSpyRefresh()
     // 自动保存只在 turn 结构变化时调度：assistant 流式输出（text）不触发写盘
     if (kind === 'structure' && !hydrating) {
       checkCacheStaleness()
@@ -177,7 +284,6 @@ export function bootstrap(): void {
   })
 
   let routeEpoch = 0
-  let retryTimer = 0
 
   async function handleJump(turnId: string): Promise<void> {
     try {
@@ -282,11 +388,19 @@ export function bootstrap(): void {
     conversationGeneration++
     // 先 flush 旧会话的待写缓存：必须在 store.reset 之前序列化旧数据
     flushPendingSave()
-    window.clearInterval(retryTimer)
+    // 停止旧 root 的观察 / 发现 / 启动扫描（迟到回调不得写入新 Store，#12/#67）
+    stopStartupScan?.()
+    stopStartupScan = null
+    stopConversationObserver?.()
+    stopConversationObserver = null
+    stopRootWatch?.()
+    stopRootWatch = null
+    activeRoot = null
     const conversationId = provider.getConversationId()
     const key = conversationId ?? `local-${routeEpoch}`
 
     spy.stop()
+    debouncedSpyRefresh.cancel()
     provider.invalidateDomCache()
     store.reset(key)
     ui.handleReset()
@@ -296,14 +410,11 @@ export function bootstrap(): void {
     lastHydrateMs = null
     lastReconcileMs = null
 
-    // 立即扫描 + 短周期重试，覆盖 SPA 异步渲染
-    indexer.scan(true)
-    let attempts = 0
-    retryTimer = window.setInterval(() => {
-      attempts++
-      indexer.scan()
-      if (attempts >= 8) window.clearInterval(retryTimer)
-    }, 400)
+    // root 已存在 → 立即挂 scoped 观察器 + 稳定性退避扫描；
+    // 尚未挂载 → 短命 RootWatch 等待出现（cache-first 不受影响：缓存 hydrate 与 root 独立）
+    const root = provider.getConversationRoot()
+    if (root) attachConversationObserver(root)
+    else startRootWatch()
 
     // cache-first：缓存读取与 Live DOM 初始化并行；命中即在历史挂载前恢复目录
     if (conversationId && cacheStore.isAvailable()) {
@@ -311,11 +422,9 @@ export function bootstrap(): void {
     }
   }
 
-  const stopDomObserver = startDomObserver(() => indexer.scan())
   const stopRouteWatcher = createRouteWatcher(() => resetForRoute())
 
   resetForRoute()
-  void stopDomObserver
   void stopRouteWatcher
 
   // DEV 钩子：tn-debug=1 时暴露诊断信息（不含任何聊天正文）
@@ -337,6 +446,8 @@ export function bootstrap(): void {
           storeTurns: store.turns.length,
           markers: ui.host.shadowRoot?.querySelectorAll('.tn-marker').length ?? 0,
           providerMode: provider.lastStrategyLabel,
+          // 性能指标（TTFR / TTLR / full-vs-incremental / observer 分类；仅元数据）
+          performance: perf.snapshot(),
           // 导航缓存指标（只含元数据：命中 / 耗时 / 数量，绝无 prompt 或回答正文）
           cache: {
             ...cacheStore.getStats(),
@@ -361,7 +472,8 @@ export function bootstrap(): void {
       spy,
       indexer,
       cache: cacheStore,
-      recoverLog: getRecoverLog
+      recoverLog: getRecoverLog,
+      resetPerformanceStats: () => perf.reset()
     }
   }
 }
