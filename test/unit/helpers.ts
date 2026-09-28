@@ -72,6 +72,8 @@ export function fakeProvider(turns: LocatedTurn[]): ChatProvider {
     isConversationRoute: () => true,
     getScrollContainer: () => null,
     invalidateDomCache: () => {},
+    locateTurnRoots: () => turns.map((turn) => ({ id: turn.id, root: turn.root })),
+    parseTurn: (turnRoot: HTMLElement) => turns.find((turn) => turn.root === turnRoot) ?? null,
     lastStrategyLabel: 'test',
     lastLocatedCount: turns.length
   }
