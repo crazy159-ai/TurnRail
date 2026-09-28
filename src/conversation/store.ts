@@ -19,6 +19,12 @@ export class ConversationStore {
   lastVisibleKeys: string[] = []
   /** 已卸载但仍保留 metadata 的 turn */
   detached: DetachedTurn[] = []
+  /**
+   * 当前会话包含来自导航缓存的 hydrated turn：true 期间 Indexer 的持续空扫描
+   * 不清空 turns（缓存恢复的目录必须在 ChatGPT 历史挂载前存活）。
+   * 仅由 cache/hydrator 置位；路由重置或缓存确认 stale 时清除。
+   */
+  cacheHydrated = false
 
   private listeners = new Set<StoreListener>()
 
@@ -46,11 +52,35 @@ export class ConversationStore {
     this.visibleOrder = []
     this.lastVisibleKeys = []
     this.detached = []
+    this.cacheHydrated = false
     this.emit('structure')
   }
 
   getTurn(id: string): ConversationTurn | undefined {
     return this.turns.find((turn) => turn.id === id)
+  }
+
+  /** 按当前 turns 顺序重排 index（0..n-1）；供缓存 hydrate / 清理复用 */
+  reindexTurns(): void {
+    this.turns.forEach((turn, index) => {
+      turn.index = index
+      if (turn.user) turn.user.turnIndex = index
+      else if (turn.assistant) turn.assistant.turnIndex = index
+    })
+  }
+
+  /** 移除指定 id 的 turn（缓存确认 stale 时清理 hydrated turn），保持 index 连续并广播 */
+  dropTurns(ids: ReadonlySet<string>): void {
+    if (ids.size === 0) return
+    const next = this.turns.filter((turn) => !ids.has(turn.id))
+    if (next.length === this.turns.length) return
+    this.turns = next
+    this.detached = this.detached.filter((entry) => !ids.has(entry.turn.id))
+    this.reindexTurns()
+    if (this.activeTurnId && !next.some((turn) => turn.id === this.activeTurnId)) {
+      this.activeTurnId = undefined
+    }
+    this.emit('structure')
   }
 
   /** 已挂载（元素在文档中）的首个 turn */
