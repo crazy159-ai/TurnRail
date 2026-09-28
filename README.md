@@ -52,6 +52,7 @@ npm test          # Node 单元测试（18 项，无需浏览器）
 修改代码后，在 `chrome://extensions/` 中点击扩展的「重新加载」，再刷新 ChatGPT 页面。
 
 调试日志：在页面控制台执行 `localStorage.setItem('tn-debug', '1')` 并刷新（生产默认关闭）。
+性能指标：`__tnDebug.performance`（TTFR / TTLR / 扫描与 observer 分类计数），`__tn.resetPerformanceStats()` 重置。
 
 ## Build
 
@@ -73,12 +74,15 @@ ChatGPTAdapter (providers/chatgpt.ts)   ← 全部站点 selector 集中于此
     │  locateMessages / getRole / getText / getTurnElement / getConversationId
     ▼
 ConversationIndexer (conversation/indexer.ts)
-    │  scan → 去重 → stableId → buildTurns → reconcile
+    │  scan（full） / scanDirty（增量）→ 去重 → stableId → reconcile
     ├────────────────────┐
     ▼                    ▼
-MutationObserver      ScrollSpy (navigation/scrollSpy.ts)
-(observers.ts,         缓存偏移 + rAF-free scroll 引擎 + 漂移自检
- 150ms 去抖)                │
+两层 Observer         ScrollSpy (navigation/scrollSpy.ts)
+(observers.ts:         缓存偏移 + rAF-free scroll 引擎 + 漂移自检
+ Root Watch + scoped
+ Conversation Observer
+ + Mutation 分类 +
+ Dirty 队列 40ms 批量)      │
     └──────────┬───────────┘
                ▼
         ConversationStore (conversation/store.ts)
@@ -113,7 +117,11 @@ MutationObserver      ScrollSpy (navigation/scrollSpy.ts)
 | `cache/serializer.ts` / `hydrator.ts` | Runtime Store ↔ 缓存 DTO 显式双向转换（纯数据，无 DOM 依赖） |
 | `cache/reconciler.ts` | 缓存与 Live 零重叠时的 stale 判定（分支切换防护） |
 | `cache/cacheStore.ts` | chrome.storage.local 持久层（索引 + 全链路容错，失败即 Live-only） |
-| `content/main.ts` / `bootstrap.ts` / `routeWatcher.ts` / `observers.ts` | 入口与生命周期、SPA 路由检测、DOM 观察器、缓存桥接 |
+| `content/observers.ts` | 两层 Observer：短命 Root Watch（root 缺失时等出现）+ scoped Conversation Observer（root 出现即断开 document 级监听） |
+| `content/mutationPipeline.ts` | Mutation 分类器 + Dirty Turn 队列（streaming 忽略 / turn 内变化 / unknown 回退 full scan；40ms 批量去重） |
+| `content/startupScan.ts` | 启动稳定性退避扫描（100→2400ms，连续 2 次签名不变即停，替代固定 8×400ms） |
+| `utils/performance.ts` | PerformanceStats（TTFR / TTLR / full-vs-incremental / observer 分类；仅 tn-debug，无上传） |
+| `content/main.ts` / `bootstrap.ts` / `routeWatcher.ts` | 入口与生命周期、SPA 路由检测、缓存桥接、性能标记 |
 
 ## Local conversation cache
 
@@ -186,6 +194,27 @@ TurnRail runs locally in your browser.
 4. **分支/编辑/regenerate**：以"当前可见 branch 为真实索引"；检测到大面积 turn 更换时
    丢弃失效的离线 metadata，不猜测不可见分支。
 
+## Performance（v1.2）
+
+TurnRail minimizes work on ChatGPT pages by:
+
+- observing the conversation subtree rather than the full document —— 两层 Observer：
+  Root Watch 只在 root 缺失时短命观察 document（root 出现即断开），正常状态只观察
+  `[data-thread-find-target="conversation"]` 子树；
+- incrementally indexing changed turns —— Mutation 分类 → Dirty Turn 队列（40ms 批量去重）
+  → 仅解析 dirty / 新增 / 重挂载的 turn，已知且元素仍连接的 turn 零查询跳过；
+- ignoring assistant streaming mutations that do not affect navigation —— 已挂载
+  assistant unit 内部的流式更新不触发任何索引、目录重建或缓存写入（首次挂载不误伤）；
+- restoring cached navigation metadata before live DOM reconciliation —— 缓存目录
+  不等 conversation root 出现即可见（cache-first）。
+
+启动重试为稳定性退避（100→2400ms，连续 2 次签名不变即停），不再固定轮询 8 次。
+目录 rail 为 keyed 更新（turn 集合未变时零 DOM 重建），outline 面板关闭时不重建。
+
+Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.performance`
+（TTFR / TTLR、full vs incremental 扫描数、observer 分类计数），`__tn.resetPerformanceStats()`
+重置。仅本地统计，无上传、无聊天正文。
+
 ## Known limitations
 
 - ChatGPT DOM 改版（尤其 `data-turn-key` / `data-chatgpt-search-unit-key` 结构变化）时需更新
@@ -195,7 +224,7 @@ TurnRail runs locally in your browser.
 - 分支切换靠启发式检测（"大量卸载 + 大量全新 id"同时出现时重置离线索引），极端场景可能残留少量"未加载"条目。
 - 导航缓存只让"已见过的 turn"提前可见：缓存无法凭空提供未加载过的历史；partial 缓存在发现更多 turn 前保持 partial。
 - 缓存的分支 / edit / regenerate 行为是 best-effort：Live 与缓存零重叠（判定为另一分支）时丢弃缓存 turn 并以 Live 重建。
-- v1.2（性能，roadmap）：document_end 注入、MutationObserver 范围收窄、增量 dirty-turn 扫描、流式输出过滤、虚拟 marker 列表；缓存 LRU 自动清理（v1.3）。
+- v1.2 已实现：document_end 注入、两层 Observer（范围收窄）、增量 dirty-turn 索引、流式输出过滤、rail keyed 更新；缓存 LRU 自动清理留待 v1.3。
 - 未实现（roadmap）：书签/重命名、快捷键（Alt+↑/↓、Alt+J）、设置面板、Claude/Gemini/DeepSeek 支持、导出目录。
 - 已在 Chrome 114+ 目标下验证；未测其他 Chromium 分支。
 
@@ -210,10 +239,13 @@ TurnRail runs locally in your browser.
 
 ## 测试
 
-- `test/unit/`：Node 原生 runner（`npm test`）的 18 项单元测试 —— serialize 纯净性、
+- `test/unit/`：Node 原生 runner（`npm test`）的 33 项单元测试 —— serialize 纯净性、
   缓存校验（合法 / 损坏 / 未来 schema）、hydrate、缓存×Live reconcile（保序 + Live 胜出 + 不重复）、
   route 竞态隔离、stale 判定与清理、CacheStore 索引 / 清除 / touch、storage 失败降级 Live-only、
   live→cache→hydrate 端到端往返。
+  v1.2 增量：Mutation 分类（streaming 忽略 / 首挂载不误伤 / unknown 回退）、Dirty 队列去重与
+  批量合并、scanDirty 只解析新 turn（旧 turn 零查询）、卸载 turn metadata 保留、
+  启动稳定性退避（恒定签名 3 扫即停 / 不稳定走满 / root 缺失不计稳定）。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
