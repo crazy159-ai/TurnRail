@@ -1,6 +1,7 @@
-import type { ChatProvider, LocatedMessage } from '../providers/types'
+import type { ChatProvider, LocatedMessage, LocatedTurn } from '../providers/types'
 import { collapseWhitespace, stripMarkdownDecorations, truncateUnicode } from '../utils/dom.ts'
 import { reportError } from '../utils/logger.ts'
+import { perf } from '../utils/performance.ts'
 import { buildFallbackKey } from './stableId.ts'
 import { ConversationStore } from './store.ts'
 import type { ChangeKind, ConversationMessage, ConversationTurn, DetachedTurn } from './types'
@@ -52,16 +53,185 @@ export class ConversationIndexer {
     this.store = store
   }
 
-  scan(force = false): void {
+  /** Full scan（correctness 基准路径）：全量定位 + 全量解析 + 完整调和 */
+  scan(force = false, isFallback = false): void {
     if (this.scanning) return
     this.scanning = true
+    const startedAt = performance.now()
     try {
-      this.scanInner(force)
+      const incoming = this.collectIncoming()
+      if (incoming.length > 0) {
+        perf.markFirstLiveScan()
+        perf.markFirstLiveReconcile()
+      }
+      this.reconcile(incoming, force)
     } catch (err) {
       reportError('indexer.scan', err)
     } finally {
       this.scanning = false
+      perf.fullScan(performance.now() - startedAt, isFallback)
     }
+  }
+
+  /**
+   * 增量扫描（fast path）：只解析 dirty / 未知 / 重挂载的 turn，
+   * 已知且元素仍连接的 turn 零查询跳过。与 full scan 共用同一套调和核心，
+   * 顺序 / 卸载 / detached 锚点语义完全一致。
+   * 任何无法安全增量处理的情况（legacy DOM、解析失败、assistant 首次出现）
+   * 一律回退 full scan —— correctness first，宁可多一次 2ms 扫描，不漏一个问题。
+   */
+  scanDirty(dirtyRoots: Iterable<HTMLElement>): void {
+    if (this.scanning) return
+    this.scanning = true
+    const startedAt = performance.now()
+    let applied = false
+    let parsedCount = 0
+    let skippedCount = 0
+    try {
+      const result = this.scanDirtyInner(dirtyRoots)
+      applied = result.applied
+      parsedCount = result.parsed
+      skippedCount = result.skipped
+    } catch (err) {
+      reportError('indexer.scanDirty', err)
+      applied = false
+    } finally {
+      this.scanning = false
+    }
+    if (applied) {
+      perf.incrementalScan(performance.now() - startedAt, parsedCount, skippedCount)
+    } else {
+      // 回退 full scan（fallback 计数在 scan 内记录）
+      this.scan(true, true)
+    }
+  }
+
+  /** 返回 applied=false 表示需要回退 full scan */
+  private scanDirtyInner(
+    dirtyRoots: Iterable<HTMLElement>
+  ): { applied: boolean; parsed: number; skipped: number } {
+    const located = this.provider.locateTurnRoots()
+    // legacy DOM（无原生 data-turn-key）无法可靠增量 → full scan
+    if (located.some((entry) => entry.id === null)) return { applied: false, parsed: 0, skipped: 0 }
+
+    const dirtySet = new Set(dirtyRoots)
+    const turnByRoot = new Map<HTMLElement, ConversationTurn>()
+    const turnById = new Map<string, ConversationTurn>()
+    for (const turn of this.store.turns) {
+      if (turn.root) turnByRoot.set(turn.root, turn)
+      turnById.set(turn.id, turn)
+    }
+
+    const ordinalCounter = new Map<string, number>()
+    const incoming: IncomingRecord[] = []
+    let parsed = 0
+    let skipped = 0
+
+    for (const entry of located) {
+      const known = turnByRoot.get(entry.root) ?? turnById.get(entry.id!)
+      if (known && !dirtySet.has(entry.root)) {
+        const userConnected = known.user?.element?.isConnected ?? false
+        const assistantOk = !known.assistant || known.assistant.element?.isConnected || false
+        if (userConnected && assistantOk) {
+          // 纯跳过：零查询，直接引用 Store 现有绑定（root 引用刷新为当前 DOM）
+          if (known.user && known.user.element) {
+            incoming.push({
+              record: {
+                role: 'user',
+                text: known.user.text,
+                element: known.user.element,
+                turnContainer: entry.root,
+                externalId: known.user.id
+              },
+              key: known.user.id,
+              opensTurn: 'user',
+              turnRoot: entry.root
+            })
+          }
+          if (known.assistant?.element?.isConnected) {
+            incoming.push({
+              record: {
+                role: 'assistant',
+                text: known.assistant.text,
+                element: known.assistant.element,
+                turnContainer: entry.root,
+                externalId: known.assistant.id
+              },
+              key: known.assistant.id,
+              opensTurn: 'attach',
+              turnRoot: entry.root
+            })
+          }
+          skipped++
+          continue
+        }
+        // 重挂载 / 元素被替换：轻量解析（只绑元素 / 读 ID，不提取文本）
+        const light = this.provider.parseTurn(entry.root, { includeText: false })
+        if (!light) return { applied: false, parsed, skipped }
+        if (!light.user !== !known.user) return { applied: false, parsed, skipped }
+        if (light.assistant && !known.assistant) return { applied: false, parsed, skipped }
+        if (light.user && known.user) {
+          incoming.push({
+            record: { ...light.user, text: known.user.text, externalId: known.user.id },
+            key: known.user.id,
+            opensTurn: 'user',
+            turnRoot: entry.root
+          })
+        }
+        if (light.assistant && known.assistant) {
+          incoming.push({
+            record: { ...light.assistant, text: known.assistant.text, externalId: known.assistant.id },
+            key: known.assistant.id,
+            opensTurn: 'attach',
+            turnRoot: entry.root
+          })
+        }
+        skipped++
+        continue
+      }
+      // 新 turn 或 dirty turn：完整解析（含文本提取）
+      const parsedTurn = this.provider.parseTurn(entry.root, { includeText: true })
+      if (!parsedTurn) return { applied: false, parsed, skipped }
+      parsed++
+      incoming.push(...this.buildRecords([parsedTurn], ordinalCounter))
+    }
+
+    this.reconcile(incoming, false)
+    return { applied: true, parsed, skipped }
+  }
+
+  /** LocatedTurn → 入库记录（full 与 incremental 共用；ordinalCounter 跨同批共享） */
+  private buildRecords(turns: LocatedTurn[], ordinalCounter: Map<string, number>): IncomingRecord[] {
+    const incoming: IncomingRecord[] = []
+    for (const turn of turns) {
+      if (turn.user) {
+        incoming.push({
+          record: turn.user,
+          key: this.stableKey(turn.user, ordinalCounter),
+          opensTurn: 'user',
+          turnRoot: turn.root
+        })
+      }
+      if (turn.assistant) {
+        incoming.push({
+          record: turn.assistant,
+          key: this.stableKey(turn.assistant, ordinalCounter),
+          opensTurn: turn.user ? 'attach' : 'assistant',
+          turnRoot: turn.root
+        })
+      }
+    }
+    return incoming
+  }
+
+  /** 稳定 key：externalId 优先；缺失时 role + 归一化文本哈希 + 同内容序号 */
+  private stableKey(record: LocatedMessage, ordinalCounter: Map<string, number>): string {
+    if (record.externalId) return record.externalId
+    const normalized = collapseWhitespace(record.text)
+    const dupKey = record.role + '\u0000' + normalized
+    const ordinal = ordinalCounter.get(dupKey) ?? 0
+    ordinalCounter.set(dupKey, ordinal + 1)
+    return buildFallbackKey(record.role, normalized, ordinal)
   }
 
   findMountedTurn(turnId: string): ConversationTurn | undefined {
@@ -74,46 +244,22 @@ export class ConversationIndexer {
   /** Turn-first 优先；legacy DOM 回退消息流式定位 */
   private collectIncoming(): IncomingRecord[] {
     const ordinalCounter = new Map<string, number>()
-    const keyOf = (record: LocatedMessage): string => {
-      if (record.externalId) return record.externalId
-      const normalized = collapseWhitespace(record.text)
-      const dupKey = record.role + '\u0000' + normalized
-      const ordinal = ordinalCounter.get(dupKey) ?? 0
-      ordinalCounter.set(dupKey, ordinal + 1)
-      return buildFallbackKey(record.role, normalized, ordinal)
-    }
-
     const turns = this.provider.locateTurns()
-    if (turns.length > 0) {
-      const incoming: IncomingRecord[] = []
-      for (const turn of turns) {
-        if (turn.user) {
-          incoming.push({ record: turn.user, key: keyOf(turn.user), opensTurn: 'user', turnRoot: turn.root })
-        }
-        if (turn.assistant) {
-          incoming.push({
-            record: turn.assistant,
-            key: keyOf(turn.assistant),
-            opensTurn: turn.user ? 'attach' : 'assistant',
-            turnRoot: turn.root
-          })
-        }
-      }
-      return incoming
-    }
+    if (turns.length > 0) return this.buildRecords(turns, ordinalCounter)
 
     const located = this.provider.locateMessages()
     return located.map((record) => ({
       record,
-      key: keyOf(record),
+      key: this.stableKey(record, ordinalCounter),
       opensTurn: record.role === 'user' ? ('user' as const) : ('attach' as const),
       turnRoot: record.turnContainer
     }))
   }
 
-  private scanInner(force: boolean): void {
+
+  /** 调和核心：full 与 incremental 共用（空扫描保护 / 快路径 / 全量调和） */
+  private reconcile(incoming: IncomingRecord[], force: boolean): void {
     const store = this.store
-    const incoming = this.collectIncoming()
 
     if (incoming.length === 0) {
       this.emptyScanCount++
