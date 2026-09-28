@@ -7,6 +7,7 @@ export interface OutlineHandlers {
   onSearchInput: (query: string) => void
   onClose: () => void
   onPinChange: (pinned: boolean) => void
+  onToggleCache: () => void
 }
 
 export interface Outline {
@@ -20,6 +21,10 @@ export interface Outline {
   setStatus(text: string): void
   setBusy(busy: boolean): void
   clearSearch(): void
+  /** ☆/★ 状态同步（含 tooltip / aria-pressed） */
+  setCached(cached: boolean): void
+  /** storage 不可用时禁用缓存按钮（Live-only 降级） */
+  setCacheEnabled(enabled: boolean): void
 }
 
 /**
@@ -49,13 +54,21 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     pinButton.classList.toggle('tn-on', next)
     handlers.onPinChange(next)
   })
+  const cacheButton = document.createElement('button')
+  cacheButton.type = 'button'
+  cacheButton.className = 'tn-icon-btn tn-cache-btn'
+  cacheButton.textContent = '☆'
+  cacheButton.setAttribute('aria-pressed', 'false')
+  cacheButton.title = '缓存当前对话导航'
+  cacheButton.setAttribute('aria-label', '缓存当前对话导航')
+  cacheButton.addEventListener('click', () => handlers.onToggleCache())
   const closeButton = document.createElement('button')
   closeButton.type = 'button'
   closeButton.className = 'tn-icon-btn'
   closeButton.textContent = '×'
   closeButton.setAttribute('aria-label', '关闭目录')
   closeButton.addEventListener('click', handlers.onClose)
-  head.append(title, count, pinButton, closeButton)
+  head.append(title, count, cacheButton, pinButton, closeButton)
 
   // 搜索
   const search = document.createElement('input')
@@ -104,6 +117,19 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
 
   function setCount(value: number): void {
     count.textContent = String(value)
+  }
+
+  function setCached(value: boolean): void {
+    cacheButton.textContent = value ? '★' : '☆'
+    cacheButton.classList.toggle('tn-cached', value)
+    cacheButton.setAttribute('aria-pressed', String(value))
+    const label = value ? '移除当前对话缓存' : '缓存当前对话导航'
+    cacheButton.title = label
+    cacheButton.setAttribute('aria-label', label)
+  }
+
+  function setCacheEnabled(value: boolean): void {
+    cacheButton.disabled = !value
   }
 
   function renderItems(turns: ConversationTurn[], query: string, detectFailed: boolean): void {
@@ -185,5 +211,5 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     handlers.onSearchInput('')
   }
 
-  return { element, open, close, isOpen, setCount, renderItems, setActive, setStatus, setBusy, clearSearch }
+  return { element, open, close, isOpen, setCount, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled }
 }

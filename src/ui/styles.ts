@@ -257,4 +257,22 @@ export const navigationCss = `
   opacity: 0.5;
   cursor: default;
 }
+.tn-icon-btn[disabled] {
+  opacity: 0.35;
+  cursor: default;
+}
+.tn-icon-btn[disabled]:hover {
+  background: transparent;
+  color: var(--tn-muted);
+}
+.tn-cache-btn {
+  font-size: 15px;
+  line-height: 1;
+}
+.tn-cache-btn.tn-cached {
+  color: #d99a2b;
+}
+:host(.tn-dark) .tn-cache-btn.tn-cached {
+  color: #e7b455;
+}
 `

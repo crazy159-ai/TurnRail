@@ -13,6 +13,7 @@ export const HOST_ID = 'turnrail-host'
 export interface NavigationUiHandlers {
   onJump: (turnId: string) => void
   onLoadHistory: () => void
+  onToggleCache: () => void
 }
 
 export interface NavigationUi {
@@ -22,6 +23,10 @@ export interface NavigationUi {
   handleReset(): void
   setStatus(text: string): void
   setBusy(busy: boolean): void
+  /** 当前会话是否已缓存（★/☆） */
+  setCached(cached: boolean): void
+  /** 缓存能力可用性（storage 失败时禁用按钮） */
+  setCacheEnabled(enabled: boolean): void
   destroy(): void
 }
 
@@ -50,6 +55,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
   const outline: Outline = createOutline(layer, {
     onJump: handlers.onJump,
     onLoadHistory: handlers.onLoadHistory,
+    onToggleCache: handlers.onToggleCache,
     onSearchInput: (query) => {
       searchQuery = query
       renderList()
@@ -225,6 +231,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.close()
     outline.setStatus('')
     outline.setCount(0)
+    outline.setCached(false)
     rail.render([], { tops: [], railHeight: 0, markerHeight: 0 })
     rail.setActive(undefined)
     layer.classList.add('tn-hidden')
@@ -241,5 +248,5 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     host.remove()
   }
 
-  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setBusy: outline.setBusy, destroy }
+  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, destroy }
 }
