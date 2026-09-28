@@ -1,4 +1,5 @@
 import { createEl } from '../utils/dom'
+import { perf } from '../utils/performance'
 import type { ConversationTurn } from '../conversation/types'
 
 export interface RailLayout {
@@ -30,10 +31,35 @@ export function createRail(parent: HTMLElement, handlers: { onJump: (turnId: str
   let activeId: string | undefined
   let failed = false
 
+  let lastIds: string[] = []
+
   function render(turns: ConversationTurn[], layout: RailLayout): void {
-    element.textContent = ''
+    const ids = turns.map((turn) => turn.id)
+    const sameSequence =
+      turns.length > 0 &&
+      ids.length === lastIds.length &&
+      ids.every((id, index) => id === lastIds[index]) &&
+      buttons.size === turns.length
+    lastIds = ids
     element.style.height = turns.length > 0 ? `${layout.railHeight}px` : ''
+    if (sameSequence) {
+      // keyed 更新：turn id 序列未变 → 只更新位置 / 高度 / 标题，不重建任何 DOM
+      //（长会话 streaming / 虚拟化滚动期间 rail 零重建）
+      turns.forEach((turn, index) => {
+        const marker = buttons.get(turn.id)
+        if (!marker) return
+        marker.style.top = `${layout.tops[index] ?? 0}px`
+        marker.style.height = `${layout.markerHeight}px`
+        marker.title = `Q${index + 1} ${turn.title}`
+        marker.setAttribute('aria-label', `跳转到第 ${index + 1} 个问题：${turn.title}`)
+      })
+      perf.railIncremental()
+      return
+    }
+    perf.railFull()
+    element.textContent = ''
     buttons.clear()
+
 
     if (turns.length === 0) {
       if (failed) {

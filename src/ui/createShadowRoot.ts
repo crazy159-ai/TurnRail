@@ -5,6 +5,7 @@ import type { ConversationStore, StoreEvent } from '../conversation/store'
 import type { ConversationTurn } from '../conversation/types'
 import { getScrollBounds } from '../navigation/scrollGeometry'
 import { navigationCss } from './styles'
+import { perf } from '../utils/performance'
 import { createRail, layoutMarkers, type Rail } from './rail'
 import { createOutline, type Outline } from './outline'
 
@@ -84,9 +85,14 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     // UI 可见性依据会话容器是否存在（不依赖 URL）；URL 仅用于 conversationKey
     const hasConversation = provider.hasConversation()
     const userTurns = store ? store.turns.filter((turn) => turn.user).length : 0
+    // 缓存命中且在会话路由上 → 缓存目录不等 conversation root 出现即可见
+    //（TTFR 只受 chrome.storage 读取 + UI mount 影响，规格 #94）
+    const cachedOutlineReady = store !== null && userTurns > 0 && provider.isConversationRoute()
     const detectFailed = hasConversation && userTurns === 0 && hasConversationDom()
-    const showAll = hasConversation && (userTurns > 0 || detectFailed)
+    const showAll = (hasConversation || cachedOutlineReady) && (userTurns > 0 || detectFailed)
+    const wasHidden = layer.classList.contains('tn-hidden')
     layer.classList.toggle('tn-hidden', !showAll)
+    if (wasHidden && showAll) perf.markFirstRailVisible()
     rail.setFailed(detectFailed)
     rail.setVisible(userTurns > 0 || detectFailed)
     if (userTurns === 0 && !detectFailed) outline.close()
@@ -127,17 +133,39 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     rail.render(turns, layout)
   }
 
+  let outlineDirty = false
+
   function renderList(): void {
     const store = storeRef
     if (!store) return
+    // 面板关闭时不重建目录（streaming / 虚拟化滚动期间的 structure/elements
+    // 事件不再产生任何 DOM 工作）；打开时按需重建一次
+    if (!outline.isOpen()) {
+      outlineDirty = true
+      perf.outlineSkipped()
+      return
+    }
+    outlineDirty = false
+    perf.outlineFull()
     const detectFailed = store.turns.length === 0 && provider.hasConversation() && hasConversationDom()
     outline.renderItems(store.turns, searchQuery, detectFailed)
   }
 
   // ---------- 事件与生命周期 ----------
   function openPanel(): void {
+    if (outlineDirty) {
+      outlineDirty = false
+      const store = storeRef
+      if (store) {
+        perf.outlineFull()
+        const detectFailed = store.turns.length === 0 && provider.hasConversation() && hasConversationDom()
+        outline.renderItems(store.turns, searchQuery, detectFailed)
+      }
+    }
     outline.open()
   }
+
+
 
   function scheduleClose(): void {
     if (pinned) return
