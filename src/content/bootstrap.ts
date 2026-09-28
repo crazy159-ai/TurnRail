@@ -10,30 +10,170 @@ import { startDomObserver } from './observers'
 import { createRouteWatcher } from './routeWatcher'
 import { isAtVisualBottom, isAtVisualTop, getScrollBounds } from '../navigation/scrollGeometry'
 import { DEBUG, reportError } from '../utils/logger'
+import { debounce } from '../utils/debounce'
+import { ConversationCacheStore } from '../cache/cacheStore'
+import { serializeConversation } from '../cache/serializer'
+import { hydrateCachedConversation } from '../cache/hydrator'
+import { isLikelyStale } from '../cache/reconciler'
 
 /**
  * 组装全部模块并管理生命周期：
- * 路由变化 → 停止 spy / 清缓存 / 重置 store → 重新扫描 → 观察器继续增量更新。
+ * 路由变化 → 停止 spy / flush 待写缓存 / 重置 store → 并行读取导航缓存（cache-first）
+ * → Live DOM 扫描 → 调和 → 观察器继续增量更新。
+ *
+ * 缓存原则：Cache 是加速层，不是事实来源 —— 缓存负责先显示，Live ChatGPT DOM 负责
+ * 最终正确性（Live 永远胜出）。缓存读取 / 写入全链路容错，任何缓存失败都退化为
+ * 原有 Live-only 行为，绝不影响 TurnRail 正常启动。
  */
 export function bootstrap(): void {
   const provider = new ChatGptProvider()
   const store = new ConversationStore()
   const indexer = new ConversationIndexer(provider, store)
+  const cacheStore = new ConversationCacheStore()
 
   const ui = createNavigationUi(provider, {
     onJump: (turnId) => void handleJump(turnId),
-    onLoadHistory: () => void handleLoadHistory()
+    onLoadHistory: () => void handleLoadHistory(),
+    onToggleCache: () => void handleToggleCache()
   })
   document.body.appendChild(ui.host)
+  ui.setCacheEnabled(cacheStore.isAvailable())
 
   const spy = new ScrollSpy(store, provider, (turnId) => {
     store.activeTurnId = turnId
     ui.setActive(turnId)
   })
 
+  // ---------- 导航缓存桥接（cache-first + live reconcile） ----------
+  // generation：每次路由变化递增；异步缓存读取返回时 generation 已变则直接丢弃
+  //（防 A/B 会话竞态串写 —— A 的缓存绝不进入 B 的 Store）
+  let conversationGeneration = 0
+  /** 当前路由对应的已缓存会话 id（null = 未缓存 / 未知） */
+  let activeCachedId: string | null = null
+  /** 已缓存会话的 createdAt（重写缓存时保留创建时间语义） */
+  let activeCreatedAt: number | undefined = undefined
+  /** 本次会话自缓存 hydrate 的 turn id（stale 判定依据；null = 缓存未参与） */
+  let hydratedTurnIds: Set<string> | null = null
+  /** hydrate 过程中抑制自动保存调度（刚恢复的缓存原样写回没有意义） */
+  let hydrating = false
+  let lastHydrateMs: number | null = null
+  let lastReconcileMs: number | null = null
+  /** 待落盘的缓存快照描述（debounce 到期或路由离开时写入） */
+  let pendingSave: { conversationId: string; complete: boolean } | null = null
+
+  const scheduleAutoSave = debounce(() => {
+    const pending = pendingSave
+    pendingSave = null
+    if (pending) void writeCacheSnapshot(pending.conversationId, pending.complete)
+  }, 1200)
+
+  /** 仅当会话已被用户缓存时才调度自动保存（v1.1 不做全量自动缓存） */
+  function scheduleCacheSave(complete: boolean): void {
+    if (!cacheStore.isAvailable()) return
+    const conversationId = provider.getConversationId()
+    if (!conversationId || conversationId !== activeCachedId) return
+    pendingSave = { conversationId, complete: complete || (pendingSave?.complete ?? false) }
+    scheduleAutoSave()
+  }
+
+  /** 序列化当前 store 并落盘。写入前校验会话 key，绝不把 A 会话的数据写进 B 的缓存。 */
+  async function writeCacheSnapshot(conversationId: string, complete: boolean): Promise<void> {
+    try {
+      if (store.conversationKey !== conversationId) return
+      const snapshot = serializeConversation(store, {
+        provider: 'chatgpt',
+        conversationId,
+        complete,
+        pinned: true,
+        createdAt: activeCreatedAt
+      })
+      await cacheStore.put(snapshot)
+    } catch (err) {
+      reportError('cache.write', err)
+    }
+  }
+
+  /** 路由离开 / 重置前：取消定时器并立即落盘待写快照（快照在 store.reset 之前序列化） */
+  function flushPendingSave(): void {
+    scheduleAutoSave.cancel()
+    const pending = pendingSave
+    pendingSave = null
+    if (pending) void writeCacheSnapshot(pending.conversationId, pending.complete)
+  }
+
+  /**
+   * 路由进入：异步读取导航缓存并 hydrate。
+   * 读取期间用户可能已切走（SPA）：generation + conversationId 双重校验，
+   * 任一变化即丢弃本次结果，绝不 hydrate 到其他会话。
+   */
+  async function loadCachedConversation(conversationId: string): Promise<void> {
+    const gen = conversationGeneration
+    try {
+      const cached = await cacheStore.get('chatgpt', conversationId)
+      if (gen !== conversationGeneration) return
+      if (provider.getConversationId() !== conversationId) return
+      if (!cached) {
+        ui.setCached(false)
+        return
+      }
+      ui.setCached(true)
+      activeCachedId = conversationId
+      activeCreatedAt = cached.createdAt
+      hydratedTurnIds = new Set(cached.turns.map((turn) => turn.id))
+      void cacheStore.touch('chatgpt', conversationId)
+
+      hydrating = true
+      let hydrated = 0
+      try {
+        const hydrateStart = performance.now()
+        hydrated = hydrateCachedConversation(store, cached)
+        lastHydrateMs = performance.now() - hydrateStart
+        if (hydrated > 0) {
+          // 缓存命中：立即渲染目录（先于 ChatGPT 历史挂载），随后与已存在的 Live DOM 调和
+          store.commit('structure')
+          const reconcileStart = performance.now()
+          indexer.scan(true)
+          lastReconcileMs = performance.now() - reconcileStart
+        }
+      } finally {
+        hydrating = false
+      }
+      // 缓存读取晚于 Live 首扫时，hydrate 刚插入的 turn 需要立即做一次 stale 检查
+      if (hydrated > 0) checkCacheStaleness()
+    } catch (err) {
+      reportError('cache.load', err)
+    }
+  }
+
+  /**
+   * 缓存 stale 判定（分支切换防护）：已挂载 Live user turn ≥3 且与缓存 id 零重叠时，
+   * 缓存大概率来自另一条分支（edit / regenerate）—— 丢弃缓存恢复的未挂载 turn，
+   * Live Store 优先；随后由 debounce 自动保存以 Live 数据重写缓存。
+   */
+  function checkCacheStaleness(): void {
+    if (!hydratedTurnIds || hydratedTurnIds.size === 0) return
+    const liveMountedIds = store.turns
+      .filter((turn) => turn.user?.element?.isConnected)
+      .map((turn) => turn.id)
+    if (!isLikelyStale(hydratedTurnIds, liveMountedIds)) return
+    const dropIds = new Set<string>()
+    for (const turn of store.turns) {
+      if (hydratedTurnIds.has(turn.id) && !turn.user?.element?.isConnected) dropIds.add(turn.id)
+    }
+    hydratedTurnIds = null
+    store.cacheHydrated = false
+    store.dropTurns(dropIds)
+  }
+
+  // ---------- Store → UI / spy / 缓存自动保存 ----------
   store.onChange((kind) => {
     ui.syncFromStore(store, kind)
     if (kind === 'structure' || kind === 'elements') spy.refresh()
+    // 自动保存只在 turn 结构变化时调度：assistant 流式输出（text）不触发写盘
+    if (kind === 'structure' && !hydrating) {
+      checkCacheStaleness()
+      scheduleCacheSave(false)
+    }
   })
 
   let routeEpoch = 0
@@ -71,6 +211,8 @@ export function bootstrap(): void {
       const result = await captureFullHistory(provider, indexer, store, (message) => {
         if (message) ui.setStatus(message)
       })
+      // 完整历史捕获确认到顶且当前会话已缓存 → 重新保存并置 complete = true
+      if (result.reachedTop && activeCachedId !== null) scheduleCacheSave(true)
       ui.setStatus(
         result.addedTurns > 0 ? `已补充 ${result.addedTurns} 条历史` : '没有发现更多历史消息'
       )
@@ -85,8 +227,61 @@ export function bootstrap(): void {
     }
   }
 
+  /**
+   * ☆/★：手动缓存 / 移除当前会话的导航缓存（v1.1 仅用户主动缓存，不自动保存陌生会话）。
+   * 快照在 await 之前同步序列化：期间即使切走路由，落盘的也是点击时刻的正确数据。
+   */
+  async function handleToggleCache(): Promise<void> {
+    if (!cacheStore.isAvailable()) {
+      ui.setStatus('缓存不可用（chrome.storage 不可用），导航功能不受影响')
+      window.setTimeout(() => ui.setStatus(''), 3500)
+      return
+    }
+    const conversationId = provider.getConversationId()
+    if (!conversationId) return
+    const gen = conversationGeneration
+    try {
+      const existing = await cacheStore.get('chatgpt', conversationId)
+      if (existing) {
+        // 移除缓存，同时取消该会话的待写自动保存，避免“删完又被写回”
+        scheduleAutoSave.cancel()
+        pendingSave = null
+        await cacheStore.remove('chatgpt', conversationId)
+        if (gen !== conversationGeneration) return
+        activeCachedId = null
+        activeCreatedAt = undefined
+        hydratedTurnIds = null
+        ui.setCached(false)
+        ui.setStatus('已移除当前对话缓存')
+      } else {
+        const snapshot = serializeConversation(store, {
+          provider: 'chatgpt',
+          conversationId,
+          complete: false,
+          pinned: true
+        })
+        await cacheStore.put(snapshot)
+        if (gen !== conversationGeneration) return
+        activeCachedId = conversationId
+        activeCreatedAt = snapshot.createdAt
+        hydratedTurnIds = new Set(snapshot.turns.map((turn) => turn.id))
+        ui.setCached(true)
+        ui.setStatus('已缓存当前对话导航')
+      }
+      window.setTimeout(() => {
+        if (gen === conversationGeneration) ui.setStatus('')
+      }, 3000)
+    } catch (err) {
+      reportError('cache.toggle', err)
+      ui.setStatus('缓存操作失败，请重试')
+      window.setTimeout(() => ui.setStatus(''), 3500)
+    }
+  }
+
   function resetForRoute(): void {
-    routeEpoch++
+    conversationGeneration++
+    // 先 flush 旧会话的待写缓存：必须在 store.reset 之前序列化旧数据
+    flushPendingSave()
     window.clearInterval(retryTimer)
     const conversationId = provider.getConversationId()
     const key = conversationId ?? `local-${routeEpoch}`
@@ -95,6 +290,11 @@ export function bootstrap(): void {
     provider.invalidateDomCache()
     store.reset(key)
     ui.handleReset()
+    activeCachedId = null
+    activeCreatedAt = undefined
+    hydratedTurnIds = null
+    lastHydrateMs = null
+    lastReconcileMs = null
 
     // 立即扫描 + 短周期重试，覆盖 SPA 异步渲染
     indexer.scan(true)
@@ -104,6 +304,11 @@ export function bootstrap(): void {
       indexer.scan()
       if (attempts >= 8) window.clearInterval(retryTimer)
     }, 400)
+
+    // cache-first：缓存读取与 Live DOM 初始化并行；命中即在历史挂载前恢复目录
+    if (conversationId && cacheStore.isAvailable()) {
+      void loadCachedConversation(conversationId)
+    }
   }
 
   const stopDomObserver = startDomObserver(() => indexer.scan())
@@ -132,6 +337,13 @@ export function bootstrap(): void {
           storeTurns: store.turns.length,
           markers: ui.host.shadowRoot?.querySelectorAll('.tn-marker').length ?? 0,
           providerMode: provider.lastStrategyLabel,
+          // 导航缓存指标（只含元数据：命中 / 耗时 / 数量，绝无 prompt 或回答正文）
+          cache: {
+            ...cacheStore.getStats(),
+            hydrateMs: lastHydrateMs,
+            reconcileMs: lastReconcileMs,
+            hydratedTurns: hydratedTurnIds?.size ?? null
+          },
           // 滚动几何（真实 ChatGPT 为 column-reverse：scrollTop ∈ [-extent, 0]）
           flexDirection: sc ? window.getComputedStyle(sc).flexDirection : null,
           scrollTop: sc ? sc.scrollTop : null,
@@ -148,6 +360,7 @@ export function bootstrap(): void {
       provider,
       spy,
       indexer,
+      cache: cacheStore,
       recoverLog: getRecoverLog
     }
   }

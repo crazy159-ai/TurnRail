@@ -13,6 +13,8 @@ export function isCaptureRunning(): boolean {
 
 export interface CaptureResult {
   addedTurns: number
+  /** 是否确认到达视觉顶部且无更多历史（缓存 complete 标记的唯一依据） */
+  reachedTop: boolean
 }
 
 /**
@@ -26,7 +28,7 @@ export async function captureFullHistory(
   store: ConversationStore,
   onProgress?: (message: string) => void
 ): Promise<CaptureResult> {
-  if (captureRunning) return { addedTurns: -1 }
+  if (captureRunning) return { addedTurns: -1, reachedTop: false }
   captureRunning = true
   try {
     return await runCapture(provider, indexer, store, onProgress)
@@ -42,7 +44,7 @@ async function runCapture(
   onProgress?: (message: string) => void
 ): Promise<CaptureResult> {
   const container = provider.getScrollContainer()
-  if (!container) return { addedTurns: 0 }
+  if (!container) return { addedTurns: 0, reachedTop: false }
 
   const baselineTurns = store.turns.length
   const savedAnchor = captureScrollAnchor(provider, store)
@@ -51,6 +53,7 @@ async function runCapture(
 
   let lastTopTurnId: string | undefined
   let noNewRounds = 0
+  let reachedTop = false
 
   for (let i = 0; i < maxIters; i++) {
     if (Date.now() > deadline) break
@@ -66,7 +69,10 @@ async function runCapture(
     }
 
     const atVisualTop = isAtVisualTop(container)
-    if (atVisualTop && noNewRounds >= 2) break
+    if (atVisualTop && noNewRounds >= 2) {
+      reachedTop = true
+      break
+    }
 
     const step = Math.max(240, Math.floor(container.clientHeight * 0.9))
     // 向视觉顶部（更旧历史）移动：column-reverse 下为更负的 scrollTop，
@@ -81,5 +87,5 @@ async function runCapture(
   restoreScrollAnchor(provider, store, savedAnchor)
   indexer.scan()
   onProgress?.('')
-  return { addedTurns }
+  return { addedTurns, reachedTop }
 }

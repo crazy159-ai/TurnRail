@@ -1,8 +1,8 @@
 import type { ChatProvider, LocatedMessage } from '../providers/types'
-import { collapseWhitespace, stripMarkdownDecorations, truncateUnicode } from '../utils/dom'
-import { reportError } from '../utils/logger'
-import { buildFallbackKey } from './stableId'
-import { ConversationStore } from './store'
+import { collapseWhitespace, stripMarkdownDecorations, truncateUnicode } from '../utils/dom.ts'
+import { reportError } from '../utils/logger.ts'
+import { buildFallbackKey } from './stableId.ts'
+import { ConversationStore } from './store.ts'
 import type { ChangeKind, ConversationMessage, ConversationTurn, DetachedTurn } from './types'
 
 /** 一条待入库记录：key 为稳定 ID；opensTurn 描述 turn 边界 */
@@ -41,13 +41,16 @@ function byCapturedAt(a: DetachedTurn, b: DetachedTurn): number {
  * legacy DOM 走消息流式分组。未挂载但已收获的 turn 通过 anchor 机制保序保留。
  */
 export class ConversationIndexer {
+  private provider: ChatProvider
+  private store: ConversationStore
   private scanning = false
   private emptyScanCount = 0
 
-  constructor(
-    private provider: ChatProvider,
-    private store: ConversationStore
-  ) {}
+  // 显式字段赋值（不用参数属性）：Node 测试运行器的类型剥离不支持该语法
+  constructor(provider: ChatProvider, store: ConversationStore) {
+    this.provider = provider
+    this.store = store
+  }
 
   scan(force = false): void {
     if (this.scanning) return
@@ -127,7 +130,13 @@ export class ConversationIndexer {
         store.lastVisibleKeys = []
         store.commit('elements')
       }
-      if (this.emptyScanCount >= 2 && (store.turns.length > 0 || store.detached.length > 0)) {
+      if (
+        this.emptyScanCount >= 2 &&
+        (store.turns.length > 0 || store.detached.length > 0) &&
+        // 导航缓存恢复的 turn 在 ChatGPT 历史尚未挂载时必须存活，
+        // 只在缓存确认 stale（bootstrap 层判定）后恢复正常清空行为
+        !store.cacheHydrated
+      ) {
         store.turns = []
         store.detached = []
         store.commit('structure')
