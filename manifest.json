@@ -1,13 +1,18 @@
 {
   "manifest_version": 3,
   "name": "TurnRail — AI Conversation Navigator",
-  "version": "1.0.0",
-  "description": "A lightweight conversation navigator for long AI chats. Index every question, jump instantly — 100% local, no permissions.",
+  "version": "1.1.0",
+  "description": "A lightweight conversation navigator for long AI chats. Index every question, jump instantly - 100% local, private by design.",
   "minimum_chrome_version": "114",
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*", "https://www.chatgpt.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://www.chatgpt.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     }
@@ -17,5 +22,8 @@
     "32": "icons/icon32.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "permissions": [
+    "storage"
+  ]
 }
