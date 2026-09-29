@@ -8,6 +8,7 @@ import { navigationCss } from './styles'
 import { perf } from '../utils/performance'
 import { createRail, layoutMarkers, type Rail } from './rail'
 import { createOutline, type Outline } from './outline'
+import { analyzeConversationHealth } from '../health/analyzer'
 
 export const HOST_ID = 'turnrail-host'
 
@@ -126,6 +127,22 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
   }
 
   let outlineDirty = false
+  let healthSignature = ''
+
+  function renderHealth(force = false): void {
+    const store = storeRef
+    if (!store) {
+      outline.setHealth(null)
+      healthSignature = ''
+      return
+    }
+    const userTurns = store.turns.filter((turn) => turn.user)
+    const last = userTurns[userTurns.length - 1]
+    const signature = `${userTurns.length}:${last?.id ?? ''}:${last?.user?.text.length ?? 0}`
+    if (!force && signature === healthSignature) return
+    healthSignature = signature
+    outline.setHealth(analyzeConversationHealth(store.turns))
+  }
 
   function renderList(): void {
     const store = storeRef
@@ -236,6 +253,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
       renderRail()
       renderList()
       outline.setCount(store.turns.filter((turn) => turn.user).length)
+      renderHealth(kind === 'structure')
       refreshScrollListener()
     }
   }
@@ -252,6 +270,8 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.setStatus('')
     outline.setCount(0)
     outline.setCached(false)
+    outline.setHealth(null)
+    healthSignature = ''
     rail.render([], { tops: [], railHeight: 0, markerHeight: 0 })
     rail.setActive(undefined)
     layer.classList.add('tn-hidden')
