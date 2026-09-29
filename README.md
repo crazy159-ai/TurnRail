@@ -1,6 +1,6 @@
 # TurnRail — AI Conversation Navigator
 
-A lightweight conversation navigator for long AI chats. Works on chatgpt.com · No permissions · No telemetry.
+A lightweight conversation navigator for long AI chats. Works on chatgpt.com · Minimal permissions（仅 `storage`） · No telemetry.
 
 在 ChatGPT 网页版（chatgpt.com）右侧添加一个 DeepSeek 风格的"对话导航 / 快速跳转"轨道：
 实时索引当前会话的全部用户提问，点击即平滑跳转，滚动时自动高亮当前正在阅读的问题。
@@ -27,11 +27,24 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 
 ## Installation（Chrome 安装方法）
 
-1. 下载/解压本扩展，得到包含 `manifest.json` 的 `dist/` 目录（或直接使用发布 zip 解压后目录）。
-2. 打开 Chrome，访问 `chrome://extensions/`。
-3. 打开右上角「开发者模式」。
-4. 点击「加载已解压的扩展程序」，选择 `dist/` 目录。
+**普通用户安装（推荐）：从 GitHub Releases 下载 ZIP**
+
+1. 打开本项目的 [Releases](../../releases) 页面，下载最新版 `turnrail-vX.Y.Z.zip`。
+2. 解压 ZIP，得到包含 `manifest.json` 的目录（ZIP 根目录即为扩展根目录）。
+3. 打开 Chrome，访问 `chrome://extensions/`，打开右上角「开发者模式」。
+4. 点击「加载已解压的扩展程序」，选择解压后的目录。
+
+**开发安装**：本仓库 clone 后执行 `npm install && npm run build`，产物在 `dist/`，
+按上述步骤选择 `dist/` 目录加载（修改代码后在 `chrome://extensions/` 中点击「重新加载」）。
+
 5. 打开 [chatgpt.com](https://chatgpt.com) 任意会话，页面右侧即出现导航轨道。
+
+## Releases
+
+正式发布版本通过 [GitHub Releases](../../releases) 提供跨平台构建的 ZIP
+（`turnrail-vX.Y.Z.zip`，ZIP 根目录即扩展根目录，解压即可加载）。
+Release 由 tag（`vX.Y.Z`）触发，流水线自动完成版本一致性检查、typecheck、单元测试、
+浏览器回归测试与打包；用户无需自行构建。
 
 ## Supported ChatGPT URL
 
@@ -42,11 +55,16 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 
 ## Development
 
+开发环境要求 Node.js **22 LTS 或更高**（`package.json` 的 `engines` 字段声明）。
+
 ```bash
 npm install
-npm run dev       # watch 模式构建（输出到 dist/）
-npm run typecheck # TypeScript strict 检查
-npm test          # Node 单元测试（18 项，无需浏览器）
+npm run dev         # watch 模式构建（输出到 dist/）
+npm run typecheck   # TypeScript strict 检查
+npm test            # Node 单元测试（无需浏览器）
+npm run build       # typecheck + 生产构建
+npm run check       # 版本一致性 + 生产构建 + 全部单元测试（提交 PR 前的一次性门槛）
+npm run test:browser  # Playwright 浏览器冒烟测试（Chromium，见「测试」章节）
 ```
 
 修改代码后，在 `chrome://extensions/` 中点击扩展的「重新加载」，再刷新 ChatGPT 页面。
@@ -58,11 +76,13 @@ npm test          # Node 单元测试（18 项，无需浏览器）
 
 ```bash
 npm install
-npm run build     # tsc --noEmit + vite build
-npm run zip       # 将 dist/ 打包为 turnrail.zip
+npm run build      # tsc --noEmit + vite build
+npm run package    # 构建 + 版本一致性检查 + 打包为 release/turnrail-vX.Y.Z.zip（跨平台 Node 实现）
 ```
 
 构建产物：`dist/content.js`（IIFE 单文件 content script）+ `dist/manifest.json` + `dist/icons/`。
+发布 ZIP 由 `npm run package` 生成（`scripts/package.mjs`，Windows / Linux / macOS 通用），
+内容只含扩展运行时文件（manifest.json / content.js / icons/）。
 
 ## Architecture
 
@@ -70,8 +90,11 @@ npm run zip       # 将 dist/ 打包为 turnrail.zip
 ChatGPT DOM
     │
     ▼
-ChatGPTAdapter (providers/chatgpt.ts)   ← 全部站点 selector 集中于此
-    │  locateMessages / getRole / getText / getTurnElement / getConversationId
+ChatGptProvider (providers/chatgpt.ts)   ← 全部站点 selector 集中于此
+    │  locateTurns / locateTurnRoots / parseTurn        （Turn-first 主路径）
+    │  locateMessages                                   （legacy fallback）
+    │  getConversationRoot / getScrollContainer / getConversationId / hasConversation
+    │  hasRecognizableContent / getMutationHints / getDiagnostics      （UI・管道・诊断专用）
     ▼
 ConversationIndexer (conversation/indexer.ts)
     │  scan（full） / scanDirty（增量）→ 去重 → stableId → reconcile
@@ -215,6 +238,18 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 （TTFR / TTLR、full vs incremental 扫描数、observer 分类计数），`__tn.resetPerformanceStats()`
 重置。仅本地统计，无上传、无聊天正文。
 
+## Roadmap
+
+- **v1.3 — Cache Management & Storage Correctness**：多标签页安全的缓存索引
+  （当前共享 `turnrail:cache:index` 为 read-modify-write，last-writer-wins 可能丢条目）、
+  recent cache / LRU、存储管理 UI。
+- **v1.4 — Large Conversation Scalability**：100 / 300 / 500 / 1000 turn 基准测试；
+  当前 `scanDirty()` 虽只解析 dirty turn，但仍经 `locateTurnRoots()` 全量枚举
+  （增量解析 ≠ 严格 O(1) 索引，属 v1.2 正常设计），届时按实测决定是否引入
+  direct dirty-root upsert、outline virtualization、marker clustering、geometry index。
+- **v1.5 — Provider Architecture**：Provider 能力抽象与注册机制。
+- **v2.0 — Multi-provider**：Claude / Gemini / DeepSeek 等站点支持。
+
 ## Known limitations
 
 - ChatGPT DOM 改版（尤其 `data-turn-key` / `data-chatgpt-search-unit-key` 结构变化）时需更新
@@ -239,23 +274,35 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 
 ## 测试
 
-- `test/unit/`：Node 原生 runner（`npm test`）的 33 项单元测试 —— serialize 纯净性、
+```bash
+npm test             # Node 单元测试（tsx 加载 TypeScript，无需浏览器）
+npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 npx playwright install chromium）
+```
+
+- `test/unit/`：Node 单元测试 —— serialize 纯净性、
   缓存校验（合法 / 损坏 / 未来 schema）、hydrate、缓存×Live reconcile（保序 + Live 胜出 + 不重复）、
   route 竞态隔离、stale 判定与清理、CacheStore 索引 / 清除 / touch、storage 失败降级 Live-only、
   live→cache→hydrate 端到端往返。
   v1.2 增量：Mutation 分类（streaming 忽略 / 首挂载不误伤 / unknown 回退）、Dirty 队列去重与
   批量合并、scanDirty 只解析新 turn（旧 turn 零查询）、卸载 turn metadata 保留、
   启动稳定性退避（恒定签名 3 扫即停 / 不稳定走满 / root 缺失不计稳定）。
+  v1.2.1 增量：版本一致性、隐私合同（manifest 权限 / host / 运行时无网络原语）、
+  Provider selector 边界、RootWatch 超时低频恢复、诊断导出隐私、打包清单一致性。
+- `test/browser/`：Playwright 浏览器冒烟测试，直接自动化下列既有测试资产（无需登录 ChatGPT）。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
 - `test/mock/index.html`：按 2026-09 真实 DOM 结构构建的高仿真测试台
   （含流式输出、懒加载 prepend、虚拟化卸载、SPA 路由切换、重复文本、UI 噪声注入、深浅色）。
+- `test/mock/reverse.html`：column-reverse 滚动坐标系测试台（复刻真实 ChatGPT）。
+
+本地手动打开测试台（与 Playwright 内置 server 相同的跨平台 Node 实现）：
 
 ```bash
-python -m http.server 8931   # 在项目根目录
+node scripts/serve-test-pages.mjs   # 在项目根目录，默认 http://127.0.0.1:8931
 # fixture: http://127.0.0.1:8931/test/fixture/index.html
 # mock:    http://127.0.0.1:8931/test/mock/index.html
+# reverse: http://127.0.0.1:8931/test/mock/reverse.html
 ```
 
 真实页面验收：控制台执行 `localStorage.setItem('tn-debug','1')` 并刷新，检查 `__tnDebug`：
