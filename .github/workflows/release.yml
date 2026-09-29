@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      # 仅创建 Release 与上传产物需要；其余步骤不需要更多权限
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+      # tag vX.Y.Z 必须与 package.json / manifest.json 的 X.Y.Z 一致，否则失败
+      - name: Verify tag/version consistency
+        run: node scripts/check-release-tag.mjs
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      # 完整质量门槛：版本一致性 + typecheck + 单元测试 + 生产构建
+      - run: npm run check
+
+      # build + 打包 release/turnrail-v<version>.zip（脚本内置 ZIP 内容复核）
+      - run: npm run package
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "TurnRail $GITHUB_REF_NAME" \
+            --generate-notes \
+            release/turnrail-v*.zip
