@@ -1,5 +1,6 @@
 import { createEl } from '../utils/dom'
 import type { ConversationTurn } from '../conversation/types'
+import type { ConversationHealthSnapshot } from '../health/types'
 
 export interface OutlineHandlers {
   onJump: (turnId: string) => void
@@ -16,6 +17,7 @@ export interface Outline {
   close(): void
   isOpen(): boolean
   setCount(count: number): void
+  setHealth(snapshot: ConversationHealthSnapshot | null): void
   renderItems(turns: ConversationTurn[], query: string, detectFailed: boolean): void
   setActive(turnId: string | undefined): void
   setStatus(text: string): void
@@ -78,6 +80,18 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   search.setAttribute('aria-label', '搜索当前对话的问题')
   search.addEventListener('input', () => handlers.onSearchInput(search.value))
 
+  // 对话健康：仅展示 TurnRail 本地启发式结果，不声称知道模型真实上下文窗口
+  const health = createEl('section', 'tn-health tn-health-hidden')
+  health.setAttribute('aria-live', 'polite')
+  const healthTop = createEl('div', 'tn-health-top')
+  const healthLabel = createEl('span', 'tn-health-label', '对话健康')
+  const healthScore = createEl('strong', 'tn-health-score', '100')
+  healthTop.append(healthLabel, healthScore)
+  const healthMessage = createEl('div', 'tn-health-message', '')
+  const healthReasons = createEl('div', 'tn-health-reasons', '')
+  const healthNote = createEl('div', 'tn-health-note', '本地启发式评估，不代表 ChatGPT 实际剩余上下文。')
+  health.append(healthTop, healthMessage, healthReasons, healthNote)
+
   // 列表
   const list = createEl('div', 'tn-list')
   list.setAttribute('role', 'list')
@@ -93,7 +107,7 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   loadButton.addEventListener('click', () => handlers.onLoadHistory())
   foot.append(status, loadButton)
 
-  element.append(head, search, list, foot)
+  element.append(head, search, health, list, foot)
 
   const items = new Map<string, HTMLButtonElement>()
   let activeId: string | undefined
@@ -117,6 +131,27 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
 
   function setCount(value: number): void {
     count.textContent = String(value)
+  }
+
+  function setHealth(snapshot: ConversationHealthSnapshot | null): void {
+    if (!snapshot || snapshot.evidence.turnCount < 3) {
+      health.classList.add('tn-health-hidden')
+      health.removeAttribute('data-level')
+      healthScore.textContent = ''
+      healthMessage.textContent = ''
+      healthReasons.textContent = ''
+      return
+    }
+
+    health.classList.remove('tn-health-hidden')
+    health.dataset.level = snapshot.level
+    healthScore.textContent = String(snapshot.score)
+    healthMessage.textContent = snapshot.recommendation
+    healthReasons.textContent = snapshot.reasons.join(' · ')
+    healthReasons.classList.toggle('tn-health-reasons-hidden', snapshot.reasons.length === 0)
+    const label = `对话健康度 ${snapshot.score} 分。 ${snapshot.recommendation}`
+    health.setAttribute('aria-label', label)
+    health.title = label
   }
 
   function setCached(value: boolean): void {
@@ -211,5 +246,5 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     handlers.onSearchInput('')
   }
 
-  return { element, open, close, isOpen, setCount, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled }
+  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled }
 }
