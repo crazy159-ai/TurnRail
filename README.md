@@ -21,6 +21,7 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
   - 「加载全部历史」：受控向上滚动渐进收获历史（有超时/迭代上限，结束恢复阅读位置）
   - 点击未加载问题自动受控滚动查找（recover），失败安全回退
 - 目录内搜索（大小写不敏感子串匹配）
+- 🩺 Chat health check：完全本地的多信号启发式评估（0–100），结合对话长度、方案反转、纠错频率、主题漂移、跨轮依赖与复杂度，在风险叠加时提示整理阶段结论或新开聊天；**不声称知道 ChatGPT 实际上下文窗口，也不会自动替用户换聊**
 - ⚡ Cached conversation navigation：为选定的会话主动缓存导航元数据，重新打开时目录立即出现（ChatGPT 历史在后台继续加载，TurnRail 自动与真实 DOM 调和绑定）
 - 深浅色自动跟随 ChatGPT / 系统
 - 无障碍：rail 为 navigation 语义、每个 marker 是带 aria-label 的按钮、面板支持键盘焦点与 Esc 关闭
@@ -135,6 +136,7 @@ ConversationIndexer (conversation/indexer.ts)
 | `conversation/indexer.ts` | 扫描 → 稳定 ID → 去重 → 调和 turn 列表（含未挂载 turn 的锚定保留） |
 | `conversation/store.ts` | 纯数据仓库 + 事件广播；UI 从 store 渲染，不把 DOM 当 store |
 | `conversation/historyCapture.ts` | 「加载全部历史」受控滚动捕获 |
+| `health/analyzer.ts` / `health/types.ts` | 本地聊天健康评估：六类可解释信号 → 风险/健康分级；不联网、不读取模型内部上下文状态 |
 | `navigation/scrollSpy.ts` | 阅读位置检测（active turn） |
 | `navigation/jump.ts` | 平滑跳转 + sticky header 补偿 + 一次性 outline 脉冲 |
 | `navigation/recoverTarget.ts` | 未挂载目标的受控滚动恢复跳转 |
@@ -173,7 +175,7 @@ TurnRail 支持由用户**主动**缓存所选会话的导航元数据（面板�
 
 TurnRail runs locally in your browser.
 
-- 所有索引、标题、搜索全部在页面本地内存中完成
+- 所有索引、标题、搜索与聊天健康评估全部在页面本地内存中完成
 - 不发送任何网络请求，不集成任何统计/遥测，无任何后端
 - 用户主动缓存的导航元数据使用 `chrome.storage.local` 本地保存；TurnRail 不上传缓存数据
 - 缓存只含导航元数据（turn ID / 顺序 / 标题 / 短 preview），绝不含回答正文、HTML 或附件
@@ -257,6 +259,7 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 
 ## Known limitations
 
+- 聊天健康分数是 TurnRail 基于**已索引内容**的本地启发式估算，不等于 ChatGPT 的真实 token 使用量、上下文裁剪状态或 Memory 状态；其作用是提醒长对话中的工程风险，而不是给出模型内部状态的确定结论。
 - ChatGPT DOM 改版（尤其 `data-turn-key` / `data-chatgpt-search-unit-key` 结构变化）时需更新
   `providers/chatgpt.ts` 中的 `SELECTORS` 表；legacy fallback 的启发式角色推断可能失效。
 - 无原生 ID（`data-turn-key` / `data-chatgpt-search-message-ids` 均缺失）时，完全相同文本的问题
