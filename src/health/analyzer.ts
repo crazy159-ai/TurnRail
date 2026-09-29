@@ -11,8 +11,12 @@ const TOPIC_RECENT_WINDOW = 5
 const MAX_TEXT_PER_TURN = 24_000
 const MAX_LEXICAL_UNITS = 900
 
+// 纠错信号只认"用户在纠正模型 / 要求重做"的表达，不认话题词：
+// - 裸 `错误` 会命中"错误处理""报错信息"这类调试话题，裸 `wrong` 会命中
+//   "what's wrong with X" 这类设计提问，均已在审查中排除（避免单轮误判）；
+// - `修正` 会命中"修正 README 拼写"这类普通任务请求，同样排除。
 const CORRECTION_RE =
-  /(不对|错了|有误|错误|你理解错|理解有误|重新来|重新做|重做|修正|纠正|还是不对|仍然不对|并不是|wrong|incorrect|mistake|redo|do it again|fix this|you misunderstood)/i
+  /(不对|错了|有误|理解错|搞错|说错|你理解错|重新来|重新做|重做|纠正|还是不对|仍然不对|并不是|not right|that's wrong|this is wrong|you're wrong|still wrong|incorrect|mistake|redo|do it again|fix this|you misunderstood)/i
 
 const CHURN_RE =
   /(改成|改为|换成|切换到|不要用|不用了|取消之前|撤销|回滚|推翻|之前.*现在|现在改|instead|switch to|change to|rather than|actually use|revert|roll back|drop the previous)/i
@@ -27,6 +31,24 @@ function clamp01(value: number): number {
   if (!Number.isFinite(value)) return 0
   return Math.max(0, Math.min(1, value))
 }
+
+/**
+ * 风险权重：R = .30L + .20D + .20C + .15T + .10Rd + .05F。
+ * 集中定义（避免 magic numbers 散落），单测保证 sum === 1。
+ *
+ * 由此得到的关键不变式：单一信号的最大贡献只有 0.30（L），因此即使某一
+ * 信号拉满（如 80 轮超长但稳定的对话），分数也不可能单独落入 new-chat
+ * 区间（score ≥ 70 ≥ watch 下限）——"单一指标不得触发换聊建议"由数学
+ * 结构保证，不依赖额外 guard 代码。
+ */
+export const HEALTH_WEIGHTS = {
+  lengthPressure: 0.3,
+  decisionChurn: 0.2,
+  correctionFrequency: 0.2,
+  topicDrift: 0.15,
+  referenceDependency: 0.1,
+  complexityPressure: 0.05
+} as const
 
 function scale(value: number, low: number, high: number): number {
   if (high <= low) return value >= high ? 1 : 0
@@ -271,15 +293,14 @@ export function analyzeConversationHealth(
     complexityPressure: round3(complexityPressure)
   }
 
-  // 延续此前 TurnRail 讨论中的权重：
-  // R = .30L + .20D + .20C + .15T + .10Rd + .05F
+  // 风险 = 六信号加权和（权重见 HEALTH_WEIGHTS，和为 1）
   const risk = clamp01(
-    signals.lengthPressure * 0.3 +
-      signals.decisionChurn * 0.2 +
-      signals.correctionFrequency * 0.2 +
-      signals.topicDrift * 0.15 +
-      signals.referenceDependency * 0.1 +
-      signals.complexityPressure * 0.05
+    signals.lengthPressure * HEALTH_WEIGHTS.lengthPressure +
+      signals.decisionChurn * HEALTH_WEIGHTS.decisionChurn +
+      signals.correctionFrequency * HEALTH_WEIGHTS.correctionFrequency +
+      signals.topicDrift * HEALTH_WEIGHTS.topicDrift +
+      signals.referenceDependency * HEALTH_WEIGHTS.referenceDependency +
+      signals.complexityPressure * HEALTH_WEIGHTS.complexityPressure
   )
   const score = Math.round((1 - risk) * 100)
   const level = healthLevel(score)
