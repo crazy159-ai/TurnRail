@@ -69,6 +69,11 @@ npm run test:browser  # Playwright 浏览器冒烟测试（Chromium，见「测�
 
 修改代码后，在 `chrome://extensions/` 中点击扩展的「重新加载」，再刷新 ChatGPT 页面。
 
+Development note（Chrome 正常行为，非缺陷）：重新加载 unpacked extension 后，已经打开的
+ChatGPT 标签页仍持有旧 content-script context，其 `chrome.storage` 调用会以
+"Extension context invalidated." 失败；TurnRail 对此会安静降级为 Live-only 模式
+（仅 tn-debug 下留痕），请同时刷新这些 ChatGPT 页面以恢复完整缓存功能。
+
 调试日志：在页面控制台执行 `localStorage.setItem('tn-debug', '1')` 并刷新（生产默认关闭）。
 性能指标：`__tnDebug.performance`（TTFR / TTLR / 扫描与 observer 分类计数），`__tn.resetPerformanceStats()` 重置。
 
