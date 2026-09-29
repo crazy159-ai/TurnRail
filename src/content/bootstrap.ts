@@ -11,8 +11,9 @@ import { createRouteWatcher } from './routeWatcher'
 import { createMutationPipeline } from './mutationPipeline'
 import { startStartupScan } from './startupScan'
 import { perf } from '../utils/performance'
+import { buildDiagnostics } from '../utils/diagnostics'
 import { isAtVisualBottom, isAtVisualTop, getScrollBounds } from '../navigation/scrollGeometry'
-import { DEBUG, reportError } from '../utils/logger'
+import { DEBUG, debugLog, debugWarn, reportError } from '../utils/logger'
 import { debounce } from '../utils/debounce'
 import { ConversationCacheStore } from '../cache/cacheStore'
 import { serializeConversation } from '../cache/serializer'
@@ -432,8 +433,29 @@ export function bootstrap(): void {
 
   // DEV 钩子：tn-debug=1 时暴露诊断信息（不含任何聊天正文）
   if (DEBUG) {
-    Object.defineProperty(globalThis, '__tnDebug', {
-      get: () => {
+    /** 扩展版本（chrome.runtime.getManifest）；不可用时 'unknown' */
+    function getExtensionVersion(): string {
+      try {
+        const manifest = (globalThis as unknown as Record<string, any>).chrome?.runtime?.getManifest?.()
+        if (typeof manifest?.version === 'string') return manifest.version
+      } catch {
+        // 非扩展环境（测试台）无 chrome.runtime
+      }
+      return 'unknown'
+    }
+
+    function buildTurnRailDiagnostics() {
+      return buildDiagnostics({
+        version: getExtensionVersion(),
+        provider,
+        store,
+        cache: cacheStore,
+        performance: perf.snapshot(),
+        markers: () => ui.host.shadowRoot?.querySelectorAll('.tn-marker').length ?? 0
+      })
+    }
+
+    Object.defineProperty(globalThis, '__tnDebug', {      get: () => {
         const sc = provider.getScrollContainer()
         const bounds = sc ? getScrollBounds(sc) : null
         return {
@@ -470,7 +492,19 @@ export function bootstrap(): void {
       indexer,
       cache: cacheStore,
       recoverLog: getRecoverLog,
-      resetPerformanceStats: () => perf.reset()
+      resetPerformanceStats: () => perf.reset(),
+      // 诊断导出（纯元数据，无聊天正文；见 utils/diagnostics.ts 隐私合同）：
+      // 生成 JSON → 尝试写入剪贴板；剪贴板不可用时返回 JSON 字符串。绝不自动发送。
+      copyDiagnostics: async (): Promise<string> => {
+        const json = JSON.stringify(buildTurnRailDiagnostics(), null, 2)
+        try {
+          await navigator.clipboard.writeText(json)
+          debugLog('TurnRail 诊断已复制到剪贴板')
+        } catch {
+          debugWarn('剪贴板不可用，诊断 JSON 以返回值提供')
+        }
+        return json
+      }
     }
   }
 }
