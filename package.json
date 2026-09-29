@@ -1,7 +1,7 @@
 {
   "name": "turnrail",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "license": "MIT",
   "description": "A lightweight conversation navigator for long AI chats (Chrome Extension, Manifest V3).",

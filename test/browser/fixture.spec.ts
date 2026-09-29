@@ -32,5 +32,17 @@ test('fixture: 真实结构最小 fixture 完整解析并渲染 rail', async ({ 
   expect(debug.storeTurns).toBe(1)
   expect(debug.markers).toBe(1)
 
+  // 诊断导出冒烟：版本正确、JSON 可解析、不含聊天正文（fixture 正文 "Hello"/"Hi"）
+  const diag = await page.evaluate(async () => {
+    const json = await (globalThis as any).__tn.copyDiagnostics()
+    return { parsed: JSON.parse(json), json: json as string }
+  })
+  // 版本：扩展环境为 chrome.runtime.getManifest().version；
+  // 测试台以普通 <script> 加载（无 chrome.runtime）→ 回退 'unknown'
+  expect(diag.parsed.turnrailVersion).toMatch(/^(\d+\.\d+\.\d+|unknown)$/)
+  expect(diag.parsed.navigation.storeTurns).toBe(1)
+  expect(diag.json.includes('Hello')).toBe(false)
+  expect(diag.json.includes('Hi"')).toBe(false)
+
   expect(errors, '页面不应出现 JS 错误').toEqual([])
 })
