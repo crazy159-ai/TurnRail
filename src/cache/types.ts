@@ -85,6 +85,17 @@ export interface CacheIndexEntry {
 /** 索引在 storage 中的存储形态：conversationKey → entry */
 export type CacheIndexMap = Record<string, CacheIndexEntry>
 
+/**
+ * v1.2.2：storage 不可用的原因（只存在于内存，绝不写入 chrome.storage）。
+ * missing-api = 环境没有 chrome.storage.local；
+ * extension-context-invalidated = 扩展重载后旧 context 的预期生命周期异常；
+ * storage-error = 其他未知 storage 故障（仍走 reportError）。
+ */
+export type CacheUnavailableReason =
+  | 'missing-api'
+  | 'extension-context-invalidated'
+  | 'storage-error'
+
 /** DEBUG 指标（只含元数据，绝不含任何聊天正文） */
 export interface CacheStats {
   available: boolean
