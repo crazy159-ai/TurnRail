@@ -164,6 +164,72 @@ export const navigationCss = `
 .tn-search::placeholder {
   color: var(--tn-muted);
 }
+
+.tn-health {
+  margin: 0 12px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--tn-border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--tn-bg) 82%, var(--tn-border));
+  color: var(--tn-text);
+}
+.tn-health-hidden {
+  display: none;
+}
+.tn-health-top {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+.tn-health-label {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+}
+.tn-health-score {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.tn-health-message {
+  font-size: 12px;
+  line-height: 1.45;
+}
+.tn-health-reasons {
+  margin-top: 4px;
+  color: var(--tn-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.tn-health-reasons-hidden {
+  display: none;
+}
+.tn-health-note {
+  margin-top: 4px;
+  color: var(--tn-muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+.tn-health[data-level="healthy"] .tn-health-score {
+  color: var(--tn-accent);
+}
+.tn-health[data-level="watch"] {
+  border-color: rgba(184, 134, 11, 0.32);
+}
+.tn-health[data-level="organize"] {
+  border-color: rgba(211, 126, 25, 0.45);
+}
+.tn-health[data-level="organize"] .tn-health-score {
+  color: #c66d16;
+}
+.tn-health[data-level="new-chat"] {
+  border-color: rgba(210, 72, 72, 0.48);
+  background: color-mix(in srgb, var(--tn-bg) 90%, rgba(210, 72, 72, 0.16));
+}
+.tn-health[data-level="new-chat"] .tn-health-score {
+  color: #cf4d4d;
+}
+
 .tn-list {
   flex: 1;
   overflow-y: auto;
