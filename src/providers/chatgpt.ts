@@ -1,7 +1,15 @@
 import { collapseWhitespace } from '../utils/dom'
 import { debugLog } from '../utils/logger'
 import { fnv1a } from '../conversation/stableId'
-import type { ChatProvider, LocatedMessage, LocatedTurn, LocatedTurnRoot, ProviderRole } from './types'
+import type {
+  ChatProvider,
+  LocatedMessage,
+  LocatedTurn,
+  LocatedTurnRoot,
+  ProviderDiagnostics,
+  ProviderMutationHints,
+  ProviderRole
+} from './types'
 
 /**
  * 2026-09 真实 chatgpt.com DOM 的正式 selector（已由 DevTools 诊断验证）。
@@ -112,6 +120,42 @@ export class ChatGptProvider implements ChatProvider {
 
   hasConversation(): boolean {
     return this.getConversationRoot() !== null
+  }
+
+  /**
+   * UI 可见性兜底：页面存在任何一代可识别的会话内容。
+   * （Turn 主路径 → legacy 角色属性 → legacy article 容器）
+   */
+  hasRecognizableContent(): boolean {
+    return (
+      document.querySelector(SELECTORS.turn) !== null ||
+      document.querySelector(`[${LEGACY_ROLE_ATTR}]`) !== null ||
+      document.querySelector('article[data-testid^="conversation-turn"]') !== null
+    )
+  }
+
+  /** Mutation 管道 selector 提示（唯一出口，管道不 import SELECTORS） */
+  getMutationHints(): ProviderMutationHints {
+    return {
+      turnSelector: SELECTORS.turn,
+      assistantUnitSelectors: [SELECTORS.assistantUnit, SELECTORS.assistantUnitFallback]
+    }
+  }
+
+  /** 健康诊断：纯元数据计数，绝无正文 / 会话 ID / URL */
+  getDiagnostics(): ProviderDiagnostics {
+    const root = this.getConversationRoot()
+    const scrollContainer = this.getScrollContainer()
+    return {
+      conversationRoot: root !== null,
+      scrollContainer: scrollContainer !== null,
+      turnRoots: root ? root.querySelectorAll(SELECTORS.turn).length : 0,
+      userUnits: document.querySelectorAll(`${SELECTORS.userUnit}, ${SELECTORS.userUnitFallback}`).length,
+      assistantUnits: document.querySelectorAll(
+        `${SELECTORS.assistantUnit}, ${SELECTORS.assistantUnitFallback}`
+      ).length,
+      strategy: this.lastStrategyLabel
+    }
   }
 
   /** 廉价定位：仅收集 turn root（原生顺序 → 按视觉顺序规整），不做正文提取 */

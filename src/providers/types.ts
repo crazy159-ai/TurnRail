@@ -33,6 +33,31 @@ export interface LocatedTurnRoot {
 }
 
 /**
+ * Mutation 管道所需的站点 selector 提示：
+ * 管道自身不认识任何站点属性，selector 由 Provider 集中下发。
+ */
+export interface ProviderMutationHints {
+  /** turn 容器选择器 */
+  turnSelector: string
+  /** assistant unit 选择器（含 fallback） */
+  assistantUnitSelectors: readonly string[]
+}
+
+/**
+ * Provider 健康诊断（纯元数据，绝不含聊天正文 / 会话 ID / URL）。
+ * 供 DEBUG 面板与 diagnostics 导出使用。
+ */
+export interface ProviderDiagnostics {
+  conversationRoot: boolean
+  scrollContainer: boolean
+  turnRoots: number
+  userUnits: number
+  assistantUnits: number
+  /** 最近一次定位使用的策略标签 */
+  strategy: string
+}
+
+/**
  * 站点适配层：所有"针对 ChatGPT DOM 的查询"必须集中在这里，
  * 其余模块只依赖本接口。站点改版时只改这个实现。
  */
@@ -63,6 +88,18 @@ export interface ChatProvider {
 
   /** UI 可见性依据：存在会话容器即视为会话页（不依赖 URL） */
   hasConversation(): boolean
+
+  /**
+   * UI 可见性兜底：页面存在可识别的会话内容（任何一代 DOM 结构）。
+   * UI 不得自行查询站点 selector，一律经由此方法。
+   */
+  hasRecognizableContent(): boolean
+
+  /** Mutation 管道 selector 提示（管道不 import 任何站点 SELECTORS） */
+  getMutationHints(): ProviderMutationHints
+
+  /** 健康诊断（DEBUG / diagnostics 导出用，纯元数据） */
+  getDiagnostics(): ProviderDiagnostics
 
   getTurnContainer(element: HTMLElement): HTMLElement | null
 

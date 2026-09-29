@@ -25,6 +25,16 @@ function createTrackingProvider(initial: LocatedTurn[]): {
     locateMessages: () => [],
     getConversationRoot: () => null,
     hasConversation: () => true,
+    hasRecognizableContent: () => true,
+    getMutationHints: () => ({ turnSelector: '[data-turn-key]', assistantUnitSelectors: [] }),
+    getDiagnostics: () => ({
+      conversationRoot: true,
+      scrollContainer: true,
+      turnRoots: current.length,
+      userUnits: current.length,
+      assistantUnits: current.length,
+      strategy: 'test'
+    }),
     getTurnContainer: () => null,
     getConversationId: () => 'conv-1',
     isConversationRoute: () => true,

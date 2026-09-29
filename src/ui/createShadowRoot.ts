@@ -72,14 +72,6 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
   })
 
   // ---------- 可见性 ----------
-  function hasConversationDom(): boolean {
-    return (
-      document.querySelector('[data-turn-key]') !== null ||
-      document.querySelector('[data-message-author-role]') !== null ||
-      document.querySelector('article[data-testid^="conversation-turn"]') !== null
-    )
-  }
-
   function applyVisibility(): void {
     const store = storeRef
     // UI 可见性依据会话容器是否存在（不依赖 URL）；URL 仅用于 conversationKey
@@ -88,7 +80,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     // 缓存命中且在会话路由上 → 缓存目录不等 conversation root 出现即可见
     //（TTFR 只受 chrome.storage 读取 + UI mount 影响，规格 #94）
     const cachedOutlineReady = store !== null && userTurns > 0 && provider.isConversationRoute()
-    const detectFailed = hasConversation && userTurns === 0 && hasConversationDom()
+    const detectFailed = hasConversation && userTurns === 0 && provider.hasRecognizableContent()
     const showAll = (hasConversation || cachedOutlineReady) && (userTurns > 0 || detectFailed)
     const wasHidden = layer.classList.contains('tn-hidden')
     layer.classList.toggle('tn-hidden', !showAll)
@@ -147,7 +139,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     }
     outlineDirty = false
     perf.outlineFull()
-    const detectFailed = store.turns.length === 0 && provider.hasConversation() && hasConversationDom()
+    const detectFailed = store.turns.length === 0 && provider.hasConversation() && provider.hasRecognizableContent()
     outline.renderItems(store.turns, searchQuery, detectFailed)
   }
 
@@ -158,7 +150,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
       const store = storeRef
       if (store) {
         perf.outlineFull()
-        const detectFailed = store.turns.length === 0 && provider.hasConversation() && hasConversationDom()
+        const detectFailed = store.turns.length === 0 && provider.hasConversation() && provider.hasRecognizableContent()
         outline.renderItems(store.turns, searchQuery, detectFailed)
       }
     }

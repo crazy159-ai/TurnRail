@@ -1,4 +1,4 @@
-import { ChatGptProvider, SELECTORS } from '../providers/chatgpt'
+import { ChatGptProvider } from '../providers/chatgpt'
 import { ConversationStore } from '../conversation/store'
 import { ConversationIndexer } from '../conversation/indexer'
 import { captureFullHistory, isCaptureRunning } from '../conversation/historyCapture'
@@ -183,14 +183,17 @@ export function bootstrap(): void {
   /** streaming / 流式输出导致的布局漂移 → 去抖 geometry refresh（不触发索引） */
   const debouncedSpyRefresh = debounce(() => spy.refresh(), 300)
 
+  // selector 由 Provider 下发（bootstrap 不 import 站点 SELECTORS，边界见 Provider 契约）
+  const mutationHints = provider.getMutationHints()
+
   const pipeline = createMutationPipeline(
     {
-      turnSelector: SELECTORS.turn,
-      assistantUnitSelectors: [SELECTORS.assistantUnit, SELECTORS.assistantUnitFallback],
+      turnSelector: mutationHints.turnSelector,
+      assistantUnitSelectors: mutationHints.assistantUnitSelectors,
       // streaming 判定：target 位于 Store 中已挂载 assistant unit 内部（元素身份比对）。
       // assistant 首次挂载时 Store 尚无绑定 → 不满足 → 走 dirty 路径，不会被误忽略（#23/#63）
       isMountedAssistantTarget: (target) => {
-        for (const selector of [SELECTORS.assistantUnit, SELECTORS.assistantUnitFallback]) {
+        for (const selector of mutationHints.assistantUnitSelectors) {
           const unit = target.closest<HTMLElement>(selector)
           if (!unit) continue
           if (
@@ -434,15 +437,9 @@ export function bootstrap(): void {
         const sc = provider.getScrollContainer()
         const bounds = sc ? getScrollBounds(sc) : null
         return {
-          conversationRoot: !!provider.getConversationRoot(),
-          scrollContainer: !!sc,
-          turnRoots: document.querySelectorAll(
-            '[data-thread-find-target="conversation"] [data-turn-key]'
-          ).length,
-          userUnits: document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"]').length,
-          assistantUnits: document.querySelectorAll('[data-chatgpt-search-unit-key$=":assistant"]').length,
-          userBubbles: document.querySelectorAll('[data-user-message-bubble="true"]').length,
-          assistantMarkdown: document.querySelectorAll('[data-markdown-text-style="assistant-message"]').length,
+          // Provider 健康（conversationRoot / scrollContainer / turnRoots /
+          // userUnits / assistantUnits / strategy）——bootstrap 不自行查询站点 DOM
+          ...provider.getDiagnostics(),
           storeTurns: store.turns.length,
           markers: ui.host.shadowRoot?.querySelectorAll('.tn-marker').length ?? 0,
           providerMode: provider.lastStrategyLabel,
