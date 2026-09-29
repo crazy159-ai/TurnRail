@@ -129,7 +129,11 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
   let outlineDirty = false
   let healthSignature = ''
 
-  function renderHealth(force = false): void {
+  // 健康分只在 structure 事件时重算，且经 signature 去重：
+  // - 'text' 事件 = assistant 流式输出快路径（见 indexer 快路径注释），健康语义信号
+  //   只读 user prompt，不会变；流式期间每个文本批都重算会毁掉 v1.2 的流式优化。
+  // - 'elements' 只换 DOM 绑定，同样不重算。
+  function renderHealth(): void {
     const store = storeRef
     if (!store) {
       outline.setHealth(null)
@@ -138,8 +142,8 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     }
     const userTurns = store.turns.filter((turn) => turn.user)
     const last = userTurns[userTurns.length - 1]
-    const signature = `${userTurns.length}:${last?.id ?? ''}:${last?.user?.text.length ?? 0}`
-    if (!force && signature === healthSignature) return
+    const signature = `${userTurns.length}:${last?.id ?? ''}:${last?.user?.text ?? ''}`
+    if (signature === healthSignature) return
     healthSignature = signature
     outline.setHealth(analyzeConversationHealth(store.turns))
   }
@@ -253,12 +257,11 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
       renderRail()
       renderList()
       outline.setCount(store.turns.filter((turn) => turn.user).length)
-      renderHealth(kind === 'structure')
+      renderHealth()
       refreshScrollListener()
-    } else if (kind === 'text') {
-      // 用户编辑 / 文本重解析可能改变健康信号；不需要重建 rail / outline 列表。
-      renderHealth(true)
     }
+    // 'text'（assistant 流式）刻意不触发健康重算：语义信号只依赖 user prompt，
+    // 结构未变时重算纯属浪费，且会在流式期间造成每批一次的全量分析。
   }
 
   function setActive(turnId: string | undefined): void {
