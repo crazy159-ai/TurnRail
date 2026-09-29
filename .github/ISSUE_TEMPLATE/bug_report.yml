@@ -1,0 +1,78 @@
+name: Bug 报告
+description: TurnRail 功能异常、报错或行为不符合预期
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。**请不要粘贴任何聊天内容 / 对话正文 / 完整 DOM**——诊断信息请使用
+        `__tn.copyDiagnostics()` 输出（纯元数据，不含聊天内容）。
+
+  - type: input
+    id: turnrail-version
+    attributes:
+      label: TurnRail 版本
+      description: 扩展版本号（chrome://extensions 中可见，或诊断输出里的 turnrailVersion）
+    validations:
+      required: true
+
+  - type: input
+    id: chrome-version
+    attributes:
+      label: Chrome 版本
+      placeholder: 例如 129.0.6668.59
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统
+      placeholder: 例如 Windows 11 / macOS 15
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从打开 chatgpt.com 开始的完整操作序列
+      placeholder: |
+        1. 打开会话 …
+        2. 点击 …
+        3. 出现 …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断输出
+      description: |
+        页面控制台执行 `localStorage.setItem('tn-debug','1')` 并刷新后，
+        执行 `__tn.copyDiagnostics()`，粘贴其 JSON 输出（纯元数据）。
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息
+      description: 控制台日志截图等（务必遮挡聊天内容）
+    validations:
+      required: false

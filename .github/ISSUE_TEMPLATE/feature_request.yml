@@ -1,0 +1,41 @@
+name: 功能建议
+description: 提出新功能或改进
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        TurnRail 的定位是**轻量的会话导航器**（索引 / 跳转 / 阅读位置）。
+        为避免项目无边界扩张，请重点说明问题本身与它为何属于 TurnRail。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到的问题
+      description: 现在使用 TurnRail（或不使用）时遇到了什么困难？
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: 期望的工作流
+      description: 你希望如何使用这个功能？
+    validations:
+      required: true
+
+  - type: textarea
+    id: fit
+    attributes:
+      label: 为什么它属于 TurnRail
+      description: 它与"长 AI 会话导航"核心定位的关系；不是所有好主意都该进来
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 该功能不需要新增网络请求 / 新增 Chrome 权限 / 持久化聊天正文
+          required: true

@@ -1,0 +1,55 @@
+name: ChatGPT DOM 兼容性
+description: ChatGPT 页面更新后轨道消失 / 识别 0 turns / 跳转失败
+labels: ['dom-compatibility', 'bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ChatGPT 改版可能导致 TurnRail 的 selector 策略失效。此类报告对维护者非常有价值。
+        **不要粘贴完整 DOM 或聊天正文**——除非维护者明确要求提供最小匿名 fixture。
+
+  - type: checkboxes
+    id: symptoms
+    attributes:
+      label: 症状（可多选）
+      options:
+        - label: 右侧轨道消失（会话页不出现）
+        - label: 轨道出现但显示"无法识别当前对话内容"警示点
+        - label: 识别 0 turns / 目录为空
+        - label: 点击跳转失败或跳错位置
+        - label: 滚动高亮（active）失效
+        - label: 其他（请在描述中说明）
+
+  - type: input
+    id: turnrail-version
+    attributes:
+      label: TurnRail 版本
+    validations:
+      required: true
+
+  - type: input
+    id: chrome-version
+    attributes:
+      label: Chrome 版本
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: `__tn.copyDiagnostics()` 输出
+      description: |
+        页面控制台执行 `localStorage.setItem('tn-debug','1')` 并刷新，
+        再执行 `__tn.copyDiagnostics()`，粘贴 JSON（纯元数据：provider 健康、
+        turnRoots / userUnits 计数等，不含聊天内容）。
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: 补充说明
+      description: 问题开始的日期 / 是否登录态 / 免费或 Plus 等会影响页面结构的信息（不要包含个人内容）
+    validations:
+      required: false
