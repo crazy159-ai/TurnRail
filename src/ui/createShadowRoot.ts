@@ -255,6 +255,9 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
       outline.setCount(store.turns.filter((turn) => turn.user).length)
       renderHealth(kind === 'structure')
       refreshScrollListener()
+    } else if (kind === 'text') {
+      // 用户编辑 / 文本重解析可能改变健康信号；不需要重建 rail / outline 列表。
+      renderHealth(true)
     }
   }
 
