@@ -216,6 +216,9 @@ export const navigationCss = `
 .tn-health[data-level="watch"] {
   border-color: rgba(184, 134, 11, 0.32);
 }
+.tn-health[data-level="watch"] .tn-health-score {
+  color: #b3862d;
+}
 .tn-health[data-level="organize"] {
   border-color: rgba(211, 126, 25, 0.45);
 }
