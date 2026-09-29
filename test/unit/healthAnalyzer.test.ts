@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { analyzeConversationHealth } from '../../src/health/analyzer.ts'
+import { analyzeConversationHealth, HEALTH_WEIGHTS } from '../../src/health/analyzer.ts'
 import type { ConversationTurn } from '../../src/conversation/types.ts'
 
 function makeTurns(prompts: string[], assistants: string[] = []): ConversationTurn[] {
@@ -87,4 +87,110 @@ test('health: 输出原因不回显 prompt 正文', () => {
 
   assert.ok(!json.includes(secret))
   assert.ok(snapshot.reasons.length <= 3)
+})
+
+// ---------- 权重合同（§ 权重集中管理） ----------
+
+test('health: 权重和为 1，且各项均在 (0,1) 内', () => {
+  const entries = Object.entries(HEALTH_WEIGHTS)
+  assert.equal(entries.length, 6)
+  const sum = entries.reduce((sum, [, weight]) => sum + weight, 0)
+  assert.ok(Math.abs(sum - 1) < 1e-9, `权重和应为 1，实际 ${sum}`)
+  for (const [name, weight] of entries) {
+    assert.ok(weight > 0 && weight < 1, `${name} 权重应在 (0,1) 内`)
+  }
+})
+
+// ---------- 单信号专项（提示词 Tests 3-6） ----------
+
+/** 与被测场景同规模的中性基线：无纠错 / 无反转 / 无指代 */
+function neutralPrompts(count: number): string[] {
+  return Array.from({ length: count }, (_, i) => `继续完善解析器第 ${i + 1} 个函数，保持接口兼容并同步更新注释。`)
+}
+
+test('health: 纠错频繁时 correctionFrequency 明显升高', () => {
+  const baseline = analyzeConversationHealth(makeTurns(neutralPrompts(14)))
+  const prompts = neutralPrompts(2).concat(
+    Array.from({ length: 12 }, (_, i) =>
+      i % 3 === 0 ? '不对，理解错了，请重新做这一段。' : '还是不对，输出和第 3 轮的要求矛盾，纠正一下。'
+    )
+  )
+  const snapshot = analyzeConversationHealth(makeTurns(prompts))
+
+  assert.ok(
+    snapshot.signals.correctionFrequency > 0.8,
+    `最近窗口高密度纠错应接近 1，实际 ${snapshot.signals.correctionFrequency}`
+  )
+  assert.ok(snapshot.signals.correctionFrequency > baseline.signals.correctionFrequency + 0.5)
+  // 纠错话题词不应被误判："错误处理"是任务词汇，不是对模型的纠正
+  const topicTurns = analyzeConversationHealth(
+    makeTurns(Array.from({ length: 14 }, (_, i) => `讨论错误处理与重试机制的几种设计，第 ${i + 1} 部分。`))
+  )
+  assert.ok(topicTurns.signals.correctionFrequency < 0.3)
+})
+
+test('health: 方案反转频繁时 decisionChurn 明显升高', () => {
+  const baseline = analyzeConversationHealth(makeTurns(neutralPrompts(14)))
+  const prompts = neutralPrompts(2).concat(
+    Array.from(
+      { length: 12 },
+      (_, i) =>
+        i % 2 === 0
+          ? '不要用之前的方案了，改成事件总线，撤销前面关于单例的决定。'
+          : '再换成存储抽象层，现在改为依赖注入的方式。'
+    )
+  )
+  const snapshot = analyzeConversationHealth(makeTurns(prompts))
+
+  assert.ok(snapshot.signals.decisionChurn > 0.8, `反转高密度应接近 1，实际 ${snapshot.signals.decisionChurn}`)
+  assert.ok(snapshot.signals.decisionChurn > baseline.signals.decisionChurn + 0.5)
+})
+
+test('health: 跨轮指代密集时 referenceDependency 升高', () => {
+  const baseline = analyzeConversationHealth(makeTurns(neutralPrompts(16)))
+  const prompts = neutralPrompts(4).concat(
+    Array.from(
+      { length: 12 },
+      (_, i) =>
+        `基于之前第 ${i} 轮的结论，沿用前面确定的目录结构，结合上一轮与上文的约束继续推进。`
+    )
+  )
+  const snapshot = analyzeConversationHealth(makeTurns(prompts))
+
+  assert.ok(
+    snapshot.signals.referenceDependency > baseline.signals.referenceDependency + 0.2,
+    `跨轮指代应抬升依赖信号，实际 ${snapshot.signals.referenceDependency}`
+  )
+})
+
+test('health: 主题漂移（Chrome 扩展 → PINN 桥梁）时 topicDrift 升高', () => {
+  const chrome = Array.from(
+    { length: 15 },
+    (_, i) =>
+      `chrome extension content script: the MutationObserver watches DOM turn nodes, indexer rebuilds rail markers, selector fallback part ${i}.`
+  )
+  const pinn = Array.from(
+    { length: 5 },
+    (_, i) =>
+      `physics informed neural network for bridge dynamics: modal analysis, natural frequency, PINN loss for the PDE residual, case ${i}.`
+  )
+  const drifted = analyzeConversationHealth(makeTurns([...chrome, ...pinn]))
+  const stable = analyzeConversationHealth(makeTurns([...chrome, ...chrome.slice(-5)]))
+
+  assert.ok(drifted.signals.topicDrift > 0.5, `换题后漂移信号应显著升高，实际 ${drifted.signals.topicDrift}`)
+  assert.ok(drifted.signals.topicDrift > stable.signals.topicDrift + 0.4)
+})
+
+// ---------- 单信号保护（§ 不因单一指标进入 new-chat） ----------
+
+test('health: 只有单一信号极端升高时不得进入 new-chat', () => {
+  // 最近 12 轮全部是纠错表达，但对话短、无长度压力、无其他信号
+  const prompts = neutralPrompts(2).concat(
+    Array.from({ length: 12 }, () => '不对，重新做。')
+  )
+  const snapshot = analyzeConversationHealth(makeTurns(prompts))
+
+  assert.ok(snapshot.signals.correctionFrequency > 0.8)
+  assert.notEqual(snapshot.level, 'new-chat')
+  assert.notEqual(snapshot.level, 'organize')
 })
