@@ -6,7 +6,7 @@ on:
       - main
   pull_request:
 
-# 单元检查 job 无需任何写权限
+# 默认只读权限；需要写的 job 单独声明
 permissions:
   contents: read
 
@@ -27,3 +27,20 @@ jobs:
       - run: npm ci
       # check = 版本一致性 + typecheck + 单元测试 + 生产构建；任一失败即 CI red
       - run: npm run check
+
+  # 浏览器冒烟独立 job：避免 Node matrix × Playwright 重复下载 Chromium
+  browser-smoke:
+    name: browser smoke (Node 24)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser

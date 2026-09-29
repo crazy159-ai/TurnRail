@@ -13,11 +13,13 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"test/unit/*.test.ts\"",
+    "test:browser": "playwright test",
     "check:version": "node scripts/check-version.mjs",
     "check": "npm run check:version && npm run build && npm test",
     "package": "npm run build && node scripts/package.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/node": "^22.10.0",
     "adm-zip": "^0.6.1",
     "archiver": "^7.0.1",
