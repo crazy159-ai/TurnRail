@@ -66,6 +66,29 @@ export function bootstrap(): void {
   /** 待落盘的缓存快照描述（debounce 到期或路由离开时写入） */
   let pendingSave: { conversationId: string; complete: boolean } | null = null
 
+  /**
+   * CacheStore 可用性 → UI 缓存控件单向同步（v1.2.2）。
+   * 只切换 disabled，不动 ☆/★：已成功 hydrate 的 ★ 不因 context 失效被抹掉
+   * （真实缓存数据仍在 chrome.storage 里，刷新页面即可恢复访问）。
+   */
+  function syncCacheAvailability(): boolean {
+    const available = cacheStore.isAvailable()
+    ui.setCacheEnabled(available)
+    return available
+  }
+
+  /** 缓存不可用时的提示文案（只在用户主动操作缓存按钮时显示；被动读写不弹） */
+  function cacheUnavailableMessage(): string {
+    switch (cacheStore.getUnavailableReason()) {
+      case 'extension-context-invalidated':
+        return '扩展已重新加载，请刷新 ChatGPT 页面后恢复缓存功能'
+      case 'storage-error':
+        return '缓存暂不可用，导航功能不受影响'
+      default:
+        return '缓存不可用，导航功能不受影响'
+    }
+  }
+
   const scheduleAutoSave = debounce(() => {
     const pending = pendingSave
     pendingSave = null
@@ -92,7 +115,9 @@ export function bootstrap(): void {
         pinned: true,
         createdAt: activeCreatedAt
       })
-      await cacheStore.put(snapshot)
+      const saved = await cacheStore.put(snapshot)
+      syncCacheAvailability()
+      if (!saved) return // 被动自动保存失败：只同步可用性，不打扰用户
     } catch (err) {
       reportError('cache.write', err)
     }
@@ -119,6 +144,9 @@ export function bootstrap(): void {
       perf.markCacheRead(performance.now() - readStart)
       if (gen !== conversationGeneration) return
       if (provider.getConversationId() !== conversationId) return
+      // v1.2.2：null 有两种语义 —— 真 miss（store 仍可用）vs storage 失败（已不可用）。
+      // 不可用时不关 UI 缓存状态（★ 不抹掉），静默退出走 Live-only。
+      if (!syncCacheAvailability()) return
       if (!cached) {
         ui.setCached(false)
         return
@@ -127,7 +155,10 @@ export function bootstrap(): void {
       activeCachedId = conversationId
       activeCreatedAt = cached.createdAt
       hydratedTurnIds = new Set(cached.turns.map((turn) => turn.id))
-      void cacheStore.touch('chatgpt', conversationId)
+      void cacheStore.touch('chatgpt', conversationId).then(() => {
+        // touch 失败同样只同步可用性（CacheStore 内部已 catch，无 unhandled rejection）
+        syncCacheAvailability()
+      })
 
       hydrating = true
       let hydrated = 0
@@ -340,10 +371,12 @@ export function bootstrap(): void {
   /**
    * ☆/★：手动缓存 / 移除当前会话的导航缓存（v1.1 仅用户主动缓存，不自动保存陌生会话）。
    * 快照在 await 之前同步序列化：期间即使切走路由，落盘的也是点击时刻的正确数据。
+   * v1.2.2：所有路径以 storage 操作的真实返回值为准 —— 写入 / 移除失败绝不显示成功，
+   * 并区分"扩展重载"（提示刷新页面）与其他 storage 故障。
    */
   async function handleToggleCache(): Promise<void> {
-    if (!cacheStore.isAvailable()) {
-      ui.setStatus('缓存不可用（chrome.storage 不可用），导航功能不受影响')
+    if (!syncCacheAvailability()) {
+      ui.setStatus(cacheUnavailableMessage())
       window.setTimeout(() => ui.setStatus(''), 3500)
       return
     }
@@ -352,12 +385,28 @@ export function bootstrap(): void {
     const gen = conversationGeneration
     try {
       const existing = await cacheStore.get('chatgpt', conversationId)
+      // get 之后 store 可能已因读取失败转为不可用：此时 null ≠ 未缓存，必须先查可用性
+      if (!syncCacheAvailability()) {
+        ui.setStatus(cacheUnavailableMessage())
+        window.setTimeout(() => {
+          if (gen === conversationGeneration) ui.setStatus('')
+        }, 3500)
+        return
+      }
       if (existing) {
         // 移除缓存，同时取消该会话的待写自动保存，避免“删完又被写回”
         scheduleAutoSave.cancel()
         pendingSave = null
-        await cacheStore.remove('chatgpt', conversationId)
+        const removed = await cacheStore.remove('chatgpt', conversationId)
+        syncCacheAvailability()
         if (gen !== conversationGeneration) return
+        if (!removed) {
+          ui.setStatus(cacheUnavailableMessage())
+          window.setTimeout(() => {
+            if (gen === conversationGeneration) ui.setStatus('')
+          }, 3500)
+          return
+        }
         activeCachedId = null
         activeCreatedAt = undefined
         hydratedTurnIds = null
@@ -370,8 +419,16 @@ export function bootstrap(): void {
           complete: false,
           pinned: true
         })
-        await cacheStore.put(snapshot)
+        const saved = await cacheStore.put(snapshot)
+        syncCacheAvailability()
         if (gen !== conversationGeneration) return
+        if (!saved) {
+          ui.setStatus(cacheUnavailableMessage())
+          window.setTimeout(() => {
+            if (gen === conversationGeneration) ui.setStatus('')
+          }, 3500)
+          return
+        }
         activeCachedId = conversationId
         activeCreatedAt = snapshot.createdAt
         hydratedTurnIds = new Set(snapshot.turns.map((turn) => turn.id))
