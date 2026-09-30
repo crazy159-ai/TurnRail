@@ -103,11 +103,16 @@
   const routeLabel = document.getElementById('route')
   let turnCounter = 0
   let uuidCounter = 0
+  // 深度会话使用稳定 turn id（同一会话重进 id 不变）——缓存 hydrate / staleness
+  // 判定的前提；普通会话保持随机 id（模拟 ChatGPT 新会话新 id）
+  let stableTurnIds = false
   let turnSeq = [] // { root, userText, assistantText, p }
 
   function uuid(prefix) {
     uuidCounter++
-    return `${prefix}-${uuidCounter.toString().padStart(4, '0')}-${Math.random().toString(36).slice(2, 8)}`
+    return stableTurnIds
+      ? `${prefix}-deep-stable-${turnCounter.toString().padStart(4, '0')}`
+      : `${prefix}-${uuidCounter.toString().padStart(4, '0')}-${Math.random().toString(36).slice(2, 8)}`
   }
 
   // 构建单个真实结构 turn：
@@ -198,6 +203,7 @@
 
   function clearThread() {
     stopDeepSimulation()
+    stableTurnIds = false
     thread.textContent = ''
     turnSeq = []
     turnCounter = 0
@@ -216,7 +222,11 @@
     streamingTimer = setInterval(() => {
       if (i >= text.length) return clearInterval(streamingTimer)
       p.textContent += text[i++]
-      scroller.scrollTop = scroller.scrollHeight
+      // 与真实 ChatGPT 一致：仅当用户已停在底部附近时跟随输出滚动；
+      // 用户停在中间阅读时绝不移动视口（被动收获测试台的前提）
+      if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80) {
+        scroller.scrollTop = scroller.scrollHeight
+      }
     }, 45)
   }
 
@@ -273,9 +283,10 @@
     addTurns(8, 100)
   }
 
-  // ================= 长会话深度历史模拟（Background History Warmup 测试台）=================
-  // 初始只挂载最近 12 轮并停在底部；向上滚动接近已挂载窗口顶部时
+  // ================= 长会话深度历史模拟（Passive History Harvest 测试台）=================
+  // 初始只挂载最近 12 轮并停在底部；用户向上滚动接近已挂载窗口顶部时
   // 自动 prepend 更旧历史（模拟 ChatGPT lazy loading），同时按虚拟化窗口卸载远端 turn。
+  // TurnRail 侧对这些行为的响应必须是纯被动的：绝不代替用户滚动。
   let pendingHistory = [] // 最旧在前
   let deepLazyTimer = 0
   let deepVirtTimer = 0
@@ -309,6 +320,7 @@
   function loadConversationDeep(total, withVirtualization) {
     stopDeepSimulation()
     clearThread()
+    stableTurnIds = true
     deepTotal = total
     const windowCount = 12
     const all = []

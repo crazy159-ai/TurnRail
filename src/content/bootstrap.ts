@@ -542,27 +542,40 @@ export function bootstrap(): void {
     })
   }
 
-  /** 启动扫描：立即 full scan + 稳定性退避重试（连续 2 次签名不变即停，交给 Observer） */
+  /** 启动扫描：稳定性退避重试（连续 2 次签名不变即停，交给 Observer） */
   function runStartupScan(): void {
     stopStartupScan?.()
     const gen = conversationGeneration
-    indexer.scan(true)
-    if (provider.lastLocatedCount > 0) {
-      perf.markFirstLiveScan()
-      perf.markFirstLiveReconcile()
-    }
-    stopStartupScan = startStartupScan({
-      scan: () => {
-        if (gen !== conversationGeneration) return null
-        indexer.scan()
-        if (provider.lastLocatedCount > 0) perf.markFirstLiveScan()
-        return { turnCount: store.turns.length, lastTurnId: store.turns[store.turns.length - 1]?.id }
-      },
-      hasRoot: () => activeRoot !== null && activeRoot.isConnected,
-      onSettled: () => {
-        stopStartupScan = null
+    // 路由变化与 DOM 交换可能同处一个宏任务（SPA pushState 后同步重渲染）：
+    // 立即扫描会把上一会话仍挂载的 DOM 索引进新会话的 Store（跨会话污染）。
+    // 首扫推迟一个宏任务；期间出现的新 DOM 由刚挂载的 Observer 增量收获。
+    let stabilityStop: (() => void) | null = null
+    let deferHandle: number | null = window.setTimeout(() => {
+      deferHandle = null
+      if (gen !== conversationGeneration) return
+      topWatch.watch()
+      indexer.scan(true)
+      if (provider.lastLocatedCount > 0) {
+        perf.markFirstLiveScan()
+        perf.markFirstLiveReconcile()
       }
-    })
+      stabilityStop = startStartupScan({
+        scan: () => {
+          if (gen !== conversationGeneration) return null
+          indexer.scan()
+          if (provider.lastLocatedCount > 0) perf.markFirstLiveScan()
+          return { turnCount: store.turns.length, lastTurnId: store.turns[store.turns.length - 1]?.id }
+        },
+        hasRoot: () => activeRoot !== null && activeRoot.isConnected,
+        onSettled: () => {
+          stopStartupScan = null
+        }
+      })
+    }, 0)
+    stopStartupScan = () => {
+      if (deferHandle !== null) window.clearTimeout(deferHandle)
+      stabilityStop?.()
+    }
   }
 
 

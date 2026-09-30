@@ -8,28 +8,19 @@ export interface TnDebug {
   userUnits: number
   assistantUnits: number
   providerMode: string
-  historyWarmup?: {
-    state: string
-    discoveredTurns: number
+  historyCoverage?: {
+    indexedTurns: number
     fullUserTurns: number
     previewUserTurns: number
-    batches: number
-    steps: number
+    fullAssistantTurns: number
+    missingAssistantTurns: number
     reachedTop: boolean
-    pausedReason: string | null
+    state: 'complete' | 'partial' | 'unknown'
   }
   performance: {
     indexer: { fullScans: number; incrementalScans: number; fallbackFullScans: number; skippedTurns: number }
     observer: { assistantStreamIgnored: number; mutationRecords: number }
-    historyWarmup?: {
-      batches: number
-      steps: number
-      productiveBatches: number
-      emptyBatches: number
-      pauses: number
-      maxBatchMs: number
-      turnsDiscovered: number
-    }
+    health: { analyzes: number }
   } | null
   cache: Record<string, unknown>
   flexDirection: string | null
