@@ -55,17 +55,25 @@ export interface CheckpointTurnRef {
   index: number
 }
 
-/** Handoff 全局限额：仅约束 TurnRail 生成的交接包体积，绝不代表 ChatGPT context limit */
-export const HANDOFF_LIMITS = {
+/** Handoff 全局限额（可覆盖形态；测试与小预算场景用 Partial 覆盖） */
+export interface HandoffLimits {
   /** 最终 markdown 文本字符上限 */
-  maxCharacters: 40_000,
+  maxCharacters: number
   /** 单条 checkpoint 数上限（超出按 turn 序保留前 N 条 + warning） */
-  maxCheckpoints: 12,
+  maxCheckpoints: number
   /** Recent Tail 的 user turn 数上限（不含当前目标轮） */
-  maxRecentTurns: 6,
+  maxRecentTurns: number
   /** 单条消息（user / assistant）字符上限，超出按 fence 安全方式截断 */
+  maxSingleMessageCharacters: number
+}
+
+/** Handoff 全局限额：仅约束 TurnRail 生成的交接包体积，绝不代表 ChatGPT context limit */
+export const HANDOFF_LIMITS: HandoffLimits = {
+  maxCharacters: 40_000,
+  maxCheckpoints: 12,
+  maxRecentTurns: 6,
   maxSingleMessageCharacters: 12_000
-} as const
+}
 
 /** PendingHandoff 的产品 TTL（跨 tab 注入窗口），与模型上下文无关 */
 export const PENDING_HANDOFF_TTL_MS = 10 * 60 * 1000
@@ -105,6 +113,9 @@ export interface HandoffSection {
    * preview 内容会以显式标记渲染，绝不伪装成完整结论（规格 8.3.1）。
    */
   assistantCompleteness?: 'full' | 'preview'
+
+  /** user prompt 完整度：语义同上（缓存 hydrate 的截断 prompt） */
+  userCompleteness?: 'full' | 'preview'
 }
 
 /** Health 快照中允许进入 Handoff 的元数据投影（不回显 prompt / reasons 正文） */
@@ -149,7 +160,7 @@ export interface HandoffBuildInput {
   health?: HandoffHealthSummary
 
   /** 预算覆盖（测试用）；缺省用 HANDOFF_LIMITS */
-  limits?: Partial<typeof HANDOFF_LIMITS>
+  limits?: Partial<HandoffLimits>
 }
 
 /**
