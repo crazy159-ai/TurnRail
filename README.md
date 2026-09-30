@@ -22,6 +22,7 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
   - 点击未加载问题自动受控滚动查找（recover），失败安全回退
 - 目录内搜索（大小写不敏感子串匹配）
 - 🩺 Chat health check：完全本地的多信号启发式评估（0–100），结合对话长度、方案反转、纠错频率、主题漂移、跨轮依赖与复杂度，在风险叠加时提示整理阶段结论或新开聊天；**不声称知道 ChatGPT 实际上下文窗口，也不会自动替用户换聊**
+- 🔄 Conversation Handoff：把关键轮次标记为 ⭐ Checkpoint，一键生成结构化交接上下文（确定性抽取，非 AI 摘要），预览审核后复制或自动填入新聊天输入框（**绝不自动发送**）—— Context Reset without State Loss
 - ⚡ Cached conversation navigation：为选定的会话主动缓存导航元数据，重新打开时目录立即出现（ChatGPT 历史在后台继续加载，TurnRail 自动与真实 DOM 调和绑定）
 - 深浅色自动跟随 ChatGPT / 系统
 - 无障碍：rail 为 navigation 语义、每个 marker 是带 aria-label 的按钮、面板支持键盘焦点与 Esc 关闭
@@ -137,6 +138,12 @@ ConversationIndexer (conversation/indexer.ts)
         │
         ▼
   jump / recoverTarget / historyCapture
+
+Store ──► Handoff 服务 (handoff/)   ← 仅用户点击时运行，不在 observer 热路径
+               CheckpointStore（标记元数据，按会话分桶）
+               builder / formatter（纯函数：确定性结构抽取 + 预算）
+               pendingStore / injector（TTL 跨标签页通道，只填草稿）
+               Provider capability（composer 注入，selector 仅在 providers/）
 ```
 
 模块职责：
@@ -158,6 +165,10 @@ ConversationIndexer (conversation/indexer.ts)
 | `cache/serializer.ts` / `hydrator.ts` | Runtime Store ↔ 缓存 DTO 显式双向转换（纯数据，无 DOM 依赖） |
 | `cache/reconciler.ts` | 缓存与 Live 零重叠时的 stale 判定（分支切换防护） |
 | `cache/cacheStore.ts` | chrome.storage.local 持久层（索引 + 显式 CacheRuntimeState 状态机：available / terminal unavailable，context probe pre-flight + 全链路容错，失败即 Live-only） |
+| `handoff/types.ts` | Checkpoint / Handoff / PendingHandoff 数据模型与体积限额（工程默认值，非模型 context limit） |
+| `handoff/checkpointStore.ts` | 用户标记的 checkpoint 仓库：纯内存、按会话分桶、附着稳定 turnId（抗虚拟化卸载） |
+| `handoff/builder.ts` / `formatter.ts` | 纯函数确定性抽取（Checkpoint + Recent Tail + Current Objective）与 markdown 渲染；fence 安全截断 + 显式 warning |
+| `handoff/pendingStore.ts` / `injector.ts` | 短生命周期跨标签页通道（TTL / 消费即删）与新聊天页 composer 草稿注入（绝不发送） |
 | `content/observers.ts` | 两层 Observer：短命 Root Watch（root 缺失时等出现）+ scoped Conversation Observer（root 出现即断开 document 级监听） |
 | `content/mutationPipeline.ts` | Mutation 分类器 + Dirty Turn 队列（streaming 忽略 / turn 内变化 / unknown 回退 full scan；40ms 批量去重） |
 | `content/startupScan.ts` | 启动稳定性退避扫描（100→2400ms，连续 2 次签名不变即停，替代固定 8×400ms） |
@@ -214,16 +225,70 @@ TurnRail 绝不自动创建或切换聊天。健康分是派生状态，不写�
 **assistant 流式输出期间不重算**（由 `semanticRevision` 事件语义保证，
 `__tnDebug.performance.health.analyzes` 可验证）。
 
+## Conversation Handoff
+
+长任务对话（科研 / 编程 / 论文）推进到后期，Health 常进入 organize / new-chat：
+继续堆上下文的边际收益下降，但直接换聊又会丢掉已获得的关键结论。Handoff 解决的是
+
+> **Context Reset without State Loss** —— 丢弃大部分历史噪声，保留有效工作状态。
+
+它不是 ChatGPT 原生「Branch in new chat」的复制：Branch 保留完整聊天树，
+Handoff 只带走用户显式选择的状态。完整流程：
+
+```text
+长聊天 → Health = organize / new-chat（或用户自行判断）
+  → 在目录里把关键轮次标为 ⭐ Checkpoint
+  → 点击「生成 Handoff」（Health CTA 或面板头 ⇄ 入口）
+  → 预览完整交接文本（可编辑）→ 用户审核
+  → 复制后自行粘贴，或确认后 TurnRail 打开新聊天并自动填入输入框
+  → 用户检查后手动发送（TurnRail 绝不自动发送）
+```
+
+**Checkpoint**：目录项 hover 出现 ☆，点击变 ★。它只记录定位元数据
+（turnId / turnIndex），不复制正文；附着于稳定 turnId，虚拟化卸载不影响；
+按会话隔离（A 的标记不出现在 B）。Checkpoint 的含义是"用户认为此轮必须保留"
+—— TurnRail 不自动推断结论。V1 checkpoint 存于内存：页面刷新后需重新标记（已知限制）。
+
+**生成内容 = 确定性结构抽取，不是 AI 摘要**：Selected Checkpoints（全部 ⭐ 轮，
+优先级最高）+ Recent Working Context（最近 6 个 user 轮，字符预算内）+
+Current Objective（最后一个 user prompt，不重写含义）+ 固定的 Continuation Rules。
+没有自动总结、没有"最终结论"推断、没有模型调用。
+
+**体积限额是 TurnRail 的工程默认值，不代表 ChatGPT context limit**：
+全文 40k 字符 / 单条消息 12k 字符 / 12 个 checkpoint / 6 个 recent 轮。
+超限按优先级裁剪（checkpoint > 目标轮 user > recent user > recent assistant），
+每一步都产生显式 warning，绝不静默截断；代码块按 fence 安全方式截断（补闭合 ```）。
+
+**Preview 是必经步骤**：预览层默认可编辑（用户可删掉错误结论），复制 / 重新生成 /
+取消 / 在新聊天继续。取消不产生任何副作用。缓存 preview 恢复的文本会显式标注
+"preview only"，绝不冒充完整结论。
+
+**新聊天注入（只填草稿）**：确认后 TurnRail 将交接文本写入
+`chrome.storage.local` 的独立命名空间 `turnrail:handoff:pending`（**短生命周期
+PendingHandoff，10 分钟 TTL**），打开 chatgpt.com 新标签页；新聊天页（无会话路由）
+自动读取并填入输入框后立即删除。**TurnRail 没有任何点击发送的代码路径** ——
+最终发送永远由用户完成。交接文本不经 URL 传递（无历史 / 日志泄漏）。storage
+不可用（含扩展重载后的 context 失效）时回退为提示用户手动复制粘贴，绝不假成功。
+
+**与 Memory / Project 无关**：Handoff 是确定性的 —— 你明确知道新对话收到了哪些
+上下文，不依赖 ChatGPT 的 Memory 检索行为。
+
 ## Privacy
 
 TurnRail runs locally in your browser.
 
-- 所有索引、标题、搜索与聊天健康评估全部在页面本地内存中完成
+- 所有索引、标题、搜索、聊天健康评估与 Handoff 生成全部在页面本地内存中完成
 - 不发送任何网络请求，不集成任何统计/遥测，无任何后端
 - 用户主动缓存的导航元数据使用 `chrome.storage.local` 本地保存；TurnRail 不上传缓存数据
 - 缓存只含导航元数据（turn ID / 顺序 / 标题 / 短 preview），绝不含回答正文、HTML 或附件
+- **Pending Handoff 是唯一短暂包含正文的存储**：仅当用户主动点击「在新聊天继续」时
+  写入，10 分钟 TTL 到期作废、新聊天页注入成功即删除、取消则根本不产生；与长期
+  导航缓存严格分桶（`turnrail:handoff:pending` ≠ `turnrail:cache:index`），
+  诊断导出只含纯数字元数据（pending / 字符数 / age），绝不含交接文本
 - 聊天正文仅以 `textContent` 渲染进 Shadow DOM，绝不作为 HTML 注入（防 XSS）
 - Manifest 仅申请 `storage` 权限 + content script 匹配两条 host
+- 以上承诺由 `test/unit/privacyContract.test.ts` 自动强制（含 handoff 模块零
+  console 输出、零网络原语、composer selector 边界）
 
 ## How message detection works（selector 策略）
 
@@ -313,7 +378,9 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 - 分支切换靠启发式检测（"大量卸载 + 大量全新 id"同时出现时重置离线索引），极端场景可能残留少量"未加载"条目。
 - 导航缓存只让"已见过的 turn"提前可见：缓存无法凭空提供未加载过的历史；partial 缓存在发现更多 turn 前保持 partial。
 - 缓存的分支 / edit / regenerate 行为是 best-effort：Live 与缓存零重叠（判定为另一分支）时丢弃缓存 turn 并以 Live 重建。
+- Handoff checkpoint 为纯内存标记：页面刷新后需重新标星（附着稳定 turnId，虚拟化卸载 / SPA 切换不受影响）；pending handoff 注入依赖新聊天页 `#prompt-textarea` selector，站点改版时需更新 `providers/chatgpt.ts`。
 - v1.2 已实现：document_end 注入、两层 Observer（范围收窄）、增量 dirty-turn 索引、流式输出过滤、rail keyed 更新；缓存 LRU 自动清理留待 v1.3。
+- Handoff V1：确定性结构抽取（非 AI 摘要）；checkpoint 无分类菜单、无 Active/Superseded UI（数据层已支持 superseded）；pending handoff 过期后需重新生成。
 - 未实现（roadmap）：书签/重命名、快捷键（Alt+↑/↓、Alt+J）、设置面板、Claude/Gemini/DeepSeek 支持、导出目录。
 - 已在 Chrome 114+ 目标下验证；未测其他 Chromium 分支。
 
@@ -346,10 +413,19 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   v1.2.3 增量：Cache Runtime Lifecycle 状态机 —— context probe 提前拦截、TOCTOU
   catch 兜底、unknown 测试环境不误判、invalidation 后 100 轮全量 API storage
   计数零增长（terminal circuit breaker）、probe 迟后失效拦截、transition 幂等。
+  Handoff 增量：checkpoint star/unstar 可逆与去重、A→B→A 会话桶隔离、
+  builder 选取/去重/预算/fence 安全/preview 不伪装/id 零泄漏、pending 存取
+  （TTL 过期不注入 / consume 即删 / storage 失败无假成功 / 注入器零触碰合同）、
+  privacy/handoff 合同（独立命名空间、TTL 窗口、零 console、selector 边界）、
+  诊断 handoff 元数据纯数字白名单。
 - `test/browser/`：Playwright 浏览器冒烟测试，直接自动化下列既有测试资产（无需登录 ChatGPT）。
   v1.2.3 增量：console 分类统计（production 0 warn / 0 error；DEBUG 无 warning 级
   invalidated 输出、console.debug lifecycle 恰 1 条）、storage 调用计数断言
   （首次失效后 SPA 路由不重新触碰 chrome.storage）、被动失败不弹 UI 提示。
+  Handoff 增量：`test/browser/handoff.spec.ts` —— checkpoint 标记与会话隔离、
+  预览内容边界（含 checkpoint / 不含超范围旧轮）、取消零 pending、确认继续 →
+  pending 落盘 + 打开意图、新聊天页自动填入 composer（不发送）+ 消费删除、
+  streaming 不影响 checkpoint、Health CTA 分档。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
