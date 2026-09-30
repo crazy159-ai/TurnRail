@@ -6,6 +6,7 @@ import {
   computeHistoryCoverage,
   historyCoverageLabel
 } from '../conversation/historyCoverage'
+import { createPassiveTopWatch } from './passiveTopWatch'
 import { ScrollSpy } from '../navigation/scrollSpy'
 import { jumpToTurn } from '../navigation/jump'
 import { isRecoverRunning, recoverAndJump, getRecoverLog } from '../navigation/recoverTarget'
@@ -91,6 +92,15 @@ export function bootstrap(): void {
   function refreshHistoryCoverageUi(): void {
     ui.setHistoryStatus(historyCoverageLabel(computeHistoryCoverage(store, reachedTop)))
   }
+
+  const topWatch = createPassiveTopWatch({
+    getContainer: () => provider.getScrollContainer(),
+    getTurnCount: () => store.turns.length,
+    onTopConfirmed: () => {
+      reachedTop = true
+      refreshHistoryCoverageUi()
+    }
+  })
 
   // ---------- 导航缓存桥接（cache-first + live reconcile） ----------
   // generation：每次路由变化递增；异步缓存读取返回时 generation 已变则直接丢弃
@@ -512,6 +522,8 @@ export function bootstrap(): void {
       (records) => pipeline.handle(records),
       handleRootLost
     )
+    // 被动到顶证据采集跟随当前滚动容器（纯监听，绝不写入 scrollTop）
+    topWatch.watch()
     runStartupScan()
   }
 
@@ -704,6 +716,8 @@ export function bootstrap(): void {
     conversationGeneration++
     // 先 flush 旧会话的待写缓存：必须在 store.reset 之前序列化旧数据
     flushPendingSave()
+    // 停止旧会话的被动到顶采集：所有计时取消，迟到回调由 generation 语义隔离
+    topWatch.stop()
     reachedTop = false
     // 停止旧 root 的观察 / 发现 / 启动扫描（迟到回调不得写入新 Store，#12/#67）
     stopStartupScan?.()
@@ -854,6 +868,7 @@ export function bootstrap(): void {
       indexer,
       cache: cacheStore,
       recoverLog: getRecoverLog,
+      topWatch,
       // DEBUG 跳转钩子：与点击目录项同一 handleJump 路径（jump → 失败时 recoverAndJump）。
       // 供诊断 / 浏览器测试在虚拟化频繁重建 DOM 时稳定触发恢复跳转
       jump: (turnId: string) => void handleJump(turnId),
