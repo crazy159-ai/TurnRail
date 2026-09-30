@@ -167,3 +167,61 @@ test('privacy/network: 合同测试自身可检出网络调用（防正则失效
 test('privacy/manifest: package.json 与 manifest.json 版本一致', () => {
   assert.equal(packageJson.version, manifest.version)
 })
+
+// ---------------- Handoff 隐私合同（Handoff V1） ----------------
+
+test('privacy/handoff: pending handoff 使用独立命名空间，绝不复用 cache index', async () => {
+  const { PENDING_HANDOFF_KEY } = await import('../../src/handoff/types.ts')
+  assert.equal(PENDING_HANDOFF_KEY.startsWith('turnrail:handoff:'), true)
+  assert.notEqual(PENDING_HANDOFF_KEY, 'turnrail:cache:index')
+})
+
+test('privacy/handoff: pending TTL 为 5-15 分钟的产品窗口（非长期存储）', async () => {
+  const { PENDING_HANDOFF_TTL_MS } = await import('../../src/handoff/types.ts')
+  assert.ok(PENDING_HANDOFF_TTL_MS >= 5 * 60 * 1000, 'TTL 不得短于 5 分钟（可用性）')
+  assert.ok(PENDING_HANDOFF_TTL_MS <= 15 * 60 * 1000, 'TTL 不得长于 15 分钟（隐私：短生命周期）')
+})
+
+test('privacy/handoff: handoff 模块零 console 输出（payload 绝不进控制台）', async () => {
+  const handoffDir = join(root, 'src', 'handoff')
+  const files = collectSourceFiles(handoffDir)
+  assert.ok(files.length >= 5, `src/handoff 应存在全部模块（实际 ${files.length}）`)
+  const violations: string[] = []
+  for (const file of files) {
+    const source = readFileSync(file, 'utf8')
+    // 收集所有 console.* 调用（含注释外的真实调用）；handoff 模块一个都不应有
+    if (/\bconsole\s*\.\s*(log|info|debug|warn|error|trace)\b/.test(source)) {
+      violations.push(relative(root, file).replace(/\\/g, '/'))
+    }
+  }
+  assert.deepEqual(
+    violations,
+    [],
+    `handoff 模块出现 console 输出（payload 泄漏风险）: ${violations.join('; ')}`
+  )
+})
+
+test('privacy/handoff: handoff 模块零网络原语（并入全仓扫描的自证）', async () => {
+  // 全仓扫描已覆盖 src/handoff/（collectSourceFiles(src) 递归）；
+  // 此处显式验证目录确实在扫描范围内，防止未来目录被排除
+  const handoffDir = join(root, 'src', 'handoff')
+  for (const file of collectSourceFiles(handoffDir)) {
+    const source = readFileSync(file, 'utf8')
+    for (const { name, regex } of NETWORK_PATTERNS) {
+      assert.equal(regex.test(source), false, `${relative(root, file)} 出现 ${name}`)
+    }
+  }
+})
+
+test('privacy/handoff: composer selector 只存在于 Provider（边界合同）', async () => {
+  // Handoff 注入所需的站点 selector（#prompt-textarea）只允许出现在 providers/；
+  // handoff/ 与 ui/ 必须只依赖 capability 接口
+  const offenders: string[] = []
+  for (const dir of ['handoff', 'ui', 'content']) {
+    for (const file of collectSourceFiles(join(root, 'src', dir))) {
+      const source = readFileSync(file, 'utf8')
+      if (source.includes('prompt-textarea')) offenders.push(relative(root, file).replace(/\\/g, '/'))
+    }
+  }
+  assert.deepEqual(offenders, [], `composer selector 越界: ${offenders.join('; ')}`)
+})
