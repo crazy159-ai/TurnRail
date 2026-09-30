@@ -168,3 +168,51 @@ test('diagnostics: handoff 元数据为纯数字白名单，绝不包含 payload
   assert.ok(!json.includes(SECRET_PROMPT), 'handoff 元数据不得携带用户 prompt')
   assert.ok(!json.includes('ASSISTANT-SECRET-REPLY'), 'handoff 元数据不得携带 assistant 正文')
 })
+
+test('diagnostics: historyWarmup 为状态枚举 + 纯数字白名单（规格 #49）', () => {
+  const { diagnostics } = makeContext()
+  // 未提供 warmup 快照 → null（向后兼容）
+  assert.equal(diagnostics.historyWarmup, null)
+
+  const withWarmup = buildDiagnostics({
+    version: '1.2.1-test',
+    provider: fakeProvider([]),
+    store: new ConversationStore(),
+    cache: new ConversationCacheStore(makeStorage()),
+    performance: null,
+    markers: () => 0,
+    historyWarmup: {
+      state: 'paused',
+      discoveredTurns: 9,
+      fullUserTurns: 12,
+      previewUserTurns: 3,
+      fullAssistantTurns: 10,
+      missingAssistantTurns: 2,
+      batches: 5,
+      steps: 8,
+      reachedTop: false,
+      pausedReason: 'user-active'
+    }
+  })
+  assert.deepEqual(Object.keys(withWarmup.historyWarmup!).sort(), [
+    'batches',
+    'indexedTurns',
+    'pauseReason',
+    'previewTurns',
+    'reachedTop',
+    'state',
+    'steps'
+  ])
+  assert.deepEqual(withWarmup.historyWarmup, {
+    state: 'paused',
+    batches: 5,
+    steps: 8,
+    indexedTurns: 15,
+    previewTurns: 3,
+    reachedTop: false,
+    pauseReason: 'user-active'
+  })
+  // 快照不得携带正文 / turn ID（即使 store 含敏感内容）
+  const json = JSON.stringify(withWarmup.historyWarmup)
+  assert.ok(!json.includes(SECRET_PROMPT))
+})
