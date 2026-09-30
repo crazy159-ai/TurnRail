@@ -432,6 +432,40 @@ test('handoff C2: 复制按钮 clipboard 抛错 → 绝不显示成功', async (
   await expect(status).not.toContainText('已复制')
 })
 
+test('handoff V: composer 静默拒绝写入 → 注入失败不假成功，pending 保留', async ({ page }) => {
+  await injectWorkingStorage(page)
+  await interceptWindowOpen(page)
+  await gotoWithDebug(page, MOCK)
+  await waitForMarkers(page, 12)
+
+  await starFirstTurn(page)
+  await openHandoffPreview(page)
+  await page.locator('.tn-handoff-continue').click()
+  await expect.poll(() => pendingExists(page)).toBe(true)
+
+  // 重新加载（pending 从 localStorage 恢复），停在会话页（不注入）
+  await page.goto(MOCK)
+  await waitForMarkers(page, 12)
+  expect(await pendingExists(page)).toBe(true)
+
+  // 让 composer 静默拒绝一切写入（execCommand 失败 + textContent 写入被吞）：
+  // 模拟站点改版后 ProseMirror 完全接管但 TurnRail selector 仍能找到节点的情况
+  await page.evaluate(() => {
+    const composer = document.querySelector('#prompt-textarea')!
+    Object.defineProperty(composer, 'textContent', { get: () => '', set: () => {} })
+    ;(document as unknown as { execCommand: () => boolean }).execCommand = () => false
+  })
+
+  // 进入新聊天页：注入必须以真实失败告终
+  await page.click('aside button[data-act="home"]')
+  await page.waitForTimeout(1500)
+
+  // 绝不假成功：状态栏不得出现"已填入"，pending 未被消费（TTL 兜底）
+  const status = await page.locator('.tn-status').textContent()
+  expect(status ?? '').not.toContain('已填入')
+  expect(await pendingExists(page)).toBe(true)
+})
+
 test('handoff J: assistant streaming 不影响 checkpoint 与 handoff UI', async ({ page }) => {
   await injectWorkingStorage(page)
   await gotoWithDebug(page, MOCK)

@@ -454,8 +454,9 @@ export class ChatGptProvider implements ChatProvider, ConversationContinuationCa
   /**
    * 只填草稿，绝不提交。contenteditable（ProseMirror 类）优先走
    * execCommand('insertText')（框架可感知）；textarea 走 value + input 事件；
-   * 两者都失败才退回 textContent + 手动 input 事件。失败返回 false，
-   * 绝不让注入器产生假成功。
+   * 两者都失败才退回 textContent + 手动 input 事件。写入后做最小回读验证
+   * （非空 + 核心采样命中）：DOM 有文本 ≠ 编辑器内部状态正确，
+   * 验证失败返回 false，绝不让注入器产生假成功。
    */
   setComposerText(text: string): boolean {
     const composer = this.getComposer()
@@ -464,23 +465,49 @@ export class ChatGptProvider implements ChatProvider, ConversationContinuationCa
       if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
         composer.value = text
         composer.dispatchEvent(new Event('input', { bubbles: true }))
-        return true
+      } else {
+        composer.focus()
+        const selection = window.getSelection()
+        if (selection) {
+          const range = document.createRange()
+          range.selectNodeContents(composer)
+          selection.removeAllRanges()
+          selection.addRange(range)
+        }
+        if (!document.execCommand('insertText', false, text)) {
+          composer.textContent = text
+          composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }))
+        }
       }
-      composer.focus()
-      const selection = window.getSelection()
-      if (selection) {
-        const range = document.createRange()
-        range.selectNodeContents(composer)
-        selection.removeAllRanges()
-        selection.addRange(range)
-      }
-      if (document.execCommand('insertText', false, text)) return true
-      composer.textContent = text
-      composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }))
-      return true
+      return this.composerContainsDraft(composer, text)
     } catch {
       return false
     }
+  }
+
+  /**
+   * 写入后最小验证：contenteditable / ProseMirror 会重排换行 —— execCommand
+   * 的 insertText 把 \n 变成 <br>，而 <br> 在 textContent 中不产生任何字符，
+   * 逐字符比对必然误报失败。因此比较时剥离全部空白：只要求回读非空，且
+   * 开头 / 中部 / 结尾三段核心采样命中。采样共 ~240 字符，对 40k 上限的
+   * handoff 足够区分"真写入"与"execCommand 假成功 / 编辑器清空"。
+   */
+  private composerContainsDraft(composer: HTMLElement, text: string): boolean {
+    const readBack =
+      composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+        ? composer.value
+        : (composer.textContent ?? '')
+    const actual = readBack.replace(/\s+/g, '')
+    if (actual.length === 0) return false
+    const expected = text.replace(/\s+/g, '')
+    if (actual === expected) return true
+    const mid = Math.floor(expected.length / 2)
+    const probes = [
+      expected.slice(0, 80),
+      expected.slice(Math.max(0, mid - 40), mid + 40),
+      expected.slice(-80)
+    ]
+    return probes.every((probe) => probe.length > 0 && actual.includes(probe))
   }
 
   /**
