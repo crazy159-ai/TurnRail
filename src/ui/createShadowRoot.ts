@@ -8,6 +8,7 @@ import { navigationCss } from './styles'
 import { perf } from '../utils/performance'
 import { createRail, layoutMarkers, type Rail } from './rail'
 import { createOutline, type Outline } from './outline'
+import { analyzeConversationHealth } from '../health/analyzer'
 
 export const HOST_ID = 'turnrail-host'
 
@@ -126,6 +127,24 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
   }
 
   let outlineDirty = false
+  // 健康重算以 Store 的 semanticRevision 为准（structure / user-text 递增）：
+  // - assistant 流式（assistant-text）与纯元素绑定（elements）不推进修订号，
+  //   物理上不会触发重算 —— 流式优化合同由事件语义保证，无需拼接全文 signature；
+  // - 历史上用"末轮全文 signature"去重，既复制 prompt 又漏检早期 turn 的修改。
+  let lastHealthRevision = -1
+
+  function renderHealth(): void {
+    const store = storeRef
+    if (!store) {
+      outline.setHealth(null)
+      lastHealthRevision = -1
+      return
+    }
+    if (store.semanticRevision === lastHealthRevision) return
+    lastHealthRevision = store.semanticRevision
+    perf.markHealthAnalyze()
+    outline.setHealth(analyzeConversationHealth(store.turns))
+  }
 
   function renderList(): void {
     const store = storeRef
@@ -232,12 +251,15 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     storeRef = store
     applyVisibility()
     if (layer.classList.contains('tn-hidden')) return
-    if (kind === 'structure' || kind === 'elements') {
+    if (kind === 'structure' || kind === 'elements' || kind === 'user-text') {
       renderRail()
       renderList()
       outline.setCount(store.turns.filter((turn) => turn.user).length)
       refreshScrollListener()
     }
+    // 健康重算：structure / user-text 触发；'assistant-text'（流式快路径）
+    // 与 'elements'（纯 DOM 绑定）绝不重算 —— 由 semanticRevision 去重兜底
+    if (kind === 'structure' || kind === 'user-text') renderHealth()
   }
 
   function setActive(turnId: string | undefined): void {
@@ -252,6 +274,8 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.setStatus('')
     outline.setCount(0)
     outline.setCached(false)
+    outline.setHealth(null)
+    lastHealthRevision = -1
     rail.render([], { tops: [], railHeight: 0, markerHeight: 0 })
     rail.setActive(undefined)
     layer.classList.add('tn-hidden')

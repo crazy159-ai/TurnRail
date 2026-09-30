@@ -40,7 +40,10 @@ export function hydrateCachedConversation(
         turnIndex: cachedTurn.index,
         element: undefined,
         firstSeenAt: cached.updatedAt,
-        isMounted: false
+        isMounted: false,
+        // 健康分析覆盖度标记：缓存恢复的是截断文本（Runtime-only，不写入缓存 DTO）；
+        // Live reconcile 绑定后由 Indexer 升级为 'full'
+        contentCompleteness: 'preview'
       }
       store.messages.set(messageId, message)
     }

@@ -96,6 +96,32 @@ export type CacheUnavailableReason =
   | 'extension-context-invalidated'
   | 'storage-error'
 
+/**
+ * v1.2.3：extension context 探测结果（轻量 probe，只读 chrome.runtime.id，零 API 调用）。
+ * alive   = chrome.runtime.id 存在 —— context 明确有效；
+ * invalid = chrome.runtime 存在但 id 缺失 / 属性访问即抛 —— context 明确失效；
+ * unknown = 非 extension 环境（Node 单元测试 / mock 测试台无 chrome.runtime）无法判断
+ *           —— 不下结论，允许注入的 fake storage 继续工作（绝不把测试环境误判为失效）。
+ */
+export type ExtensionContextState = 'alive' | 'invalid' | 'unknown'
+
+/** context 探测函数（CacheStore 可注入替身，见 ConversationCacheStoreOptions） */
+export type ExtensionContextProbe = () => ExtensionContextState
+
+/**
+ * v1.2.3：cache 运行时状态 —— 显式状态机，替代 storage=null + reason 的隐式组合。
+ *
+ *   AVAILABLE ── missing API ──→ MISSING_API（terminal）
+ *   AVAILABLE ── storage error ─→ STORAGE_ERROR（terminal）
+ *   AVAILABLE ── context invalidated（probe 或调用失败）──→ CONTEXT_INVALIDATED（terminal）
+ *
+ * unavailable 是 terminal 状态：只允许一次转换，此后所有方法短路，绝不再触碰
+ * chrome.storage；恢复的唯一途径是页面 reload 后由新 content script 重新构造。
+ */
+export type CacheRuntimeState =
+  | { status: 'available'; storage: StorageAreaLike }
+  | { status: 'unavailable'; reason: CacheUnavailableReason }
+
 /** DEBUG 指标（只含元数据，绝不含任何聊天正文） */
 export interface CacheStats {
   available: boolean
@@ -122,7 +148,9 @@ export interface StorageAreaLike {
   remove(key: string): Promise<void>
 }
 
-declare const chrome: { storage?: { local?: StorageAreaLike } } | undefined
+declare const chrome:
+  | { storage?: { local?: StorageAreaLike }; runtime?: { id?: unknown } }
+  | undefined
 
 /** 探测当前环境可用的 storage（chrome.storage.local），不可用返回 null */
 export function detectChromeLocalStorage(): StorageAreaLike | null {
@@ -135,4 +163,21 @@ export function detectChromeLocalStorage(): StorageAreaLike | null {
     // chrome API 探测失败 → 视为不可用
   }
   return null
+}
+
+/**
+ * v1.2.3：生产 context 探测（零 API 调用，只读 chrome.runtime.id）。
+ * 扩展重载后旧 content script 的 chrome.runtime.id 变为缺失（部分版本连属性访问
+ * 都会抛出）→ invalid；mock / Node 测试环境没有 chrome.runtime → unknown（放行）。
+ * 注意：probe 只是 pre-flight 优化，正确性由 CacheStore 的 try/catch fallback 兜底。
+ */
+export function detectExtensionContext(): ExtensionContextState {
+  try {
+    const runtime = typeof chrome !== 'undefined' ? chrome?.runtime : undefined
+    if (!runtime || typeof runtime !== 'object') return 'unknown'
+    return typeof runtime.id === 'string' && runtime.id.length > 0 ? 'alive' : 'invalid'
+  } catch {
+    // context 失效时连属性访问都可能抛出 → 明确失效
+    return 'invalid'
+  }
 }

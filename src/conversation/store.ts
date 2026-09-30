@@ -25,6 +25,13 @@ export class ConversationStore {
    * 仅由 cache/hydrator 置位；路由重置或缓存确认 stale 时清除。
    */
   cacheHydrated = false
+  /**
+   * 语义修订号：structure / user-text 事件递增，assistant-text / elements 不变。
+   * 供健康分析等"只依赖 user prompt 语义"的派生状态做廉价变更检测，
+   * 取代此前在 UI 侧拼接全文的 signature（重复 Store 已有信息、漏检早期 turn 修改）。
+   * reset() 归零。
+   */
+  semanticRevision = 0
 
   private listeners = new Set<StoreListener>()
 
@@ -53,6 +60,7 @@ export class ConversationStore {
     this.lastVisibleKeys = []
     this.detached = []
     this.cacheHydrated = false
+    this.semanticRevision = 0
     this.emit('structure')
   }
 
@@ -90,6 +98,9 @@ export class ConversationStore {
 
   /** 内部使用：由 Indexer 在扫描后提交本轮结果并广播 */
   commit(kind: ChangeKind): void {
-    if (kind !== 'none') this.emit(kind)
+    if (kind === 'none') return
+    // 只有影响 user prompt 语义的事件推进修订号（assistant 流式 / 纯元素绑定不推进）
+    if (kind === 'structure' || kind === 'user-text') this.semanticRevision++
+    this.emit(kind)
   }
 }

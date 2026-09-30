@@ -11,6 +11,12 @@ export interface ConversationMessage {
   element?: HTMLElement
   firstSeenAt: number
   isMounted: boolean
+  /**
+   * 文本完整度（Runtime-only metadata，绝不写入缓存 DTO）：
+   * 'preview' = 缓存 hydrate 恢复的截断文本（preview/title），非完整 prompt；
+   * 'full' / undefined = Live DOM 解析的完整原文。健康分析据此计算覆盖度。
+   */
+  contentCompleteness?: 'full' | 'preview'
 }
 
 export interface ConversationTurn {
@@ -36,4 +42,10 @@ export interface DetachedTurn {
   capturedAt: number
 }
 
-export type ChangeKind = 'structure' | 'text' | 'elements' | 'none'
+/**
+ * Store 变化事件。'user-text' / 'assistant-text' 区分文本变化的角色：
+ * assistant 流式输出（高频、仅 assistant 文本）绝不触发健康重算等语义级工作，
+ * 而 user prompt 变化（编辑 / 重解析）必须触发 —— 消费方依赖这一区分。
+ * 同批两者都变时 indexer 以 'user-text' 优先上报。
+ */
+export type ChangeKind = 'structure' | 'user-text' | 'assistant-text' | 'elements' | 'none'

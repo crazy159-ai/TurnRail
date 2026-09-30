@@ -1,30 +1,87 @@
-import { debugWarn, reportError } from '../utils/logger.ts'
-import { isExtensionContextInvalidated } from './errors.ts'
+import { debugLog, reportError } from '../utils/logger.ts'
+import { classifyCacheFailure } from './errors.ts'
 import { parseCacheIndex, parseCachedConversation } from './validate.ts'
 import type {
   CacheIndexEntry,
   CacheIndexMap,
+  CacheRuntimeState,
   CacheStats,
   CacheUnavailableReason,
   CachedConversation,
+  ExtensionContextProbe,
   StorageAreaLike
 } from './types.ts'
-import { CACHE_INDEX_KEY, conversationCacheKey, detectChromeLocalStorage } from './types.ts'
+import {
+  CACHE_INDEX_KEY,
+  conversationCacheKey,
+  detectChromeLocalStorage,
+  detectExtensionContext
+} from './types.ts'
+
+/** ConversationCacheStore 构造参数（测试注入替身；省略的字段取生产默认值） */
+export interface ConversationCacheStoreOptions {
+  /** 注入 storage 实现；undefined = 自动探测 chrome.storage.local；null = 强制不可用 */
+  storage?: StorageAreaLike | null
+
+  /**
+   * extension context 探测（pre-flight）。默认 detectExtensionContext；
+   * 测试可注入 () => 'alive' / 'invalid' / 'unknown'，不依赖真实 Chrome。
+   */
+  contextProbe?: ExtensionContextProbe
+}
+
+/** 区分 options 对象与旧的位置参数 storage（StorageAreaLike 永远不会有这两个 key） */
+function isStoreOptions(
+  value: ConversationCacheStoreOptions | StorageAreaLike | null | undefined
+): value is ConversationCacheStoreOptions {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    ('storage' in value || 'contextProbe' in value)
+  )
+}
 
 /**
  * 会话导航缓存持久层：唯一允许接触 chrome.storage 的模块。
  * 不感知 ChatGPT DOM / selector，不感知 UI；所有调用完全容错 ——
  * 任何 storage 失败都会把自身标记为不可用并降级（Live-only 模式），
  * 绝不让缓存问题影响 TurnRail 正常启动与导航。
- * v1.2.2：失败会先分类 —— "Extension context invalidated"（扩展重载的预期
- * 生命周期异常）只留 DEBUG 日志；其他未知 storage 故障仍走 reportError。
+ *
+ * v1.2.3 Cache Runtime Lifecycle：可用性建模为显式状态机（CacheRuntimeState），
+ * 不再以 storage=null + reason 的字段组合隐式表示：
+ *
+ * ```text
+ *                     page load
+ *                        │
+ *                        ▼
+ *                   AVAILABLE
+ *                   /       \
+ *                  /         \
+ *        missing API         storage error
+ *                /             \
+ *               ▼               ▼
+ *        MISSING_API       STORAGE_ERROR
+ *               \               /
+ *                \             /
+ *                 └─── terminal
+ *
+ * AVAILABLE
+ *    │  context invalidated（pre-flight probe 或 storage 调用失败）
+ *    ▼
+ * CONTEXT_INVALIDATED
+ *    └── terminal until page reload
+ * ```
+ *
+ * unavailable 是 terminal 状态：只允许第一次转换（transitionUnavailable 幂等），
+ * 此后所有方法直接短路返回，绝不再触碰 chrome.storage（不重试、不重新探测
+ * storage、不轮询恢复）—— 旧 content script 的 context 已无法在本页面生命周期
+ * 内复活，只有页面 reload 后由新 content script 重新构造 CacheStore 才能恢复。
  *
  * key 结构：turnrail:conversation:<provider>:<conversationId> + 索引 turnrail:cache:index
  */
 export class ConversationCacheStore {
-  private storage: StorageAreaLike | null
-  /** 不可用原因（只存内存）：available 时为 null，missing-api / context-invalidated / storage-error */
-  private unavailableReason: CacheUnavailableReason | null
+  private state: CacheRuntimeState
+  private contextProbe: ExtensionContextProbe
   private stats: CacheStats = {
     available: true,
     hit: null,
@@ -38,19 +95,24 @@ export class ConversationCacheStore {
     lastWriteAt: null
   }
 
-  constructor(storage?: StorageAreaLike | null) {
-    this.storage = storage === undefined ? detectChromeLocalStorage() : storage
-    this.stats.available = this.storage !== null
-    this.unavailableReason = this.storage === null ? 'missing-api' : null
+  constructor(options?: ConversationCacheStoreOptions | StorageAreaLike | null) {
+    const opts = isStoreOptions(options) ? options : { storage: options }
+    this.contextProbe = opts.contextProbe ?? detectExtensionContext
+    const storage = opts.storage === undefined ? detectChromeLocalStorage() : opts.storage
+    this.state = storage
+      ? { status: 'available', storage }
+      : { status: 'unavailable', reason: 'missing-api' }
+    this.stats.available = storage !== null
   }
 
+  /** 简单状态读取：不触碰 chrome.runtime / storage（context probe 只在真正执行 cache 操作前进行） */
   isAvailable(): boolean {
-    return this.storage !== null
+    return this.state.status === 'available'
   }
 
   /** 最近一次不可用的原因（内存态；available 时为 null）。供 bootstrap 区分提示文案 */
   getUnavailableReason(): CacheUnavailableReason | null {
-    return this.unavailableReason
+    return this.state.status === 'unavailable' ? this.state.reason : null
   }
 
   getStats(): CacheStats {
@@ -58,7 +120,7 @@ export class ConversationCacheStore {
   }
 
   async get(provider: string, conversationId: string): Promise<CachedConversation | null> {
-    const storage = this.storage
+    const storage = this.getStorage()
     if (!storage) return null
     const startedAt = performance.now()
     try {
@@ -82,7 +144,7 @@ export class ConversationCacheStore {
 
   /** true = 写入完整成功；false = storage 不可用或写入失败（调用方据此决定 UI，绝不假成功） */
   async put(conversation: CachedConversation): Promise<boolean> {
-    const storage = this.storage
+    const storage = this.getStorage()
     if (!storage) return false
     const startedAt = performance.now()
     try {
@@ -111,7 +173,7 @@ export class ConversationCacheStore {
 
   /** true = 会话数据移除 + 索引更新完整成功 */
   async remove(provider: string, conversationId: string): Promise<boolean> {
-    const storage = this.storage
+    const storage = this.getStorage()
     if (!storage) return false
     try {
       const key = conversationCacheKey(provider, conversationId)
@@ -130,7 +192,7 @@ export class ConversationCacheStore {
 
   /** 更新索引中的 lastAccessAt（缓存命中时调用；只写索引，不重写会话数据） */
   async touch(provider: string, conversationId: string): Promise<boolean> {
-    const storage = this.storage
+    const storage = this.getStorage()
     if (!storage) return false
     try {
       const now = Date.now()
@@ -155,7 +217,7 @@ export class ConversationCacheStore {
   }
 
   async setPinned(provider: string, conversationId: string, pinned: boolean): Promise<boolean> {
-    const storage = this.storage
+    const storage = this.getStorage()
     if (!storage) return false
     try {
       const key = conversationCacheKey(provider, conversationId)
@@ -178,7 +240,7 @@ export class ConversationCacheStore {
   }
 
   async list(): Promise<CacheIndexEntry[]> {
-    const storage = this.storage
+    const storage = this.getStorage()
     if (!storage) return []
     try {
       const result = await storage.get(CACHE_INDEX_KEY)
@@ -191,7 +253,7 @@ export class ConversationCacheStore {
   }
 
   async clear(): Promise<boolean> {
-    const storage = this.storage
+    const storage = this.getStorage()
     if (!storage) return false
     try {
       const result = await storage.get(CACHE_INDEX_KEY)
@@ -212,7 +274,7 @@ export class ConversationCacheStore {
     conversationId: string,
     mutate: (index: CacheIndexMap) => CacheIndexMap
   ): Promise<void> {
-    const storage = this.storage
+    const storage = this.getStorage()
     if (!storage) return
     const result = await storage.get(CACHE_INDEX_KEY)
     const index = parseCacheIndex(result[CACHE_INDEX_KEY])
@@ -232,21 +294,51 @@ export class ConversationCacheStore {
   }
 
   /**
-   * storage 不可恢复的失败：标记不可用，此后所有方法静默空操作（Live-only 兜底）。
-   * v1.2.2：先分类再上报 —— 只有"Extension context invalidated"（扩展重载的预期
-   * 生命周期异常）安静降级为 DEBUG 日志；其余未知 storage 故障仍走 reportError，
-   * 绝不吞掉真实错误。
+   * 所有 storage 操作的唯一入口（pre-flight gate）。
+   * unavailable → null（terminal 短路）；available 时先做 context probe ——
+   * probe === 'invalid' 直接 terminal 转换，避免必然失败的 storage 调用；
+   * 'alive' / 'unknown'（测试与 mock 环境）放行注入的实现。
    */
-  private markUnavailable(operation: string, err: unknown): void {
-    if (this.storage === null) return
-    this.storage = null
+  private getStorage(): StorageAreaLike | null {
+    if (this.state.status !== 'available') return null
+    if (this.contextProbe() === 'invalid') {
+      this.transitionUnavailable('extension-context-invalidated', 'context-probe')
+      return null
+    }
+    return this.state.storage
+  }
+
+  /**
+   * 统一 terminal 转换：只允许第一次，此后重复调用一律 no-op（天然保证
+   * lifecycle 日志与 reportError 只出现一次）。storage 调用失败的 catch 路径
+   * 与 pre-flight probe 都汇入这里，绝不各自改状态。
+   */
+  private transitionUnavailable(
+    reason: CacheUnavailableReason,
+    source: string,
+    err?: unknown
+  ): void {
+    if (this.state.status === 'unavailable') return
+    this.state = { status: 'unavailable', reason }
     this.stats.available = false
-    if (isExtensionContextInvalidated(err)) {
-      this.unavailableReason = 'extension-context-invalidated'
-      debugWarn(`cache.${operation}: extension context invalidated; falling back to Live-only mode`)
+    if (reason === 'extension-context-invalidated') {
+      // 预期生命周期事件（v1.2.3）：DEBUG 下仅一条 debug 级 lifecycle 日志，
+      // 生产完全静默 —— 绝不 warn / error / reportError。transitionUnavailable
+      // 幂等保证同一页面生命周期最多这一条。
+      debugLog(
+        `cache lifecycle: extension context invalidated (via ${source}); cache disabled until page reload`
+      )
       return
     }
-    this.unavailableReason = 'storage-error'
-    reportError(`cache.${operation}`, err)
+    if (reason === 'storage-error') {
+      // 未知 storage 故障：绝不能被"消 warning"吞掉真实错误
+      reportError(`cache.${source}`, err)
+    }
+    // missing-api：构造期已知的环境事实，无需日志
+  }
+
+  /** storage 调用失败的 catch 路径：先分类（expected lifecycle vs 真实故障）再统一转换 */
+  private markUnavailable(operation: string, err: unknown): void {
+    this.transitionUnavailable(classifyCacheFailure(err), operation, err)
   }
 }

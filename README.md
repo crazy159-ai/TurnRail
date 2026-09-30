@@ -21,6 +21,7 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
   - 「加载全部历史」：受控向上滚动渐进收获历史（有超时/迭代上限，结束恢复阅读位置）
   - 点击未加载问题自动受控滚动查找（recover），失败安全回退
 - 目录内搜索（大小写不敏感子串匹配）
+- 🩺 Chat health check：完全本地的多信号启发式评估（0–100），结合对话长度、方案反转、纠错频率、主题漂移、跨轮依赖与复杂度，在风险叠加时提示整理阶段结论或新开聊天；**不声称知道 ChatGPT 实际上下文窗口，也不会自动替用户换聊**
 - ⚡ Cached conversation navigation：为选定的会话主动缓存导航元数据，重新打开时目录立即出现（ChatGPT 历史在后台继续加载，TurnRail 自动与真实 DOM 调和绑定）
 - 深浅色自动跟随 ChatGPT / 系统
 - 无障碍：rail 为 navigation 语义、每个 marker 是带 aria-label 的按钮、面板支持键盘焦点与 Esc 关闭
@@ -71,11 +72,22 @@ npm run test:browser  # Playwright 浏览器冒烟测试（Chromium，见「测�
 
 Development note（Chrome 正常行为，非缺陷）：重新加载 unpacked extension 后，已经打开的
 ChatGPT 标签页仍持有旧 content-script context，其 `chrome.storage` 调用会以
-"Extension context invalidated." 失败；TurnRail 对此会安静降级为 Live-only 模式
-（仅 tn-debug 下留痕），请同时刷新这些 ChatGPT 页面以恢复完整缓存功能。
+"Extension context invalidated." 失败。TurnRail detects the invalidated context,
+stops using cache for the remainder of that page lifetime, and continues in
+Live-only mode. Reload the ChatGPT page to obtain a fresh extension context.
+
+即：这是扩展重载的预期生命周期事件（Cache Runtime Lifecycle 状态机的 terminal
+转换），不是 TurnRail 故障 —— TurnRail 检测到 context 失效后，在该页面生命周期的
+剩余时间里停用缓存并继续以 Live-only 模式工作：导航与 Health 完全不受影响，
+后续不再访问 chrome.storage，production 模式完全静默（DEBUG 下仅一条 debug 级
+lifecycle 日志，绝不以 warning / error 记录），也不会自动刷新页面。
+刷新该 ChatGPT 页面获得新的 extension context 后，缓存功能自动恢复。
 
 调试日志：在页面控制台执行 `localStorage.setItem('tn-debug', '1')` 并刷新（生产默认关闭）。
 性能指标：`__tnDebug.performance`（TTFR / TTLR / 扫描与 observer 分类计数），`__tn.resetPerformanceStats()` 重置。
+生命周期诊断（DEBUG）：`__tnDebug.bootstrapCount`（同一页面 bootstrap 次数，正常恒为 1）、
+`__tnDebug.extensionVersion`、`__tnDebug.extensionIdHash`（extension ID 的短 hash，
+用于排查"同时装了开发版 + Release 版两个副本"类问题；绝不输出完整 ID）。
 
 ## Build
 
@@ -135,6 +147,7 @@ ConversationIndexer (conversation/indexer.ts)
 | `conversation/indexer.ts` | 扫描 → 稳定 ID → 去重 → 调和 turn 列表（含未挂载 turn 的锚定保留） |
 | `conversation/store.ts` | 纯数据仓库 + 事件广播；UI 从 store 渲染，不把 DOM 当 store |
 | `conversation/historyCapture.ts` | 「加载全部历史」受控滚动捕获 |
+| `health/analyzer.ts` / `health/types.ts` | 本地聊天健康评估：六类可解释信号 → 风险/健康分级；不联网、不读取模型内部上下文状态 |
 | `navigation/scrollSpy.ts` | 阅读位置检测（active turn） |
 | `navigation/jump.ts` | 平滑跳转 + sticky header 补偿 + 一次性 outline 脉冲 |
 | `navigation/recoverTarget.ts` | 未挂载目标的受控滚动恢复跳转 |
@@ -144,7 +157,7 @@ ConversationIndexer (conversation/indexer.ts)
 | `cache/types.ts` / `validate.ts` | 缓存 schema（CachedConversation DTO）与全部入读校验（损坏 / 未来版本 → 忽略） |
 | `cache/serializer.ts` / `hydrator.ts` | Runtime Store ↔ 缓存 DTO 显式双向转换（纯数据，无 DOM 依赖） |
 | `cache/reconciler.ts` | 缓存与 Live 零重叠时的 stale 判定（分支切换防护） |
-| `cache/cacheStore.ts` | chrome.storage.local 持久层（索引 + 全链路容错，失败即 Live-only） |
+| `cache/cacheStore.ts` | chrome.storage.local 持久层（索引 + 显式 CacheRuntimeState 状态机：available / terminal unavailable，context probe pre-flight + 全链路容错，失败即 Live-only） |
 | `content/observers.ts` | 两层 Observer：短命 Root Watch（root 缺失时等出现）+ scoped Conversation Observer（root 出现即断开 document 级监听） |
 | `content/mutationPipeline.ts` | Mutation 分类器 + Dirty Turn 队列（streaming 忽略 / turn 内变化 / unknown 回退 full scan；40ms 批量去重） |
 | `content/startupScan.ts` | 启动稳定性退避扫描（100→2400ms，连续 2 次签名不变即停，替代固定 8×400ms） |
@@ -169,11 +182,43 @@ TurnRail 支持由用户**主动**缓存所选会话的导航元数据（面板�
 所有数据保存在本机浏览器内，**TurnRail 不上传任何缓存数据**。缓存永远只是加速层：
 损坏或版本不符的缓存会被忽略并回退 Live 重建，任何缓存失败都不影响 TurnRail 正常工作。
 
+## Chat Health Check
+
+长对话常见风险不是"轮数多"，而是方案反复、纠错累积、主题漂移、跨轮依赖过长。
+TurnRail 在目录面板内提供一个低干扰健康卡，基于**已索引的 user prompt**（user-only，
+assistant 正文不参与评分）做本地启发式评估（六信号加权：长度压力 30% / 方案反转 20% /
+纠错频率 20% / 主题漂移 15% / 跨轮依赖 10% / 复杂度 5%），任何单一信号都不足以
+单独触发换聊建议。
+
+| 分数 | 等级 | 含义 |
+| --- | --- | --- |
+| 80–100 | healthy | 当前对话可继续 |
+| 65–79 | watch | 可继续，建议在阶段节点整理关键结论与约束 |
+| 45–64 | organize | 建议先整理阶段结论；任务已换阶段时可考虑新开聊天 |
+| 0–44 | new-chat | 多项长对话风险叠加，建议带着目标/结论/约束/状态新开聊天 |
+
+**分数 ≠ 等级**：分数是连续加权量，等级是给用户的建议，两者经 guardrail 解耦——
+任一核心信号进入强区间时至少显示 watch（"12 轮全在纠错"不会因加权平均仍显示 healthy）；
+organize / new-chat 要求多项核心语义信号实质支持；**缓存 preview 覆盖不足（置信度低）
+时绝不输出"新开聊天"这类强建议**，健康卡会显式标注"低置信度"并提示加载更多历史。
+
+**Coverage / Confidence**：缓存恢复的目录只含截断 preview 文本（Runtime 标记
+`contentCompleteness: 'preview'`），对它们的评分证据不足。健康卡按 Live 文本覆盖率
+给出 high（≥85%）/ medium（≥50%）/ low 三档置信度；Live reconcile 绑定后自动升级为
+full 并重算，无需任何手动操作。
+
+边界：评估只使用浏览器本地已索引内容（**不联网、无模型调用**），不代表 ChatGPT
+真实 token 用量、上下文裁剪或 Memory 状态；建议均为非强制提示，是否换聊始终由用户决定，
+TurnRail 绝不自动创建或切换聊天。健康分是派生状态，不写入缓存（每次从当前 Store 重算，
+缓存 schema 保持 v1 不变）；重算只由 structure / user-text 事件触发，
+**assistant 流式输出期间不重算**（由 `semanticRevision` 事件语义保证，
+`__tnDebug.performance.health.analyzes` 可验证）。
+
 ## Privacy
 
 TurnRail runs locally in your browser.
 
-- 所有索引、标题、搜索全部在页面本地内存中完成
+- 所有索引、标题、搜索与聊天健康评估全部在页面本地内存中完成
 - 不发送任何网络请求，不集成任何统计/遥测，无任何后端
 - 用户主动缓存的导航元数据使用 `chrome.storage.local` 本地保存；TurnRail 不上传缓存数据
 - 缓存只含导航元数据（turn ID / 顺序 / 标题 / 短 preview），绝不含回答正文、HTML 或附件
@@ -245,18 +290,22 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 
 ## Roadmap
 
-- **v1.3 — Cache Management & Storage Correctness**：多标签页安全的缓存索引
+- **v1.3 — Conversation Health + Cache Management**：Chat Health 转正与真实对话校准
+  （Golden Cases 持续扩充、信号阈值随样本调整）；多标签页安全的缓存索引
   （当前共享 `turnrail:cache:index` 为 read-modify-write，last-writer-wins 可能丢条目）、
   recent cache / LRU、存储管理 UI。
 - **v1.4 — Large Conversation Scalability**：100 / 300 / 500 / 1000 turn 基准测试；
   当前 `scanDirty()` 虽只解析 dirty turn，但仍经 `locateTurnRoots()` 全量枚举
   （增量解析 ≠ 严格 O(1) 索引，属 v1.2 正常设计），届时按实测决定是否引入
   direct dirty-root upsert、outline virtualization、marker clustering、geometry index。
-- **v1.5 — Provider Architecture**：Provider 能力抽象与注册机制。
+- **v1.5 — Conversation Handoff & Provider Architecture**：整理/新聊场景的交接上下文生成
+  （基于健康卡建议的后续能力）；Provider 能力抽象与注册机制。
 - **v2.0 — Multi-provider**：Claude / Gemini / DeepSeek 等站点支持。
 
 ## Known limitations
 
+- 聊天健康分数是 TurnRail 基于**已索引内容**的本地启发式估算，不等于 ChatGPT 的真实 token 使用量、上下文裁剪状态或 Memory 状态；其作用是提醒长对话中的工程风险，而不是给出模型内部状态的确定结论。
+- 健康信号依赖中英文关键词启发式：同义换题（词面不同）检不出主题漂移，长尾表达可能漏检或误检；缓存 preview 覆盖不足时分数仅作参考（UI 已标注低置信度并禁用强建议）。
 - ChatGPT DOM 改版（尤其 `data-turn-key` / `data-chatgpt-search-unit-key` 结构变化）时需更新
   `providers/chatgpt.ts` 中的 `SELECTORS` 表；legacy fallback 的启发式角色推断可能失效。
 - 无原生 ID（`data-turn-key` / `data-chatgpt-search-message-ids` 均缺失）时，完全相同文本的问题
@@ -276,6 +325,7 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 | 轨道出现但点击无反应 | 控制台执行 `localStorage.setItem('tn-debug','1')` 后刷新，查看 `[TurnRail]` 日志 |
 | 部分问题带"未加载" | 该历史尚未被浏览器挂载：点击它自动查找，或用「加载全部历史」 |
 | 跳转后目标仍被遮挡 | 极少见；目标样式变化导致 header 测量偏差，欢迎提 issue |
+| 缓存按钮突然变灰 | 开发过程中重新加载过 TurnRail：旧 ChatGPT 标签页失去 extension context（预期生命周期事件），导航与 Health 仍可用；刷新该 ChatGPT 页面即可恢复缓存 |
 
 ## 测试
 
@@ -293,7 +343,13 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   启动稳定性退避（恒定签名 3 扫即停 / 不稳定走满 / root 缺失不计稳定）。
   v1.2.1 增量：版本一致性、隐私合同（manifest 权限 / host / 运行时无网络原语）、
   Provider selector 边界、RootWatch 超时低频恢复、诊断导出隐私、打包清单一致性。
+  v1.2.3 增量：Cache Runtime Lifecycle 状态机 —— context probe 提前拦截、TOCTOU
+  catch 兜底、unknown 测试环境不误判、invalidation 后 100 轮全量 API storage
+  计数零增长（terminal circuit breaker）、probe 迟后失效拦截、transition 幂等。
 - `test/browser/`：Playwright 浏览器冒烟测试，直接自动化下列既有测试资产（无需登录 ChatGPT）。
+  v1.2.3 增量：console 分类统计（production 0 warn / 0 error；DEBUG 无 warning 级
+  invalidated 输出、console.debug lifecycle 恰 1 条）、storage 调用计数断言
+  （首次失效后 SPA 路由不重新触碰 chrome.storage）、被动失败不弹 UI 提示。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
