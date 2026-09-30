@@ -43,6 +43,8 @@ export interface Outline {
   showHandoffPreview(payload: { text: string; warnings: string[] }): void
   hideHandoffPreview(): void
   isHandoffPreviewOpen(): boolean
+  /** 面板头 Handoff 入口：仅在已存在 checkpoint 标记时可见（用户意图信号） */
+  setHandoffEntryVisible(visible: boolean): void
 }
 
 /**
@@ -80,13 +82,22 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   cacheButton.title = '缓存当前对话导航'
   cacheButton.setAttribute('aria-label', '缓存当前对话导航')
   cacheButton.addEventListener('click', () => handlers.onToggleCache())
+  // Handoff 入口：默认隐藏，仅当当前会话存在 checkpoint 标记时显示
+  //（healthy 状态下 Health CTA 不出现，但用户显式标记后仍需可直达 Handoff）
+  const handoffOpenButton = document.createElement('button')
+  handoffOpenButton.type = 'button'
+  handoffOpenButton.className = 'tn-icon-btn tn-handoff-open-btn tn-handoff-hidden'
+  handoffOpenButton.textContent = '⇄'
+  handoffOpenButton.title = '生成交接上下文（Handoff）：基于已标记的检查点 + 近期轮次'
+  handoffOpenButton.setAttribute('aria-label', '生成交接上下文（Handoff）')
+  handoffOpenButton.addEventListener('click', () => handlers.onOpenHandoff())
   const closeButton = document.createElement('button')
   closeButton.type = 'button'
   closeButton.className = 'tn-icon-btn'
   closeButton.textContent = '×'
   closeButton.setAttribute('aria-label', '关闭目录')
   closeButton.addEventListener('click', handlers.onClose)
-  head.append(title, count, cacheButton, pinButton, closeButton)
+  head.append(title, count, handoffOpenButton, cacheButton, pinButton, closeButton)
 
   // 搜索
   const search = document.createElement('input')
@@ -318,6 +329,10 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     return !handoffView.classList.contains('tn-handoff-hidden')
   }
 
+  function setHandoffEntryVisible(visible: boolean): void {
+    handoffOpenButton.classList.toggle('tn-handoff-hidden', !visible)
+  }
+
   /**
    * 检查点星标（Handoff V1）：低干扰设计 —— 未标记时 hover 才显现，
    * 标记后常驻 ★。item 本身是 <button>，内部不允许再嵌 button，
@@ -426,5 +441,5 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     handlers.onSearchInput('')
   }
 
-  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled, setCheckpointLookup, showHandoffPreview, hideHandoffPreview, isHandoffPreviewOpen }
+  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled, setCheckpointLookup, showHandoffPreview, hideHandoffPreview, isHandoffPreviewOpen, setHandoffEntryVisible }
 }

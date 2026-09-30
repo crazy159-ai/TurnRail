@@ -137,7 +137,14 @@ export function bootstrap(): void {
     const turn = store.getTurn(turnId)
     if (!conversationId || !turn) return
     checkpointStore.toggle(conversationId, { id: turn.id, index: turn.index })
+    syncHandoffEntry()
     ui.refreshList()
+  }
+
+  /** 面板头 Handoff 入口：当前会话存在 checkpoint 标记时可见（路由重置后同步） */
+  function syncHandoffEntry(): void {
+    const conversationId = currentCheckpointConversationId()
+    ui.setHandoffEntryVisible(conversationId !== null && checkpointStore.count(conversationId) > 0)
   }
 
   // ---------- Handoff（确定性结构化交接：Preview → 用户审核 → 复制/继续） ----------
@@ -636,6 +643,8 @@ export function bootstrap(): void {
     hydratedTurnIds = null
     lastHydrateMs = null
     lastReconcileMs = null
+    // Handoff 入口 / 预览跟随新会话（A 的 checkpoint 不影响 B；B 无标记则隐藏入口）
+    syncHandoffEntry()
 
     // root 已存在 → 立即挂 scoped 观察器 + 稳定性退避扫描；
     // 尚未挂载 → 短命 RootWatch 等待出现（cache-first 不受影响：缓存 hydrate 与 root 独立）

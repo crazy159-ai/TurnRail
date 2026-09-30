@@ -49,6 +49,8 @@ export interface NavigationUi {
   /** Handoff 预览 */
   showHandoffPreview(payload: { text: string; warnings: string[] }): void
   hideHandoffPreview(): void
+  /** 面板头 Handoff 入口可见性（checkpoint 存在时显示） */
+  setHandoffEntryVisible(visible: boolean): void
   destroy(): void
 }
 
@@ -313,6 +315,10 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.hideHandoffPreview()
   }
 
+  function setHandoffEntryVisible(visible: boolean): void {
+    outline.setHandoffEntryVisible(visible)
+  }
+
   function handleReset(): void {
     searchQuery = ''
     outline.clearSearch()
@@ -322,6 +328,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.setCached(false)
     outline.setHealth(null)
     outline.hideHandoffPreview()
+    outline.setHandoffEntryVisible(false)
     lastHealthRevision = -1
     lastHealthSnapshot = null
     rail.render([], { tops: [], railHeight: 0, markerHeight: 0 })
@@ -340,5 +347,5 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     host.remove()
   }
 
-  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, refreshList, getHealthSnapshot, showHandoffPreview, hideHandoffPreview, destroy }
+  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, refreshList, getHealthSnapshot, showHandoffPreview, hideHandoffPreview, setHandoffEntryVisible, destroy }
 }
