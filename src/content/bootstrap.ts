@@ -21,6 +21,13 @@ import { hydrateCachedConversation } from '../cache/hydrator'
 import { isLikelyStale } from '../cache/reconciler'
 
 /**
+ * bootstrap() 在同一 content world 内的执行次数（纯数字诊断，v1.2.3）。
+ * 正常恒为 1；>1 说明同一页面重复初始化（排查"重复 warning"类问题用）。
+ * 只在 DEBUG 下经 __tnDebug.bootstrapCount 暴露，不含任何会话内容。
+ */
+let bootstrapInstanceCount = 0
+
+/**
  * 组装全部模块并管理生命周期：
  * 路由变化 → 停止 spy / flush 待写缓存 / 重置 store → 并行读取导航缓存（cache-first）
  * → Live DOM 扫描 → 调和 → 观察器继续增量更新。
@@ -30,6 +37,7 @@ import { isLikelyStale } from '../cache/reconciler'
  * 原有 Live-only 行为，绝不影响 TurnRail 正常启动。
  */
 export function bootstrap(): void {
+  bootstrapInstanceCount++
   perf.reset()
   const provider = new ChatGptProvider()
   const store = new ConversationStore()
@@ -501,6 +509,22 @@ export function bootstrap(): void {
       return 'unknown'
     }
 
+    /** extension ID 的 FNV-1a 短 hash（8 位十六进制；隐私合同：绝不输出完整 extension ID） */
+    function getExtensionIdHash(): string | null {
+      try {
+        const id = (globalThis as unknown as Record<string, any>).chrome?.runtime?.id
+        if (typeof id !== 'string' || id.length === 0) return null
+        let hash = 0x811c9dc5
+        for (let i = 0; i < id.length; i++) {
+          hash ^= id.charCodeAt(i)
+          hash = Math.imul(hash, 0x01000193)
+        }
+        return (hash >>> 0).toString(16).padStart(8, '0')
+      } catch {
+        return null
+      }
+    }
+
     function buildTurnRailDiagnostics() {
       return buildDiagnostics({
         version: getExtensionVersion(),
@@ -522,6 +546,12 @@ export function bootstrap(): void {
           storeTurns: store.turns.length,
           markers: ui.host.shadowRoot?.querySelectorAll('.tn-marker').length ?? 0,
           providerMode: provider.lastStrategyLabel,
+          // 生命周期诊断（纯数字 / 短 hash）：bootstrap 次数（正常恒为 1，
+          // >1 = 同一页面重复初始化）、扩展版本与 extension ID 短 hash
+          //（用于区分"两个扩展副本"造成的重复日志；绝不输出完整 ID）
+          bootstrapCount: bootstrapInstanceCount,
+          extensionVersion: getExtensionVersion(),
+          extensionIdHash: getExtensionIdHash(),
           // 性能指标（TTFR / TTLR / full-vs-incremental / observer 分类；仅元数据）
           performance: perf.snapshot(),
           // 导航缓存指标（只含元数据：命中 / 耗时 / 数量，绝无 prompt 或回答正文）

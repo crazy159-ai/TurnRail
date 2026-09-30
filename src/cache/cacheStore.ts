@@ -1,4 +1,4 @@
-import { debugWarn, reportError } from '../utils/logger.ts'
+import { debugLog, reportError } from '../utils/logger.ts'
 import { classifyCacheFailure } from './errors.ts'
 import { parseCacheIndex, parseCachedConversation } from './validate.ts'
 import type {
@@ -322,8 +322,12 @@ export class ConversationCacheStore {
     this.state = { status: 'unavailable', reason }
     this.stats.available = false
     if (reason === 'extension-context-invalidated') {
-      // 预期生命周期事件（v1.2.2 语义：DEBUG 下降级留痕；生产静默）
-      debugWarn(`cache.${source}: extension context invalidated; falling back to Live-only mode`)
+      // 预期生命周期事件（v1.2.3）：DEBUG 下仅一条 debug 级 lifecycle 日志，
+      // 生产完全静默 —— 绝不 warn / error / reportError。transitionUnavailable
+      // 幂等保证同一页面生命周期最多这一条。
+      debugLog(
+        `cache lifecycle: extension context invalidated (via ${source}); cache disabled until page reload`
+      )
       return
     }
     if (reason === 'storage-error') {
