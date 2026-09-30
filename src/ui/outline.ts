@@ -53,8 +53,8 @@ export interface Outline {
   renderItems(turns: ConversationTurn[], query: string, detectFailed: boolean): void
   setActive(turnId: string | undefined): void
   setStatus(text: string): void
-  /** 后台历史预热状态（footer 低干扰文本；null 语义由调用方决定是否更新） */
-  setWarmupStatus(text: string): void
+  /** 静态历史覆盖状态（footer 低干扰文本，如"历史 72 · 部分"） */
+  setHistoryStatus(text: string): void
   setBusy(busy: boolean): void
   clearSearch(): void
   /** ☆/★ 状态同步（含 tooltip / aria-pressed） */
@@ -208,15 +208,17 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   // 底部
   const foot = createEl('div', 'tn-panel-foot')
   const status = createEl('span', 'tn-status', '')
-  // 后台历史预热状态（低干扰：纯文本、无动画、每 batch 至多更新一次，规格 #47/#48）
-  const warmupStatus = createEl('span', 'tn-warmup-status', '')
+  // 静态历史覆盖状态（低干扰：只反映当前实际 coverage，无动画、无后台任务进度）
+  const historyStatus = createEl('span', 'tn-history-status', '')
   const loadButton = document.createElement('button')
   loadButton.type = 'button'
   loadButton.className = 'tn-load-btn'
   loadButton.textContent = '加载全部历史'
-  loadButton.setAttribute('aria-label', '滚动加载当前会话的全部历史消息')
+  // 明确告知：这是唯一会主动滚动页面的操作，由用户显式授权
+  loadButton.title = '主动滚动聊天以加载更早历史，完成后会尝试恢复原阅读位置'
+  loadButton.setAttribute('aria-label', '加载全部历史（会暂时滚动聊天，完成后恢复阅读位置）')
   loadButton.addEventListener('click', () => handlers.onLoadHistory())
-  foot.append(status, warmupStatus, loadButton)
+  foot.append(status, historyStatus, loadButton)
 
   element.append(head, search, health, list, handoffView, foot)
 
@@ -458,8 +460,8 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     status.textContent = text
   }
 
-  function setWarmupStatus(text: string): void {
-    warmupStatus.textContent = text
+  function setHistoryStatus(text: string): void {
+    historyStatus.textContent = text
   }
 
   function setBusy(value: boolean): void {
@@ -472,5 +474,5 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     handlers.onSearchInput('')
   }
 
-  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setWarmupStatus, setBusy, clearSearch, setCached, setCacheEnabled, setCheckpointLookup, showHandoffPreview, hideHandoffPreview, isHandoffPreviewOpen, setHandoffEntryVisible }
+  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setHistoryStatus, setBusy, clearSearch, setCached, setCacheEnabled, setCheckpointLookup, showHandoffPreview, hideHandoffPreview, isHandoffPreviewOpen, setHandoffEntryVisible }
 }

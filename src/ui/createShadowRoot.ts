@@ -37,8 +37,8 @@ export interface NavigationUi {
   setActive(turnId: string | undefined): void
   handleReset(): void
   setStatus(text: string): void
-  /** 后台历史预热状态（footer 文本） */
-  setWarmupStatus(text: string): void
+  /** 静态历史覆盖状态（footer 文本，如"历史 72 · 部分"） */
+  setHistoryStatus(text: string): void
   setBusy(busy: boolean): void
   /** 当前会话是否已缓存（★/☆） */
   setCached(cached: boolean): void
@@ -326,7 +326,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.clearSearch()
     outline.close()
     outline.setStatus('')
-    outline.setWarmupStatus('')
+    outline.setHistoryStatus('')
     outline.setCount(0)
     outline.setCached(false)
     outline.setHealth(null)
@@ -350,5 +350,5 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     host.remove()
   }
 
-  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setWarmupStatus: outline.setWarmupStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, refreshList, getHealthSnapshot, showHandoffPreview, hideHandoffPreview, setHandoffEntryVisible, destroy }
+  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setHistoryStatus: outline.setHistoryStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, refreshList, getHealthSnapshot, showHandoffPreview, hideHandoffPreview, setHandoffEntryVisible, destroy }
 }

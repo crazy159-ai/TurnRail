@@ -3,10 +3,9 @@ import { ConversationStore } from '../conversation/store'
 import { ConversationIndexer } from '../conversation/indexer'
 import { captureFullHistory, isCaptureRunning } from '../conversation/historyCapture'
 import {
-  createHistoryWarmupController,
-  warmupStatusText
-} from '../conversation/historyWarmup'
-import { createUserActivityMonitor } from './userActivity'
+  computeHistoryCoverage,
+  historyCoverageLabel
+} from '../conversation/historyCoverage'
 import { ScrollSpy } from '../navigation/scrollSpy'
 import { jumpToTurn } from '../navigation/jump'
 import { isRecoverRunning, recoverAndJump, getRecoverLog } from '../navigation/recoverTarget'
@@ -77,33 +76,21 @@ export function bootstrap(): void {
     ui.setActive(turnId)
   })
 
-  // ---------- 用户活动监视 + 后台历史预热（Cooperative History Warmup） ----------
-  // 只记录时间戳 / 计数（绝不含按键内容 / 输入文本），供 warmup 门控使用。
-  const activity = createUserActivityMonitor()
-  activity.attach()
-
+  // ---------- 被动历史收获（Passive History Harvest） ----------
+  // TurnRail 绝不为补全历史主动滚动当前聊天（BACKGROUND_TASK_MUST_NOT_SCROLL）：
+  // 用户自然浏览挂载的内容由 Observer 管道自动收获；reachedTop 只收集
+  // "用户自然到顶且懒加载稳定"的被动证据，或来自显式捕获 / 缓存 complete。
   let conversationGeneration = 0
   /**
-   * 缓存 hydrate 明确 complete = true 时（此前 manual capture 已确认到顶），
-   * 本轮路由不再自动 warmup（规格 #35）：避免重复全量扫旧历史。
-   * 缓存被判定 stale / 用户移除缓存 / 路由切换时清除。
+   * 本轮路由是否已确认到达视觉顶部（无更多旧历史）。依据仅三种：
+   * 用户显式「加载全部历史」确认到顶 / 缓存 complete / 被动到顶证据。
+   * 只影响 coverage 展示语义（state=complete），绝不触发任何滚动。
    */
-  let cachedHydrationComplete = false
+  let reachedTop = false
 
-  const warmup = createHistoryWarmupController({
-    provider,
-    indexer,
-    store,
-    activity,
-    isCaptureRunning,
-    isRecoverRunning,
-    getGeneration: () => conversationGeneration,
-    onStateChange: (snapshot) => {
-      // 低干扰 UI：每 batch 至多一次；paused 维持原文案不闪烁（warmupStatusText 返回 null）
-      const text = warmupStatusText(snapshot)
-      if (text !== null) ui.setWarmupStatus(text)
-    }
-  })
+  function refreshHistoryCoverageUi(): void {
+    ui.setHistoryStatus(historyCoverageLabel(computeHistoryCoverage(store, reachedTop)))
+  }
 
   // ---------- 导航缓存桥接（cache-first + live reconcile） ----------
   // generation：每次路由变化递增；异步缓存读取返回时 generation 已变则直接丢弃
@@ -428,10 +415,10 @@ export function bootstrap(): void {
       } finally {
         hydrating = false
       }
-      // 缓存此前已确认 complete（到顶）：本轮路由不做自动 warmup（规格 #35）
-      if (cached.complete === true && hydrated > 0 && !cachedHydrationComplete) {
-        cachedHydrationComplete = true
-        warmup.stop()
+      // 缓存此前已确认 complete（到顶）：本轮路由直接继承到顶证据（不再需要任何补全）
+      if (cached.complete === true && hydrated > 0) {
+        reachedTop = true
+        refreshHistoryCoverageUi()
       }
       // 缓存读取晚于 Live 首扫时，hydrate 刚插入的 turn 需要立即做一次 stale 检查
       if (hydrated > 0) checkCacheStaleness()
@@ -457,11 +444,10 @@ export function bootstrap(): void {
     }
     hydratedTurnIds = null
     store.cacheHydrated = false
-    // 缓存 complete 语义随 stale 判定失效：若 warmup 因此被跳过，允许其接管补全
-    const wasComplete = cachedHydrationComplete
-    cachedHydrationComplete = false
+    // 缓存 complete 语义随 stale 判定失效：到顶证据不再可信，退回 partial
+    reachedTop = false
     store.dropTurns(dropIds)
-    if (wasComplete && provider.getConversationId() !== null) warmup.start()
+    refreshHistoryCoverageUi()
   }
 
   // ---------- 两层 Observer + Mutation 管道（v1.2） ----------
@@ -510,8 +496,8 @@ export function bootstrap(): void {
         indexer.scan(true)
       },
       onAssistantStream: () => {
-        // streaming 时间戳 → warmup 门控在 streamingQuietMs 内不运行（规格 #16）
-        activity.markAssistantStream()
+        // streaming 导致的布局漂移 → 去抖 geometry refresh（历史补全不再消费流式时间戳：
+        // TurnRail 没有任何会因 streaming 而启动的后台任务）
         debouncedSpyRefresh()
       }
     }
@@ -571,6 +557,8 @@ export function bootstrap(): void {
   // ---------- Store → UI / spy / 缓存自动保存 ----------
   store.onChange((kind) => {
     ui.syncFromStore(store, kind)
+    // 静态覆盖状态跟随结构变化（纯文本，无后台任务进度）
+    if (kind === 'structure') refreshHistoryCoverageUi()
     if (kind === 'structure') spy.refresh()
     else if (kind === 'elements') debouncedSpyRefresh()
     // 自动保存只在 turn 结构变化时调度：assistant 流式输出（text）不触发写盘
@@ -616,8 +604,11 @@ export function bootstrap(): void {
       })
       // 完整历史捕获确认到顶且当前会话已缓存 → 重新保存并置 complete = true
       if (result.reachedTop && activeCachedId !== null) scheduleCacheSave(true)
-      // manual capture 已确认到顶：本轮路由不再自动 warmup（与缓存 complete 同语义）
-      if (result.reachedTop) warmup.stop()
+      // 显式捕获确认到顶：记录到顶证据（coverage state → complete）
+      if (result.reachedTop) {
+        reachedTop = true
+        refreshHistoryCoverageUi()
+      }
       ui.setStatus(
         result.addedTurns > 0 ? `已补充 ${result.addedTurns} 条历史` : '没有发现更多历史消息'
       )
@@ -674,7 +665,6 @@ export function bootstrap(): void {
         activeCachedId = null
         activeCreatedAt = undefined
         hydratedTurnIds = null
-        cachedHydrationComplete = false
         ui.setCached(false)
         ui.setStatus('已移除当前对话缓存')
       } else {
@@ -714,9 +704,7 @@ export function bootstrap(): void {
     conversationGeneration++
     // 先 flush 旧会话的待写缓存：必须在 store.reset 之前序列化旧数据
     flushPendingSave()
-    // 停止旧会话的后台 warmup：所有定时器取消，迟到 batch 被 generation 校验丢弃
-    warmup.stop()
-    cachedHydrationComplete = false
+    reachedTop = false
     // 停止旧 root 的观察 / 发现 / 启动扫描（迟到回调不得写入新 Store，#12/#67）
     stopStartupScan?.()
     stopStartupScan = null
@@ -757,10 +745,6 @@ export function bootstrap(): void {
       void maybeInjectPendingHandoff()
       return
     }
-
-    // 会话路由：等 initialIdleMs 让启动链路稳定后开始低优先级补全（规格 #36/#82）。
-    // 缓存此前已确认 complete 时不自动运行（规格 #35）；warmup.start() 内部会重置本轮计数。
-    if (!cachedHydrationComplete) warmup.start()
   }
 
   const stopRouteWatcher = createRouteWatcher(() => resetForRoute())
@@ -810,8 +794,8 @@ export function bootstrap(): void {
           ? checkpointStore.count(currentCheckpointConversationId()!)
           : 0,
         handoff: { ...handoffPendingMeta },
-        // 后台历史预热快照（纯数字 / 枚举，无正文无 turn ID）
-        historyWarmup: warmup.snapshot()
+        // 历史覆盖快照（纯数字 / 枚举，无正文无 turn ID）
+        historyCoverage: computeHistoryCoverage(store, reachedTop)
       })
     }
 
@@ -850,8 +834,8 @@ export function bootstrap(): void {
             ageMs: handoffPendingMeta.ageMs,
             characters: handoffPendingMeta.characters
           },
-          // 后台历史预热快照（纯数字 / 枚举；供浏览器测试与诊断读取）
-          historyWarmup: warmup.snapshot(),
+          // 历史覆盖快照（纯数字 / 枚举；供浏览器测试与诊断读取）
+          historyCoverage: computeHistoryCoverage(store, reachedTop),
           // 滚动几何（真实 ChatGPT 为 column-reverse：scrollTop ∈ [-extent, 0]）
           flexDirection: sc ? window.getComputedStyle(sc).flexDirection : null,
           scrollTop: sc ? sc.scrollTop : null,
@@ -870,7 +854,6 @@ export function bootstrap(): void {
       indexer,
       cache: cacheStore,
       recoverLog: getRecoverLog,
-      warmup,
       // DEBUG 跳转钩子：与点击目录项同一 handleJump 路径（jump → 失败时 recoverAndJump）。
       // 供诊断 / 浏览器测试在虚拟化频繁重建 DOM 时稳定触发恢复跳转
       jump: (turnId: string) => void handleJump(turnId),

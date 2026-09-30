@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { buildDiagnostics, type TurnRailDiagnostics } from '../../src/utils/diagnostics.ts'
 import { ConversationStore } from '../../src/conversation/store.ts'
 import { ConversationCacheStore } from '../../src/cache/cacheStore.ts'
+import { computeHistoryCoverage } from '../../src/conversation/historyCoverage.ts'
 import { fakeProvider, liveTurn, makeStorage } from './helpers.ts'
 
 /**
@@ -169,50 +170,40 @@ test('diagnostics: handoff 元数据为纯数字白名单，绝不包含 payload
   assert.ok(!json.includes('ASSISTANT-SECRET-REPLY'), 'handoff 元数据不得携带 assistant 正文')
 })
 
-test('diagnostics: historyWarmup 为状态枚举 + 纯数字白名单（规格 #49）', () => {
-  const { diagnostics } = makeContext()
-  // 未提供 warmup 快照 → null（向后兼容）
-  assert.equal(diagnostics.historyWarmup, null)
+test('diagnostics: historyCoverage 为枚举 + 纯数字白名单', () => {
+  const { diagnostics, store } = makeContext()
+  // 未提供覆盖快照 → null（向后兼容）
+  assert.equal(diagnostics.historyCoverage, null)
 
-  const withWarmup = buildDiagnostics({
+  const withCoverage = buildDiagnostics({
     version: '1.2.1-test',
     provider: fakeProvider([]),
-    store: new ConversationStore(),
+    store,
     cache: new ConversationCacheStore(makeStorage()),
     performance: null,
     markers: () => 0,
-    historyWarmup: {
-      state: 'paused',
-      discoveredTurns: 9,
-      fullUserTurns: 12,
-      previewUserTurns: 3,
-      fullAssistantTurns: 10,
-      missingAssistantTurns: 2,
-      batches: 5,
-      steps: 8,
-      reachedTop: false,
-      pausedReason: 'user-active'
-    }
+    historyCoverage: computeHistoryCoverage(store, true)
   })
-  assert.deepEqual(Object.keys(withWarmup.historyWarmup!).sort(), [
-    'batches',
+  assert.deepEqual(Object.keys(withCoverage.historyCoverage!).sort(), [
+    'fullAssistantTurns',
+    'fullUserTurns',
     'indexedTurns',
-    'pauseReason',
-    'previewTurns',
+    'missingAssistantTurns',
+    'previewUserTurns',
     'reachedTop',
-    'state',
-    'steps'
+    'state'
   ])
-  assert.deepEqual(withWarmup.historyWarmup, {
-    state: 'paused',
-    batches: 5,
-    steps: 8,
-    indexedTurns: 15,
-    previewTurns: 3,
-    reachedTop: false,
-    pauseReason: 'user-active'
+  assert.deepEqual(withCoverage.historyCoverage, {
+    indexedTurns: 1,
+    fullUserTurns: 1,
+    previewUserTurns: 0,
+    fullAssistantTurns: 1,
+    missingAssistantTurns: 0,
+    reachedTop: true,
+    state: 'complete'
   })
-  // 快照不得携带正文 / turn ID（即使 store 含敏感内容）
-  const json = JSON.stringify(withWarmup.historyWarmup)
+  // 覆盖快照不得携带正文 / turn ID（即使 store 含敏感内容）
+  const json = JSON.stringify(withCoverage.historyCoverage)
   assert.ok(!json.includes(SECRET_PROMPT))
+  assert.ok(!json.includes(SECRET_MESSAGE_ID))
 })

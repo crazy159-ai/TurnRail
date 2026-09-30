@@ -1,7 +1,7 @@
 import type { ChatProvider } from '../providers/types'
 import type { ConversationStore } from '../conversation/store'
 import type { ConversationCacheStore } from '../cache/cacheStore'
-import type { HistoryWarmupSnapshot } from '../conversation/historyWarmup'
+import type { HistoryCoverage } from '../conversation/historyCoverage'
 import { getScrollBounds, isAtVisualBottom, isAtVisualTop, isReversedContainer } from '../navigation/scrollGeometry'
 import type { PerformanceSnapshot } from './performance'
 
@@ -33,8 +33,8 @@ export interface TurnRailDiagnosticsContext {
     ageMs: number | null
     characters: number | null
   }
-  /** 后台历史预热快照（纯数字 / 枚举，无正文无 turn ID，规格 #49） */
-  historyWarmup?: HistoryWarmupSnapshot | null
+  /** 历史覆盖快照（纯数字 / 枚举，无正文无 turn ID） */
+  historyCoverage?: HistoryCoverage | null
 }
 
 export interface TurnRailDiagnostics {
@@ -94,15 +94,15 @@ export interface TurnRailDiagnostics {
     characters: number | null
   }
 
-  /** 后台历史预热（白名单：状态枚举 + 纯数字；无标题 / preview / turn ID） */
-  historyWarmup: {
-    state: string
-    batches: number
-    steps: number
+  /** 历史覆盖（白名单：枚举 + 纯数字；无标题 / preview / turn ID / 正文） */
+  historyCoverage: {
     indexedTurns: number
-    previewTurns: number
+    fullUserTurns: number
+    previewUserTurns: number
+    fullAssistantTurns: number
+    missingAssistantTurns: number
     reachedTop: boolean
-    pauseReason: string | null
+    state: string
   } | null
 }
 
@@ -169,15 +169,15 @@ export function buildDiagnostics(ctx: TurnRailDiagnosticsContext): TurnRailDiagn
       characters: ctx.handoff?.characters ?? null
     },
 
-    historyWarmup: ctx.historyWarmup
+    historyCoverage: ctx.historyCoverage
       ? {
-          state: ctx.historyWarmup.state,
-          batches: ctx.historyWarmup.batches,
-          steps: ctx.historyWarmup.steps,
-          indexedTurns: ctx.historyWarmup.fullUserTurns + ctx.historyWarmup.previewUserTurns,
-          previewTurns: ctx.historyWarmup.previewUserTurns,
-          reachedTop: ctx.historyWarmup.reachedTop,
-          pauseReason: ctx.historyWarmup.pausedReason
+          indexedTurns: ctx.historyCoverage.indexedTurns,
+          fullUserTurns: ctx.historyCoverage.fullUserTurns,
+          previewUserTurns: ctx.historyCoverage.previewUserTurns,
+          fullAssistantTurns: ctx.historyCoverage.fullAssistantTurns,
+          missingAssistantTurns: ctx.historyCoverage.missingAssistantTurns,
+          reachedTop: ctx.historyCoverage.reachedTop,
+          state: ctx.historyCoverage.state
         }
       : null
   }
