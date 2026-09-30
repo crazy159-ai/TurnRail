@@ -167,8 +167,8 @@ Store ──► Handoff 服务 (handoff/)   ← 仅用户点击时运行，不�
 | `cache/cacheStore.ts` | chrome.storage.local 持久层（索引 + 显式 CacheRuntimeState 状态机：available / terminal unavailable，context probe pre-flight + 全链路容错，失败即 Live-only） |
 | `handoff/types.ts` | Checkpoint / Handoff / PendingHandoff 数据模型与体积限额（工程默认值，非模型 context limit） |
 | `handoff/checkpointStore.ts` | 用户标记的 checkpoint 仓库：纯内存、按会话分桶、附着稳定 turnId（抗虚拟化卸载） |
-| `handoff/builder.ts` / `formatter.ts` | 纯函数确定性抽取（Checkpoint + Recent Tail + Current Objective）与 markdown 渲染；fence 安全截断 + 显式 warning |
-| `handoff/pendingStore.ts` / `injector.ts` | 短生命周期跨标签页通道（TTL / 消费即删）与新聊天页 composer 草稿注入（绝不发送） |
+| `handoff/builder.ts` / `formatter.ts` | 纯函数确定性抽取（Checkpoint + Recent Tail + Current Objective，objective 同轮去重）与 markdown 渲染；checkpoint 超限保留最新；fence 安全截断 + 显式 warning |
+| `handoff/pendingStore.ts` / `injector.ts` | 短生命周期跨标签页通道（TTL / 身份安全消费：只删自己注入的那条）与新聊天页 composer 草稿注入（写入后回读验证，绝不发送） |
 | `content/observers.ts` | 两层 Observer：短命 Root Watch（root 缺失时等出现）+ scoped Conversation Observer（root 出现即断开 document 级监听） |
 | `content/mutationPipeline.ts` | Mutation 分类器 + Dirty Turn 队列（streaming 忽略 / turn 内变化 / unknown 回退 full scan；40ms 批量去重） |
 | `content/startupScan.ts` | 启动稳定性退避扫描（100→2400ms，连续 2 次签名不变即停，替代固定 8×400ms） |
@@ -249,26 +249,48 @@ Handoff 只带走用户显式选择的状态。完整流程：
 按会话隔离（A 的标记不出现在 B）。Checkpoint 的含义是"用户认为此轮必须保留"
 —— TurnRail 不自动推断结论。V1 checkpoint 存于内存：页面刷新后需重新标记（已知限制）。
 
-**生成内容 = 确定性结构抽取，不是 AI 摘要**：Selected Checkpoints（全部 ⭐ 轮，
+**生成内容 = 确定性结构抽取，不是 AI 摘要**：Selected Checkpoints（用户 ⭐ 轮，
 优先级最高）+ Recent Working Context（最近 6 个 user 轮，字符预算内）+
 Current Objective（最后一个 user prompt，不重写含义）+ 固定的 Continuation Rules。
-没有自动总结、没有"最终结论"推断、没有模型调用。
+没有自动总结、没有"最终结论"推断、没有模型调用。最后一轮恰好也是 checkpoint 时，
+Objective 段只保留指引（"已包含在上方 Checkpoint N"），同一轮的完整正文绝不重复出现。
 
 **体积限额是 TurnRail 的工程默认值，不代表 ChatGPT context limit**：
 全文 40k 字符 / 单条消息 12k 字符 / 12 个 checkpoint / 6 个 recent 轮。
-超限按优先级裁剪（checkpoint > 目标轮 user > recent user > recent assistant），
-每一步都产生显式 warning，绝不静默截断；代码块按 fence 安全方式截断（补闭合 ```）。
+checkpoint 超过 12 个时**保留最新 12 个**（长期任务的最新状态最有价值），
+被省略的永远是最旧的，且产生显式 warning；其余超限按优先级裁剪
+（checkpoint > 目标轮 user > recent user > recent assistant），每一步都产生
+显式 warning，绝不静默截断；代码块按 fence 安全方式截断（补闭合 ```）。
+多个 checkpoint 之间出现矛盾时，Continuation Rules 告知新模型"后者优先"
+（TurnRail 不做自动冲突检测，也不自动把旧 checkpoint 标记为 superseded）。
 
 **Preview 是必经步骤**：预览层默认可编辑（用户可删掉错误结论），复制 / 重新生成 /
 取消 / 在新聊天继续。取消不产生任何副作用。缓存 preview 恢复的文本会显式标注
 "preview only"，绝不冒充完整结论。
 
-**新聊天注入（只填草稿）**：确认后 TurnRail 将交接文本写入
-`chrome.storage.local` 的独立命名空间 `turnrail:handoff:pending`（**短生命周期
-PendingHandoff，10 分钟 TTL**），打开 chatgpt.com 新标签页；新聊天页（无会话路由）
-自动读取并填入输入框后立即删除。**TurnRail 没有任何点击发送的代码路径** ——
-最终发送永远由用户完成。交接文本不经 URL 传递（无历史 / 日志泄漏）。storage
-不可用（含扩展重载后的 context 失效）时回退为提示用户手动复制粘贴，绝不假成功。
+**新聊天注入（只填草稿）**：确认后 TurnRail 依次执行：
+
+1. **同步预留新标签页**（用户点击手势内 `window.open('about:blank')`，此时
+   弹窗不会被浏览器拦截；正文绝不写入 URL，预留成功后立即切断 opener）；
+2. 预留成功 → 将交接文本写入 `chrome.storage.local` 的独立命名空间
+   `turnrail:handoff:pending`（**短生命周期 PendingHandoff，10 分钟 TTL**），
+   保存成功后把预留标签页导航到 chatgpt.com 新聊天；
+3. 新聊天页（无会话路由）自动读取并填入输入框后**身份安全地删除**——只删除
+   自己实际注入的那条 pending；多标签页竞争下被更新的 handoff 覆盖时，
+   旧消费者绝不误删新记录。
+
+**TurnRail 没有任何点击发送的代码路径** —— 最终发送永远由用户完成。
+
+**失败语义（no silent failure / no fake success）**：每一步失败都有真实的
+用户可见结果，绝不谎报成功——
+
+| 失败点 | 用户看到的 |
+| --- | --- |
+| 弹窗被浏览器阻止 | 「浏览器阻止了新标签页…」（按剪贴板真实成败给两套文案），不创建 pending |
+| pending 写入失败（含扩展重载 context 失效） | 关闭空白标签页 + 按剪贴板真实结果显示「已复制」或「请手动全选复制」 |
+| 复制失败（权限 / 非安全上下文） | 「复制失败，请在预览框中手动全选复制」，绝不显示「已复制」 |
+| composer 写入后回读验证失败 | 注入如实失败，pending 保留（TTL 兜底），绝不显示「已填入」 |
+| 注入期间 pending 被新 handoff 覆盖 | 新 pending 完整保留，本轮不算失败（composer 已收到自己的那份） |
 
 **与 Memory / Project 无关**：Handoff 是确定性的 —— 你明确知道新对话收到了哪些
 上下文，不依赖 ChatGPT 的 Memory 检索行为。
