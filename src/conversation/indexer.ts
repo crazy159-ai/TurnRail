@@ -330,6 +330,7 @@ export class ConversationIndexer {
     let elementChanged = false
     let userTextChanged = false
     let assistantTextChanged = false
+    let coverageChanged = false
     for (const { record, key } of incoming) {
       const existing = store.messages.get(key)
       if (existing) {
@@ -343,8 +344,13 @@ export class ConversationIndexer {
           else assistantTextChanged = true
         }
         // 该消息已被 Live DOM 重新解析绑定 → 文本即完整原文
-        //（缓存 hydrate 恢复的截断 preview 在此升级为 full）
-        if (record.role === 'user') existing.contentCompleteness = 'full'
+        //（缓存 hydrate 恢复的截断 preview 在此升级为 full）。
+        // 即使文本与 preview 完全相同（语义未变），完整度升级也必须上报
+        // 'coverage' —— 健康覆盖度 / 目录标记依赖它，绝不能因文本相同被吞掉
+        if (existing.contentCompleteness === 'preview') {
+          existing.contentCompleteness = 'full'
+          coverageChanged = true
+        }
         existing.role = record.role
         existing.isMounted = true
       } else {
@@ -475,17 +481,19 @@ export class ConversationIndexer {
 
     const idsChanged =
       finalTurns.length !== prevTurns.length || finalTurns.some((turn, i) => turn.id !== prevTurns[i]?.id)
-    // 同批多类变化时按用户侧优先上报（健康重算依赖 user-text）：
-    // structure > user-text > elements > assistant-text
+    // 同批多类变化时按影响面优先上报（structure 隐含 coverage，健康重算依赖 user-text）：
+    // structure > user-text > coverage > elements > assistant-text
     const kind: ChangeKind = idsChanged
       ? 'structure'
       : userTextChanged
         ? 'user-text'
-        : elementChanged
-          ? 'elements'
-          : assistantTextChanged
-            ? 'assistant-text'
-            : 'none'
+        : coverageChanged
+          ? 'coverage'
+          : elementChanged
+            ? 'elements'
+            : assistantTextChanged
+              ? 'assistant-text'
+              : 'none'
     store.commit(kind)
   }
 

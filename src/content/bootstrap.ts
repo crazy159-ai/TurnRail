@@ -569,8 +569,8 @@ export function bootstrap(): void {
   // ---------- Store → UI / spy / 缓存自动保存 ----------
   store.onChange((kind) => {
     ui.syncFromStore(store, kind)
-    // 静态覆盖状态跟随结构变化（纯文本，无后台任务进度）
-    if (kind === 'structure') refreshHistoryCoverageUi()
+    // 静态覆盖状态跟随 structure / coverage 变化（纯文本，无后台任务进度）
+    if (kind === 'structure' || kind === 'coverage') refreshHistoryCoverageUi()
     if (kind === 'structure') spy.refresh()
     else if (kind === 'elements') debouncedSpyRefresh()
     // 自动保存只在 turn 结构变化时调度：assistant 流式输出（text）不触发写盘
