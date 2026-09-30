@@ -2,6 +2,11 @@ import { ChatGptProvider } from '../providers/chatgpt'
 import { ConversationStore } from '../conversation/store'
 import { ConversationIndexer } from '../conversation/indexer'
 import { captureFullHistory, isCaptureRunning } from '../conversation/historyCapture'
+import {
+  createHistoryWarmupController,
+  warmupStatusText
+} from '../conversation/historyWarmup'
+import { createUserActivityMonitor } from './userActivity'
 import { ScrollSpy } from '../navigation/scrollSpy'
 import { jumpToTurn } from '../navigation/jump'
 import { isRecoverRunning, recoverAndJump, getRecoverLog } from '../navigation/recoverTarget'
@@ -72,10 +77,37 @@ export function bootstrap(): void {
     ui.setActive(turnId)
   })
 
+  // ---------- 用户活动监视 + 后台历史预热（Cooperative History Warmup） ----------
+  // 只记录时间戳 / 计数（绝不含按键内容 / 输入文本），供 warmup 门控使用。
+  const activity = createUserActivityMonitor()
+  activity.attach()
+
+  let conversationGeneration = 0
+  /**
+   * 缓存 hydrate 明确 complete = true 时（此前 manual capture 已确认到顶），
+   * 本轮路由不再自动 warmup（规格 #35）：避免重复全量扫旧历史。
+   * 缓存被判定 stale / 用户移除缓存 / 路由切换时清除。
+   */
+  let cachedHydrationComplete = false
+
+  const warmup = createHistoryWarmupController({
+    provider,
+    indexer,
+    store,
+    activity,
+    isCaptureRunning,
+    isRecoverRunning,
+    getGeneration: () => conversationGeneration,
+    onStateChange: (snapshot) => {
+      // 低干扰 UI：每 batch 至多一次；paused 维持原文案不闪烁（warmupStatusText 返回 null）
+      const text = warmupStatusText(snapshot)
+      if (text !== null) ui.setWarmupStatus(text)
+    }
+  })
+
   // ---------- 导航缓存桥接（cache-first + live reconcile） ----------
   // generation：每次路由变化递增；异步缓存读取返回时 generation 已变则直接丢弃
-  //（防 A/B 会话竞态串写 —— A 的缓存绝不进入 B 的 Store）
-  let conversationGeneration = 0
+  //（防 A/B 会话竞态串写 —— A 的缓存绝不进入 B 的 Store）。声明见 warmup 段。
   /** 当前路由对应的已缓存会话 id（null = 未缓存 / 未知） */
   let activeCachedId: string | null = null
   /** 已缓存会话的 createdAt（重写缓存时保留创建时间语义） */
@@ -396,6 +428,11 @@ export function bootstrap(): void {
       } finally {
         hydrating = false
       }
+      // 缓存此前已确认 complete（到顶）：本轮路由不做自动 warmup（规格 #35）
+      if (cached.complete === true && hydrated > 0 && !cachedHydrationComplete) {
+        cachedHydrationComplete = true
+        warmup.stop()
+      }
       // 缓存读取晚于 Live 首扫时，hydrate 刚插入的 turn 需要立即做一次 stale 检查
       if (hydrated > 0) checkCacheStaleness()
     } catch (err) {
@@ -420,7 +457,11 @@ export function bootstrap(): void {
     }
     hydratedTurnIds = null
     store.cacheHydrated = false
+    // 缓存 complete 语义随 stale 判定失效：若 warmup 因此被跳过，允许其接管补全
+    const wasComplete = cachedHydrationComplete
+    cachedHydrationComplete = false
     store.dropTurns(dropIds)
+    if (wasComplete && provider.getConversationId() !== null) warmup.start()
   }
 
   // ---------- 两层 Observer + Mutation 管道（v1.2） ----------
@@ -469,6 +510,8 @@ export function bootstrap(): void {
         indexer.scan(true)
       },
       onAssistantStream: () => {
+        // streaming 时间戳 → warmup 门控在 streamingQuietMs 内不运行（规格 #16）
+        activity.markAssistantStream()
         debouncedSpyRefresh()
       }
     }
@@ -573,6 +616,8 @@ export function bootstrap(): void {
       })
       // 完整历史捕获确认到顶且当前会话已缓存 → 重新保存并置 complete = true
       if (result.reachedTop && activeCachedId !== null) scheduleCacheSave(true)
+      // manual capture 已确认到顶：本轮路由不再自动 warmup（与缓存 complete 同语义）
+      if (result.reachedTop) warmup.stop()
       ui.setStatus(
         result.addedTurns > 0 ? `已补充 ${result.addedTurns} 条历史` : '没有发现更多历史消息'
       )
@@ -629,6 +674,7 @@ export function bootstrap(): void {
         activeCachedId = null
         activeCreatedAt = undefined
         hydratedTurnIds = null
+        cachedHydrationComplete = false
         ui.setCached(false)
         ui.setStatus('已移除当前对话缓存')
       } else {
@@ -668,6 +714,9 @@ export function bootstrap(): void {
     conversationGeneration++
     // 先 flush 旧会话的待写缓存：必须在 store.reset 之前序列化旧数据
     flushPendingSave()
+    // 停止旧会话的后台 warmup：所有定时器取消，迟到 batch 被 generation 校验丢弃
+    warmup.stop()
+    cachedHydrationComplete = false
     // 停止旧 root 的观察 / 发现 / 启动扫描（迟到回调不得写入新 Store，#12/#67）
     stopStartupScan?.()
     stopStartupScan = null
@@ -706,7 +755,12 @@ export function bootstrap(): void {
     // 新建聊天 / 首页：检查是否有待注入的 Handoff（无 pending 时零行为）
     if (conversationId === null) {
       void maybeInjectPendingHandoff()
+      return
     }
+
+    // 会话路由：等 initialIdleMs 让启动链路稳定后开始低优先级补全（规格 #36/#82）。
+    // 缓存此前已确认 complete 时不自动运行（规格 #35）；warmup.start() 内部会重置本轮计数。
+    if (!cachedHydrationComplete) warmup.start()
   }
 
   const stopRouteWatcher = createRouteWatcher(() => resetForRoute())
@@ -755,7 +809,9 @@ export function bootstrap(): void {
         checkpointCount: currentCheckpointConversationId()
           ? checkpointStore.count(currentCheckpointConversationId()!)
           : 0,
-        handoff: { ...handoffPendingMeta }
+        handoff: { ...handoffPendingMeta },
+        // 后台历史预热快照（纯数字 / 枚举，无正文无 turn ID）
+        historyWarmup: warmup.snapshot()
       })
     }
 
@@ -794,6 +850,8 @@ export function bootstrap(): void {
             ageMs: handoffPendingMeta.ageMs,
             characters: handoffPendingMeta.characters
           },
+          // 后台历史预热快照（纯数字 / 枚举；供浏览器测试与诊断读取）
+          historyWarmup: warmup.snapshot(),
           // 滚动几何（真实 ChatGPT 为 column-reverse：scrollTop ∈ [-extent, 0]）
           flexDirection: sc ? window.getComputedStyle(sc).flexDirection : null,
           scrollTop: sc ? sc.scrollTop : null,
@@ -812,6 +870,7 @@ export function bootstrap(): void {
       indexer,
       cache: cacheStore,
       recoverLog: getRecoverLog,
+      warmup,
       resetPerformanceStats: () => perf.reset(),
       // 诊断导出（纯元数据，无聊天正文；见 utils/diagnostics.ts 隐私合同）：
       // 生成 JSON → 尝试写入剪贴板；剪贴板不可用时返回 JSON 字符串。绝不自动发送。
