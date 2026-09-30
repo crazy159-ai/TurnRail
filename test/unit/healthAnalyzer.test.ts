@@ -3,7 +3,11 @@ import assert from 'node:assert/strict'
 import { analyzeConversationHealth, HEALTH_WEIGHTS } from '../../src/health/analyzer.ts'
 import type { ConversationTurn } from '../../src/conversation/types.ts'
 
-function makeTurns(prompts: string[], assistants: string[] = []): ConversationTurn[] {
+function makeTurns(
+  prompts: string[],
+  assistants: string[] = [],
+  completeness?: 'full' | 'preview'
+): ConversationTurn[] {
   return prompts.map((text, index) => ({
     id: `turn-${index}`,
     index,
@@ -13,7 +17,8 @@ function makeTurns(prompts: string[], assistants: string[] = []): ConversationTu
       text,
       turnIndex: index,
       firstSeenAt: index,
-      isMounted: false
+      isMounted: false,
+      contentCompleteness: completeness
     },
     assistant: {
       id: `assistant-${index}`,
@@ -137,7 +142,7 @@ test('health: 方案反转频繁时 decisionChurn 明显升高', () => {
       (_, i) =>
         i % 2 === 0
           ? '不要用之前的方案了，改成事件总线，撤销前面关于单例的决定。'
-          : '再换成存储抽象层，现在改为依赖注入的方式。'
+          : '再换成存储抽象层，架构上改为依赖注入的方式。'
     )
   )
   const snapshot = analyzeConversationHealth(makeTurns(prompts))
@@ -191,6 +196,43 @@ test('health: 只有单一信号极端升高时不得进入 new-chat', () => {
   const snapshot = analyzeConversationHealth(makeTurns(prompts))
 
   assert.ok(snapshot.signals.correctionFrequency > 0.8)
-  assert.notEqual(snapshot.level, 'new-chat')
-  assert.notEqual(snapshot.level, 'organize')
+  // P1-5 guardrail：强纠错信号必须至少 watch（加权分数会把单信号稀释到 healthy 区间）
+  assert.equal(snapshot.level, 'watch')
+})
+
+/** P0-1 合同：assistant 正文长度绝不影响健康分（流式期间分数输入必须稳定） */
+test('health: assistant 正文不参与评分（user-only）', () => {
+  const prompts = neutralPrompts(20)
+  const compact = analyzeConversationHealth(makeTurns(prompts, Array.from({ length: 20 }, () => '好的。')))
+  const verbose = analyzeConversationHealth(
+    makeTurns(prompts, Array.from({ length: 20 }, () => '很长的回答。'.repeat(2000)))
+  )
+
+  assert.equal(compact.score, verbose.score)
+  assert.deepEqual(compact.signals, verbose.signals)
+  assert.equal(compact.evidence.indexedUserCharacters, verbose.evidence.indexedUserCharacters)
+})
+
+/** Test H：正常 UI 微调（弱修改动词、无决策上下文）不得产生高 churn */
+test('health: 普通参数修改不算方案反转', () => {
+  const prompts = neutralPrompts(2).concat([
+    '把按钮改成绿色。',
+    '把 padding 改成 8px。',
+    '把 README 标题改成英文。',
+    '把变量名改成 healthScore。',
+    '把默认端口切换到 8931。',
+    '把提示文案改为更简短的版本。',
+    '把图标换成 16px 的版本。',
+    '把这个函数改成 async 的写法。',
+    '把颜色改为深色主题变量。',
+    '把 margin 改为 4px。',
+    '把超链接改为新窗口打开。',
+    '把日志改成 debug 级别。'
+  ])
+  const snapshot = analyzeConversationHealth(makeTurns(prompts))
+
+  assert.ok(
+    snapshot.signals.decisionChurn < 0.2,
+    `普通修改不应计为方案反转，实际 ${snapshot.signals.decisionChurn}`
+  )
 })
