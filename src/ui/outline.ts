@@ -9,6 +9,8 @@ export interface OutlineHandlers {
   onClose: () => void
   onPinChange: (pinned: boolean) => void
   onToggleCache: () => void
+  /** 标记 / 取消检查点（Handoff 必带轮次）；由 bootstrap 操作 CheckpointStore */
+  onToggleCheckpoint: (turnId: string) => void
 }
 
 export interface Outline {
@@ -27,6 +29,8 @@ export interface Outline {
   setCached(cached: boolean): void
   /** storage 不可用时禁用缓存按钮（Live-only 降级） */
   setCacheEnabled(enabled: boolean): void
+  /** 注入 checkpoint 查询函数（renderItems 时决定每项的 ★/☆ 状态） */
+  setCheckpointLookup(lookup: (turnId: string) => boolean): void
 }
 
 /**
@@ -114,6 +118,8 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   const items = new Map<string, HTMLButtonElement>()
   let activeId: string | undefined
   let lastUserScrollAt = 0
+  /** checkpoint 状态查询（bootstrap 注入；缺省视为未标记） */
+  let checkpointLookup: (turnId: string) => boolean = () => false
 
   list.addEventListener('wheel', () => (lastUserScrollAt = Date.now()), { passive: true })
   list.addEventListener('pointerdown', () => (lastUserScrollAt = Date.now()), { passive: true })
@@ -202,6 +208,38 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     cacheButton.disabled = !value
   }
 
+  function setCheckpointLookup(lookup: (turnId: string) => boolean): void {
+    checkpointLookup = lookup
+  }
+
+  /**
+   * 检查点星标（Handoff V1）：低干扰设计 —— 未标记时 hover 才显现，
+   * 标记后常驻 ★。item 本身是 <button>，内部不允许再嵌 button，
+   * 因此用 span[role="button"] 并阻断冒泡（点击星标不触发跳转）。
+   */
+  function createCheckpointButton(turnId: string): HTMLSpanElement {
+    const marked = checkpointLookup(turnId)
+    const star = document.createElement('span')
+    star.className = marked ? 'tn-checkpoint-btn tn-checkpointed' : 'tn-checkpoint-btn'
+    star.textContent = marked ? '★' : '☆'
+    star.setAttribute('role', 'button')
+    star.tabIndex = 0
+    star.setAttribute('aria-pressed', String(marked))
+    star.setAttribute('aria-label', marked ? '取消检查点标记' : '标记为检查点')
+    star.title = marked ? '取消检查点标记' : '标记为检查点：生成 Handoff 时必带此轮'
+    const toggle = (event: Event): void => {
+      event.preventDefault()
+      event.stopPropagation()
+      handlers.onToggleCheckpoint(turnId)
+    }
+    star.addEventListener('click', toggle)
+    star.addEventListener('keydown', (event) => {
+      const key = (event as KeyboardEvent).key
+      if (key === 'Enter' || key === ' ') toggle(event)
+    })
+    return star
+  }
+
   function renderItems(turns: ConversationTurn[], query: string, detectFailed: boolean): void {
     list.textContent = ''
     items.clear()
@@ -244,6 +282,7 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
       if (!turn.user?.element?.isConnected) {
         item.appendChild(createEl('span', 'tn-flag', '未加载'))
       }
+      item.appendChild(createCheckpointButton(turn.id))
       if (turn.id === activeId) item.classList.add('tn-active')
       item.addEventListener('click', () => handlers.onJump(turn.id))
 
@@ -281,5 +320,5 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     handlers.onSearchInput('')
   }
 
-  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled }
+  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled, setCheckpointLookup }
 }

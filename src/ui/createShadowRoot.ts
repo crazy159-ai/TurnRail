@@ -16,6 +16,10 @@ export interface NavigationUiHandlers {
   onJump: (turnId: string) => void
   onLoadHistory: () => void
   onToggleCache: () => void
+  /** 标记 / 取消检查点（bootstrap 操作 CheckpointStore 后由 UI 重渲染） */
+  onToggleCheckpoint: (turnId: string) => void
+  /** 当前会话中该 turn 是否已标记检查点（renderItems 逐项查询） */
+  isCheckpointed: (turnId: string) => boolean
 }
 
 export interface NavigationUi {
@@ -29,6 +33,8 @@ export interface NavigationUi {
   setCached(cached: boolean): void
   /** 缓存能力可用性（storage 失败时禁用按钮） */
   setCacheEnabled(enabled: boolean): void
+  /** 检查点标记变化后按需重建目录（面板打开时立即，关闭时标记 dirty） */
+  refreshList(): void
   destroy(): void
 }
 
@@ -58,6 +64,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     onJump: handlers.onJump,
     onLoadHistory: handlers.onLoadHistory,
     onToggleCache: handlers.onToggleCache,
+    onToggleCheckpoint: handlers.onToggleCheckpoint,
     onSearchInput: (query) => {
       searchQuery = query
       renderList()
@@ -71,6 +78,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
       if (!value) scheduleClose()
     }
   })
+  outline.setCheckpointLookup((turnId) => handlers.isCheckpointed(turnId))
 
   // ---------- 可见性 ----------
   function applyVisibility(): void {
@@ -267,6 +275,11 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.setActive(turnId)
   }
 
+  /** 检查点标记变化后重建目录（面板关闭时 renderList 自动转 dirty） */
+  function refreshList(): void {
+    renderList()
+  }
+
   function handleReset(): void {
     searchQuery = ''
     outline.clearSearch()
@@ -292,5 +305,5 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     host.remove()
   }
 
-  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, destroy }
+  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, refreshList, destroy }
 }

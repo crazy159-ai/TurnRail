@@ -357,4 +357,31 @@ export const navigationCss = `
 :host(.tn-dark) .tn-cache-btn.tn-cached {
   color: #e7b455;
 }
+
+/* ---------- Checkpoint 星标（目录项内，低干扰） ---------- */
+.tn-checkpoint-btn {
+  flex: none;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--tn-muted);
+  cursor: pointer;
+  padding: 1px 3px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.tn-item:hover .tn-checkpoint-btn,
+.tn-checkpoint-btn:focus-visible {
+  opacity: 1;
+}
+.tn-checkpoint-btn.tn-checkpointed {
+  opacity: 1;
+  color: #d99a2b;
+}
+:host(.tn-dark) .tn-checkpoint-btn.tn-checkpointed {
+  color: #e7b455;
+}
+.tn-checkpoint-btn:hover {
+  background: var(--tn-border);
+}
 `

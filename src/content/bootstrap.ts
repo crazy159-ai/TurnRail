@@ -16,6 +16,7 @@ import { isAtVisualBottom, isAtVisualTop, getScrollBounds } from '../navigation/
 import { DEBUG, debugLog, debugWarn, reportError } from '../utils/logger'
 import { debounce } from '../utils/debounce'
 import { ConversationCacheStore } from '../cache/cacheStore'
+import { CheckpointStore } from '../handoff/checkpointStore'
 import { serializeConversation } from '../cache/serializer'
 import { hydrateCachedConversation } from '../cache/hydrator'
 import { isLikelyStale } from '../cache/reconciler'
@@ -43,11 +44,14 @@ export function bootstrap(): void {
   const store = new ConversationStore()
   const indexer = new ConversationIndexer(provider, store)
   const cacheStore = new ConversationCacheStore()
+  const checkpointStore = new CheckpointStore()
 
   const ui = createNavigationUi(provider, {
     onJump: (turnId) => void handleJump(turnId),
     onLoadHistory: () => void handleLoadHistory(),
-    onToggleCache: () => void handleToggleCache()
+    onToggleCache: () => void handleToggleCache(),
+    onToggleCheckpoint: (turnId) => handleToggleCheckpoint(turnId),
+    isCheckpointed: (turnId) => isTurnCheckpointed(turnId)
   })
   document.body.appendChild(ui.host)
   ui.setCacheEnabled(cacheStore.isAvailable())
@@ -102,6 +106,28 @@ export function bootstrap(): void {
     pendingSave = null
     if (pending) void writeCacheSnapshot(pending.conversationId, pending.complete)
   }, 1200)
+
+  // ---------- Checkpoint（Handoff 必带轮次的用户标记） ----------
+  // 只操作内存元数据（CheckpointStore 按会话分桶），随后按需重建目录；
+  // 不写 storage、不进入 observer hot path（用户事件驱动，规格 #38）。
+
+  /** 检查点 key 与缓存一致：使用 provider 会话 id（无 id 的本地会话不参与 Handoff） */
+  function currentCheckpointConversationId(): string | null {
+    return provider.getConversationId()
+  }
+
+  function isTurnCheckpointed(turnId: string): boolean {
+    const conversationId = currentCheckpointConversationId()
+    return conversationId !== null && checkpointStore.isCheckpointed(conversationId, turnId)
+  }
+
+  function handleToggleCheckpoint(turnId: string): void {
+    const conversationId = currentCheckpointConversationId()
+    const turn = store.getTurn(turnId)
+    if (!conversationId || !turn) return
+    checkpointStore.toggle(conversationId, { id: turn.id, index: turn.index })
+    ui.refreshList()
+  }
 
   /** 仅当会话已被用户缓存时才调度自动保存（v1.1 不做全量自动缓存） */
   function scheduleCacheSave(complete: boolean): void {
