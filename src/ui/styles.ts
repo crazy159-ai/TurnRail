@@ -223,6 +223,105 @@ export const navigationCss = `
 .tn-health-note-hidden {
   display: none;
 }
+.tn-health-cta {
+  appearance: none;
+  border: 1px solid var(--tn-accent);
+  background: transparent;
+  color: var(--tn-accent);
+  font: inherit;
+  font-size: 12px;
+  margin-top: 7px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  width: 100%;
+}
+.tn-health-cta:hover {
+  background: color-mix(in srgb, var(--tn-accent) 12%, transparent);
+}
+.tn-health-cta-hidden {
+  display: none;
+}
+
+/* ---------- Handoff 预览层（覆盖列表区；editable） ---------- */
+.tn-handoff-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--tn-bg);
+  z-index: 3;
+}
+.tn-handoff-hidden {
+  display: none;
+}
+.tn-handoff-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.tn-handoff-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.tn-handoff-hint {
+  color: var(--tn-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.tn-handoff-warnings {
+  border: 1px solid rgba(184, 134, 11, 0.35);
+  border-radius: 8px;
+  padding: 5px 8px;
+  color: var(--tn-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.tn-handoff-text {
+  flex: 1;
+  resize: none;
+  border: 1px solid var(--tn-border);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--tn-text);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 8px;
+  white-space: pre;
+}
+.tn-handoff-text:focus {
+  outline: 1px solid var(--tn-accent);
+}
+.tn-handoff-actions {
+  display: flex;
+  gap: 6px;
+}
+.tn-handoff-btn {
+  appearance: none;
+  border: 1px solid var(--tn-border);
+  background: transparent;
+  color: var(--tn-text);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.tn-handoff-btn:hover {
+  border-color: var(--tn-accent);
+  color: var(--tn-accent);
+}
+.tn-handoff-continue {
+  border-color: var(--tn-accent);
+  color: var(--tn-accent);
+  flex: 1;
+}
+.tn-handoff-continue:hover {
+  background: color-mix(in srgb, var(--tn-accent) 12%, transparent);
+}
 .tn-health[data-level="healthy"] .tn-health-score {
   color: var(--tn-accent);
 }
@@ -356,5 +455,32 @@ export const navigationCss = `
 }
 :host(.tn-dark) .tn-cache-btn.tn-cached {
   color: #e7b455;
+}
+
+/* ---------- Checkpoint 星标（目录项内，低干扰） ---------- */
+.tn-checkpoint-btn {
+  flex: none;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--tn-muted);
+  cursor: pointer;
+  padding: 1px 3px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.tn-item:hover .tn-checkpoint-btn,
+.tn-checkpoint-btn:focus-visible {
+  opacity: 1;
+}
+.tn-checkpoint-btn.tn-checkpointed {
+  opacity: 1;
+  color: #d99a2b;
+}
+:host(.tn-dark) .tn-checkpoint-btn.tn-checkpointed {
+  color: #e7b455;
+}
+.tn-checkpoint-btn:hover {
+  background: var(--tn-border);
 }
 `

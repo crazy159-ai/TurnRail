@@ -58,6 +58,43 @@ export interface ProviderDiagnostics {
 }
 
 /**
+ * 新聊天标签页预留（popup blocked 防护，Handoff V1）：
+ * reserveNewConversation 在用户点击的同步链路内先开 about:blank 占住弹窗资格，
+ * pending 保存成功后再导航到目标地址。实现层不暴露裸 Window / location，
+ * handoff 模块对 window.open / WindowProxy / opener 保持零知识。
+ */
+export interface NewConversationReservation {
+  /** 导航到 Provider 的新聊天地址。true = 导航指令已发出 */
+  navigate(): boolean
+
+  /** 关闭预留标签页（pending 保存失败时回滚，不留空白 tab） */
+  close(): void
+}
+
+/**
+ * 会话延续能力（Conversation Handoff 注入，可选 capability）：
+ * 只有具备"新聊天输入框"概念的 Provider 才实现；handoff / UI 模块只依赖
+ * 本接口，绝不允许出现任何站点 selector。未来新增 Provider 时按需实现。
+ */
+export interface ConversationContinuationCapability {
+  /** 新聊天 composer 元素；不存在 / 站点改版返回 null */
+  getComposer(): HTMLElement | null
+
+  /**
+   * 将 draft 文本写入 composer 并触发框架感知的 input 事件。
+   * 只填草稿 —— 绝不提交 / 点击发送（TurnRail 的硬性产品约束）。
+   * true = 写入真实完成（含最小回读验证）。
+   */
+  setComposerText(text: string): boolean
+
+  /**
+   * 同步预留新聊天标签页（必须在用户点击的同步链路中调用，避免弹窗拦截）。
+   * null = 浏览器阻止了新标签页（或 Provider 无法打开）；正文绝不写入 URL。
+   */
+  reserveNewConversation(): NewConversationReservation | null
+}
+
+/**
  * 站点适配层：所有"针对 ChatGPT DOM 的查询"必须集中在这里，
  * 其余模块只依赖本接口。站点改版时只改这个实现。
  */

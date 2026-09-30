@@ -3,9 +3,11 @@ import { debugLog } from '../utils/logger'
 import { fnv1a } from '../conversation/stableId'
 import type {
   ChatProvider,
+  ConversationContinuationCapability,
   LocatedMessage,
   LocatedTurn,
   LocatedTurnRoot,
+  NewConversationReservation,
   ProviderDiagnostics,
   ProviderMutationHints,
   ProviderRole
@@ -28,6 +30,8 @@ export const SELECTORS = {
   assistantRole: '[data-conversation-role="assistant"]',
   assistantMarkdown: '[data-markdown-text-style="assistant-message"]',
   assistantMessage: '[data-chatgpt-selection-message-id]',
+  /** 新聊天输入框（Handoff draft 注入；只填草稿，绝不提交） */
+  composer: '#prompt-textarea',
   /** 站点标记为非正文（操作 UI 等）的节点 */
   skipContent: '[data-thread-find-skip="true"]'
 } as const
@@ -104,7 +108,7 @@ function inferLegacyRole(element: HTMLElement): ProviderRole {
   return 'unknown'
 }
 
-export class ChatGptProvider implements ChatProvider {
+export class ChatGptProvider implements ChatProvider, ConversationContinuationCapability {
   readonly name = 'chatgpt'
 
   private cachedScrollContainer: HTMLElement | null = null
@@ -439,5 +443,109 @@ export class ChatGptProvider implements ChatProvider {
 
   invalidateDomCache(): void {
     this.cachedScrollContainer = null
+  }
+
+  // ---------- ConversationContinuationCapability（Handoff draft 注入） ----------
+
+  getComposer(): HTMLElement | null {
+    return document.querySelector<HTMLElement>(SELECTORS.composer)
+  }
+
+  /**
+   * 只填草稿，绝不提交。contenteditable（ProseMirror 类）优先走
+   * execCommand('insertText')（框架可感知）；textarea 走 value + input 事件；
+   * 两者都失败才退回 textContent + 手动 input 事件。写入后做最小回读验证
+   * （非空 + 核心采样命中）：DOM 有文本 ≠ 编辑器内部状态正确，
+   * 验证失败返回 false，绝不让注入器产生假成功。
+   */
+  setComposerText(text: string): boolean {
+    const composer = this.getComposer()
+    if (!composer) return false
+    try {
+      if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+        composer.value = text
+        composer.dispatchEvent(new Event('input', { bubbles: true }))
+      } else {
+        composer.focus()
+        const selection = window.getSelection()
+        if (selection) {
+          const range = document.createRange()
+          range.selectNodeContents(composer)
+          selection.removeAllRanges()
+          selection.addRange(range)
+        }
+        if (!document.execCommand('insertText', false, text)) {
+          composer.textContent = text
+          composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }))
+        }
+      }
+      return this.composerContainsDraft(composer, text)
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 写入后最小验证：contenteditable / ProseMirror 会重排换行 —— execCommand
+   * 的 insertText 把 \n 变成 <br>，而 <br> 在 textContent 中不产生任何字符，
+   * 逐字符比对必然误报失败。因此比较时剥离全部空白：只要求回读非空，且
+   * 开头 / 中部 / 结尾三段核心采样命中。采样共 ~240 字符，对 40k 上限的
+   * handoff 足够区分"真写入"与"execCommand 假成功 / 编辑器清空"。
+   */
+  private composerContainsDraft(composer: HTMLElement, text: string): boolean {
+    const readBack =
+      composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+        ? composer.value
+        : (composer.textContent ?? '')
+    const actual = readBack.replace(/\s+/g, '')
+    if (actual.length === 0) return false
+    const expected = text.replace(/\s+/g, '')
+    if (actual === expected) return true
+    const mid = Math.floor(expected.length / 2)
+    const probes = [
+      expected.slice(0, 80),
+      expected.slice(Math.max(0, mid - 40), mid + 40),
+      expected.slice(-80)
+    ]
+    return probes.every((probe) => probe.length > 0 && actual.includes(probe))
+  }
+
+  /**
+   * 同步预留新聊天标签页（用户手势链路内调用才不会被弹窗拦截）：
+   * 先 window.open('about:blank') 探测弹窗资格（null = 被浏览器阻止），
+   * 成功后切断 opener 再返回窄接口；正文绝不写入 URL —— 导航地址是常量
+   * 新聊天页，与 handoff 内容零关联。
+   */
+  reserveNewConversation(): NewConversationReservation | null {
+    let target: Window | null = null
+    try {
+      target = window.open('about:blank', '_blank')
+    } catch {
+      return null
+    }
+    if (!target) return null
+    try {
+      target.opener = null
+    } catch {
+      // 个别浏览器不允许改写 opener：不影响后续导航与关闭
+    }
+    return {
+      navigate: () => {
+        try {
+          if (target!.closed) return false
+          target!.location.href = 'https://chatgpt.com/'
+          return true
+        } catch {
+          return false
+        }
+      },
+      close: () => {
+        try {
+          target!.close()
+        } catch {
+          // 关闭失败只留下一个空白标签页，由用户手动处理
+        }
+      }
+    }
   }
 }

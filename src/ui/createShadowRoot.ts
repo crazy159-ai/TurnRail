@@ -3,6 +3,7 @@ import { createEl } from '../utils/dom'
 import type { ChatProvider } from '../providers/types'
 import type { ConversationStore, StoreEvent } from '../conversation/store'
 import type { ConversationTurn } from '../conversation/types'
+import type { ConversationHealthSnapshot } from '../health/types'
 import { getScrollBounds } from '../navigation/scrollGeometry'
 import { navigationCss } from './styles'
 import { perf } from '../utils/performance'
@@ -16,6 +17,18 @@ export interface NavigationUiHandlers {
   onJump: (turnId: string) => void
   onLoadHistory: () => void
   onToggleCache: () => void
+  /** 标记 / 取消检查点（bootstrap 操作 CheckpointStore 后由 UI 重渲染） */
+  onToggleCheckpoint: (turnId: string) => void
+  /** 当前会话中该 turn 是否已标记检查点（renderItems 逐项查询） */
+  isCheckpointed: (turnId: string) => boolean
+  /** Health CTA / 预览"重新生成"：构建并显示 Handoff 预览 */
+  onOpenHandoff: () => void
+  /** 复制预览文本（text = textarea 当前内容，含用户手改） */
+  onHandoffCopy: (text: string) => void
+  /** 确认在新聊天继续：保存 pending → 打开新标签页（只填草稿，绝不发送） */
+  onHandoffContinue: (text: string) => void
+  /** 关闭预览（取消，无副作用） */
+  onHandoffCancel: () => void
 }
 
 export interface NavigationUi {
@@ -29,6 +42,15 @@ export interface NavigationUi {
   setCached(cached: boolean): void
   /** 缓存能力可用性（storage 失败时禁用按钮） */
   setCacheEnabled(enabled: boolean): void
+  /** 检查点标记变化后按需重建目录（面板打开时立即，关闭时标记 dirty） */
+  refreshList(): void
+  /** 最近一次健康快照（Handoff 构建输入；无快照为 null） */
+  getHealthSnapshot(): ConversationHealthSnapshot | null
+  /** Handoff 预览 */
+  showHandoffPreview(payload: { text: string; warnings: string[] }): void
+  hideHandoffPreview(): void
+  /** 面板头 Handoff 入口可见性（checkpoint 存在时显示） */
+  setHandoffEntryVisible(visible: boolean): void
   destroy(): void
 }
 
@@ -58,6 +80,11 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     onJump: handlers.onJump,
     onLoadHistory: handlers.onLoadHistory,
     onToggleCache: handlers.onToggleCache,
+    onToggleCheckpoint: handlers.onToggleCheckpoint,
+    onOpenHandoff: handlers.onOpenHandoff,
+    onHandoffCopy: handlers.onHandoffCopy,
+    onHandoffContinue: handlers.onHandoffContinue,
+    onHandoffCancel: handlers.onHandoffCancel,
     onSearchInput: (query) => {
       searchQuery = query
       renderList()
@@ -71,6 +98,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
       if (!value) scheduleClose()
     }
   })
+  outline.setCheckpointLookup((turnId) => handlers.isCheckpointed(turnId))
 
   // ---------- 可见性 ----------
   function applyVisibility(): void {
@@ -132,18 +160,21 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
   //   物理上不会触发重算 —— 流式优化合同由事件语义保证，无需拼接全文 signature；
   // - 历史上用"末轮全文 signature"去重，既复制 prompt 又漏检早期 turn 的修改。
   let lastHealthRevision = -1
+  let lastHealthSnapshot: ConversationHealthSnapshot | null = null
 
   function renderHealth(): void {
     const store = storeRef
     if (!store) {
       outline.setHealth(null)
       lastHealthRevision = -1
+      lastHealthSnapshot = null
       return
     }
     if (store.semanticRevision === lastHealthRevision) return
     lastHealthRevision = store.semanticRevision
     perf.markHealthAnalyze()
-    outline.setHealth(analyzeConversationHealth(store.turns))
+    lastHealthSnapshot = analyzeConversationHealth(store.turns)
+    outline.setHealth(lastHealthSnapshot)
   }
 
   function renderList(): void {
@@ -267,6 +298,27 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.setActive(turnId)
   }
 
+  /** 检查点标记变化后重建目录（面板关闭时 renderList 自动转 dirty） */
+  function refreshList(): void {
+    renderList()
+  }
+
+  function getHealthSnapshot(): ConversationHealthSnapshot | null {
+    return lastHealthSnapshot
+  }
+
+  function showHandoffPreview(payload: { text: string; warnings: string[] }): void {
+    outline.showHandoffPreview(payload)
+  }
+
+  function hideHandoffPreview(): void {
+    outline.hideHandoffPreview()
+  }
+
+  function setHandoffEntryVisible(visible: boolean): void {
+    outline.setHandoffEntryVisible(visible)
+  }
+
   function handleReset(): void {
     searchQuery = ''
     outline.clearSearch()
@@ -275,7 +327,10 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.setCount(0)
     outline.setCached(false)
     outline.setHealth(null)
+    outline.hideHandoffPreview()
+    outline.setHandoffEntryVisible(false)
     lastHealthRevision = -1
+    lastHealthSnapshot = null
     rail.render([], { tops: [], railHeight: 0, markerHeight: 0 })
     rail.setActive(undefined)
     layer.classList.add('tn-hidden')
@@ -292,5 +347,5 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     host.remove()
   }
 
-  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, destroy }
+  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, refreshList, getHealthSnapshot, showHandoffPreview, hideHandoffPreview, setHandoffEntryVisible, destroy }
 }

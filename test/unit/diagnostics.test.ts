@@ -71,7 +71,14 @@ function makeContext(): {
     store,
     cache,
     performance: null,
-    markers: () => 1
+    markers: () => 1,
+    // Handoff 元数据（payload 故意携带 SECRET 正文 —— 断言绝不泄漏进导出）
+    checkpointCount: 4,
+    handoff: {
+      pending: true,
+      ageMs: 2300,
+      characters: 18420
+    }
   })
   return { diagnostics, store }
 }
@@ -139,4 +146,25 @@ test('diagnostics: 缓存字段为白名单子集（available/hit/cachedTurns/co
     ['available', 'cachedTurns', 'complete', 'hit', 'pinned', 'readMs', 'writeMs']
   )
   assert.equal(diagnostics.cache.available, true)
+})
+
+test('diagnostics: handoff 元数据为纯数字白名单，绝不包含 payload 正文', () => {
+  const { diagnostics } = makeContext()
+  // 白名单字段与纯数字断言（规格 #40）
+  assert.deepEqual(Object.keys(diagnostics.handoff).sort(), [
+    'ageMs',
+    'characters',
+    'checkpointCount',
+    'pending'
+  ])
+  assert.deepEqual(diagnostics.handoff, {
+    checkpointCount: 4,
+    pending: true,
+    ageMs: 2300,
+    characters: 18420
+  })
+  // payload 正文（即便曾进入 pending handoff）绝不出现在导出中
+  const json = JSON.stringify(diagnostics)
+  assert.ok(!json.includes(SECRET_PROMPT), 'handoff 元数据不得携带用户 prompt')
+  assert.ok(!json.includes('ASSISTANT-SECRET-REPLY'), 'handoff 元数据不得携带 assistant 正文')
 })

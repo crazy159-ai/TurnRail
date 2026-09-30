@@ -16,6 +16,13 @@ import { isAtVisualBottom, isAtVisualTop, getScrollBounds } from '../navigation/
 import { DEBUG, debugLog, debugWarn, reportError } from '../utils/logger'
 import { debounce } from '../utils/debounce'
 import { ConversationCacheStore } from '../cache/cacheStore'
+import { CheckpointStore } from '../handoff/checkpointStore'
+import { PendingHandoffStore } from '../handoff/pendingStore'
+import { injectPendingHandoff } from '../handoff/injector'
+import { buildConversationHandoff } from '../handoff/builder'
+import { formatConversationHandoff } from '../handoff/formatter'
+import type { HandoffTurnSnapshot } from '../handoff/types'
+import type { ConversationContinuationCapability } from '../providers/types'
 import { serializeConversation } from '../cache/serializer'
 import { hydrateCachedConversation } from '../cache/hydrator'
 import { isLikelyStale } from '../cache/reconciler'
@@ -43,11 +50,19 @@ export function bootstrap(): void {
   const store = new ConversationStore()
   const indexer = new ConversationIndexer(provider, store)
   const cacheStore = new ConversationCacheStore()
+  const checkpointStore = new CheckpointStore()
+  const pendingHandoffStore = new PendingHandoffStore()
 
   const ui = createNavigationUi(provider, {
     onJump: (turnId) => void handleJump(turnId),
     onLoadHistory: () => void handleLoadHistory(),
-    onToggleCache: () => void handleToggleCache()
+    onToggleCache: () => void handleToggleCache(),
+    onToggleCheckpoint: (turnId) => handleToggleCheckpoint(turnId),
+    isCheckpointed: (turnId) => isTurnCheckpointed(turnId),
+    onOpenHandoff: () => handleOpenHandoff(),
+    onHandoffCopy: (text) => void handleHandoffCopy(text),
+    onHandoffContinue: (text) => void handleHandoffContinue(text),
+    onHandoffCancel: () => handleHandoffCancel()
   })
   document.body.appendChild(ui.host)
   ui.setCacheEnabled(cacheStore.isAvailable())
@@ -102,6 +117,202 @@ export function bootstrap(): void {
     pendingSave = null
     if (pending) void writeCacheSnapshot(pending.conversationId, pending.complete)
   }, 1200)
+
+  // ---------- Checkpoint（Handoff 必带轮次的用户标记） ----------
+  // 只操作内存元数据（CheckpointStore 按会话分桶），随后按需重建目录；
+  // 不写 storage、不进入 observer hot path（用户事件驱动，规格 #38）。
+
+  /** 检查点 key 与缓存一致：使用 provider 会话 id（无 id 的本地会话不参与 Handoff） */
+  function currentCheckpointConversationId(): string | null {
+    return provider.getConversationId()
+  }
+
+  function isTurnCheckpointed(turnId: string): boolean {
+    const conversationId = currentCheckpointConversationId()
+    return conversationId !== null && checkpointStore.isCheckpointed(conversationId, turnId)
+  }
+
+  function handleToggleCheckpoint(turnId: string): void {
+    const conversationId = currentCheckpointConversationId()
+    const turn = store.getTurn(turnId)
+    if (!conversationId || !turn) return
+    checkpointStore.toggle(conversationId, { id: turn.id, index: turn.index })
+    syncHandoffEntry()
+    ui.refreshList()
+  }
+
+  /** 面板头 Handoff 入口：当前会话存在 checkpoint 标记时可见（路由重置后同步） */
+  function syncHandoffEntry(): void {
+    const conversationId = currentCheckpointConversationId()
+    ui.setHandoffEntryVisible(conversationId !== null && checkpointStore.count(conversationId) > 0)
+  }
+
+  // ---------- Handoff（确定性结构化交接：Preview → 用户审核 → 复制/继续） ----------
+  // 只在用户点击 CTA 时执行（用户事件驱动，绝不进入 observer hot path）。
+  // Snapshot 在点击时刻同步复制正文 —— 之后 DOM/store 再变不影响预览内容。
+
+  function snapshotTurnsForHandoff(): HandoffTurnSnapshot[] {
+    return store.turns.map((turn) => ({
+      id: turn.id,
+      index: turn.index,
+      userText: turn.user?.text ?? '',
+      assistantText: turn.assistant?.text ?? null,
+      userCompleteness: turn.user?.contentCompleteness,
+      assistantCompleteness: turn.assistant?.contentCompleteness
+    }))
+  }
+
+  function handleOpenHandoff(): void {
+    try {
+      const conversationId = currentCheckpointConversationId()
+      const health = ui.getHealthSnapshot()
+      const handoff = buildConversationHandoff({
+        conversationId,
+        turns: snapshotTurnsForHandoff(),
+        checkpoints: conversationId ? checkpointStore.list(conversationId) : [],
+        health: health
+          ? { score: health.score, level: health.level, confidence: health.confidence }
+          : undefined
+      })
+      ui.showHandoffPreview({
+        text: formatConversationHandoff(handoff),
+        warnings: handoff.warnings
+      })
+    } catch (err) {
+      reportError('handoff.build', err)
+      ui.setStatus('生成交接上下文失败，请重试')
+      window.setTimeout(() => ui.setStatus(''), 3500)
+    }
+  }
+
+  /**
+   * 剪贴板写入的"复制行为"与"UI 提示"分离：返回真实结果，
+   * 由调用方按成败渲染状态 —— 失败绝不显示"已复制"（no fake success）。
+   */
+  async function tryCopyText(text: string): Promise<boolean> {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async function handleHandoffCopy(text: string): Promise<void> {
+    const copied = await tryCopyText(text)
+    ui.setStatus(
+      copied
+        ? '交接上下文已复制，可粘贴到新聊天'
+        : '复制失败，请在预览框中手动全选复制'
+    )
+    window.setTimeout(() => ui.setStatus(''), 3500)
+  }
+
+  function handleHandoffCancel(): void {
+    ui.hideHandoffPreview()
+  }
+
+  // ---------- PendingHandoff：跨标签页注入（只填草稿，绝不自动发送） ----------
+
+  /** DEBUG 诊断元数据（纯数字，绝不含 payload；保存/注入后更新） */
+  let handoffPendingMeta: { pending: boolean; ageMs: number | null; characters: number | null } = {
+    pending: false,
+    ageMs: null,
+    characters: null
+  }
+
+  /** Provider 的会话延续能力（capability 探测，未实现返回 null） */
+  function getContinuationCapability(): ConversationContinuationCapability | null {
+    const candidate = provider as unknown as Partial<ConversationContinuationCapability>
+    if (
+      typeof candidate.getComposer === 'function' &&
+      typeof candidate.setComposerText === 'function' &&
+      typeof candidate.reserveNewConversation === 'function'
+    ) {
+      return candidate as ConversationContinuationCapability
+    }
+    return null
+  }
+
+  /** 回退提示：按剪贴板真实结果给用户可恢复路径（storage / 弹窗失败共用） */
+  async function fallbackToClipboard(text: string): Promise<void> {
+    const copied = await tryCopyText(text)
+    ui.setStatus(
+      copied
+        ? '无法自动传递到新标签页，已复制 Handoff，请手动打开新聊天并粘贴'
+        : '无法自动传递，也未能写入剪贴板，请在预览框中手动全选复制'
+    )
+    window.setTimeout(() => ui.setStatus(''), 4500)
+  }
+
+  async function handleHandoffContinue(text: string): Promise<void> {
+    if (text.length === 0) return
+    const capability = getContinuationCapability()
+
+    // 同步链路第一步：预留新标签页。window.open 必须仍在用户点击手势内执行，
+    // 否则 await storage 之后弹窗会被浏览器拦截（popup blocked 假成功的根源）。
+    // 预留失败 = 弹窗被阻止：绝不显示"已打开"，pending 也不创建（正文走预览/剪贴板）。
+    const reservation = capability ? capability.reserveNewConversation() : null
+    if (!reservation) {
+      if (!capability) {
+        await fallbackToClipboard(text)
+        return
+      }
+      const copied = await tryCopyText(text)
+      ui.setStatus(
+        copied
+          ? '浏览器阻止了新标签页，Handoff 已复制，请手动打开新聊天并粘贴'
+          : '浏览器阻止了新标签页，也无法自动复制，请在预览框中手动全选复制'
+      )
+      window.setTimeout(() => ui.setStatus(''), 4500)
+      return
+    }
+
+    // 预留成功后再异步保存 pending；保存失败 → 关闭空白标签页 + 剪贴板兜底
+    const saved = await pendingHandoffStore.save(text)
+    if (!saved) {
+      reservation.close()
+      await fallbackToClipboard(text)
+      return
+    }
+    handoffPendingMeta = { pending: true, ageMs: 0, characters: text.length }
+    ui.hideHandoffPreview()
+    const navigated = reservation.navigate()
+    ui.setStatus(
+      navigated
+        ? '已打开新聊天，Handoff 将自动填入输入框（不会自动发送）'
+        : '新聊天标签页已被关闭，Handoff 已保留，请重新点击或手动打开新聊天'
+    )
+    window.setTimeout(() => ui.setStatus(''), 4500)
+  }
+
+  /** 注入互斥：resetForRoute 可能连续触发，避免并发双重注入 */
+  let handoffInjectInFlight = false
+
+  /**
+   * 新建聊天页（无会话 id）读取 pending handoff 并填入 composer。
+   * 会话路由直接跳过（不多一次 storage 读）；无 pending 时页面零行为。
+   */
+  async function maybeInjectPendingHandoff(): Promise<void> {
+    if (provider.getConversationId() !== null) return
+    if (handoffInjectInFlight) return
+    handoffInjectInFlight = true
+    try {
+      const startedAt = Date.now()
+      const result = await injectPendingHandoff(getContinuationCapability(), pendingHandoffStore)
+      if (result === 'injected') {
+        handoffPendingMeta = {
+          pending: false,
+          ageMs: Date.now() - startedAt,
+          characters: null
+        }
+        ui.setStatus('已填入上一段会话的 Handoff，请检查后手动发送')
+        window.setTimeout(() => ui.setStatus(''), 5000)
+      }
+    } finally {
+      handoffInjectInFlight = false
+    }
+  }
 
   /** 仅当会话已被用户缓存时才调度自动保存（v1.1 不做全量自动缓存） */
   function scheduleCacheSave(complete: boolean): void {
@@ -478,6 +689,8 @@ export function bootstrap(): void {
     hydratedTurnIds = null
     lastHydrateMs = null
     lastReconcileMs = null
+    // Handoff 入口 / 预览跟随新会话（A 的 checkpoint 不影响 B；B 无标记则隐藏入口）
+    syncHandoffEntry()
 
     // root 已存在 → 立即挂 scoped 观察器 + 稳定性退避扫描；
     // 尚未挂载 → 短命 RootWatch 等待出现（cache-first 不受影响：缓存 hydrate 与 root 独立）
@@ -488,6 +701,11 @@ export function bootstrap(): void {
     // cache-first：缓存读取与 Live DOM 初始化并行；命中即在历史挂载前恢复目录
     if (conversationId && cacheStore.isAvailable()) {
       void loadCachedConversation(conversationId)
+    }
+
+    // 新建聊天 / 首页：检查是否有待注入的 Handoff（无 pending 时零行为）
+    if (conversationId === null) {
+      void maybeInjectPendingHandoff()
     }
   }
 
@@ -532,7 +750,12 @@ export function bootstrap(): void {
         store,
         cache: cacheStore,
         performance: perf.snapshot(),
-        markers: () => ui.host.shadowRoot?.querySelectorAll('.tn-marker').length ?? 0
+        markers: () => ui.host.shadowRoot?.querySelectorAll('.tn-marker').length ?? 0,
+        // Handoff 元数据（纯数字；payload / checkpoint 正文绝不进入诊断）
+        checkpointCount: currentCheckpointConversationId()
+          ? checkpointStore.count(currentCheckpointConversationId()!)
+          : 0,
+        handoff: { ...handoffPendingMeta }
       })
     }
 
@@ -560,6 +783,16 @@ export function bootstrap(): void {
             hydrateMs: lastHydrateMs,
             reconcileMs: lastReconcileMs,
             hydratedTurns: hydratedTurnIds?.size ?? null
+          },
+          // Handoff 元数据（纯数字：checkpoint 数 / pending 状态；
+          // handoff 文本与 checkpoint 正文绝不暴露）
+          handoff: {
+            checkpointCount: currentCheckpointConversationId()
+              ? checkpointStore.count(currentCheckpointConversationId()!)
+              : 0,
+            pending: handoffPendingMeta.pending,
+            ageMs: handoffPendingMeta.ageMs,
+            characters: handoffPendingMeta.characters
           },
           // 滚动几何（真实 ChatGPT 为 column-reverse：scrollTop ∈ [-extent, 0]）
           flexDirection: sc ? window.getComputedStyle(sc).flexDirection : null,

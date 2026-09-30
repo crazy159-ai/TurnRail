@@ -9,6 +9,16 @@ export interface OutlineHandlers {
   onClose: () => void
   onPinChange: (pinned: boolean) => void
   onToggleCache: () => void
+  /** 标记 / 取消检查点（Handoff 必带轮次）；由 bootstrap 操作 CheckpointStore */
+  onToggleCheckpoint: (turnId: string) => void
+  /** Health CTA / 预览"重新生成"：打开（或重建）Handoff 预览 */
+  onOpenHandoff: () => void
+  /** 复制预览文本（text = textarea 当前内容，含用户手改） */
+  onHandoffCopy: (text: string) => void
+  /** 确认在新聊天继续：保存 pending → 打开新标签页（只填草稿，绝不发送） */
+  onHandoffContinue: (text: string) => void
+  /** 关闭预览（无任何副作用；确认/取消均不产生 pending） */
+  onHandoffCancel: () => void
 }
 
 export interface Outline {
@@ -27,6 +37,14 @@ export interface Outline {
   setCached(cached: boolean): void
   /** storage 不可用时禁用缓存按钮（Live-only 降级） */
   setCacheEnabled(enabled: boolean): void
+  /** 注入 checkpoint 查询函数（renderItems 时决定每项的 ★/☆ 状态） */
+  setCheckpointLookup(lookup: (turnId: string) => boolean): void
+  /** 显示 Handoff 预览（editable；用户可手改后复制） */
+  showHandoffPreview(payload: { text: string; warnings: string[] }): void
+  hideHandoffPreview(): void
+  isHandoffPreviewOpen(): boolean
+  /** 面板头 Handoff 入口：仅在已存在 checkpoint 标记时可见（用户意图信号） */
+  setHandoffEntryVisible(visible: boolean): void
 }
 
 /**
@@ -64,13 +82,22 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   cacheButton.title = '缓存当前对话导航'
   cacheButton.setAttribute('aria-label', '缓存当前对话导航')
   cacheButton.addEventListener('click', () => handlers.onToggleCache())
+  // Handoff 入口：默认隐藏，仅当当前会话存在 checkpoint 标记时显示
+  //（healthy 状态下 Health CTA 不出现，但用户显式标记后仍需可直达 Handoff）
+  const handoffOpenButton = document.createElement('button')
+  handoffOpenButton.type = 'button'
+  handoffOpenButton.className = 'tn-icon-btn tn-handoff-open-btn tn-handoff-hidden'
+  handoffOpenButton.textContent = '⇄'
+  handoffOpenButton.title = '生成交接上下文（Handoff）：基于已标记的检查点 + 近期轮次'
+  handoffOpenButton.setAttribute('aria-label', '生成交接上下文（Handoff）')
+  handoffOpenButton.addEventListener('click', () => handlers.onOpenHandoff())
   const closeButton = document.createElement('button')
   closeButton.type = 'button'
   closeButton.className = 'tn-icon-btn'
   closeButton.textContent = '×'
   closeButton.setAttribute('aria-label', '关闭目录')
   closeButton.addEventListener('click', handlers.onClose)
-  head.append(title, count, cacheButton, pinButton, closeButton)
+  head.append(title, count, handoffOpenButton, cacheButton, pinButton, closeButton)
 
   // 搜索
   const search = document.createElement('input')
@@ -92,7 +119,63 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   const healthMessage = createEl('div', 'tn-health-message', '')
   const healthReasons = createEl('div', 'tn-health-reasons', '')
   const healthNote = createEl('div', 'tn-health-note', '')
-  health.append(healthTop, healthMessage, healthReasons, healthNote)
+  // Health → Handoff CTA（watch 弱提示 / organize / new-chat 三档文案；healthy 隐藏）
+  const healthCta = document.createElement('button')
+  healthCta.type = 'button'
+  healthCta.className = 'tn-health-cta'
+  healthCta.addEventListener('click', () => handlers.onOpenHandoff())
+  health.append(healthTop, healthMessage, healthReasons, healthNote, healthCta)
+
+  // Handoff 预览（覆盖列表区的编辑层）：用户必须先看到完整文本，任何自动发送都被禁止
+  const handoffView = createEl('section', 'tn-handoff-view tn-handoff-hidden')
+  const handoffHead = createEl('div', 'tn-handoff-head')
+  handoffHead.append(createEl('span', 'tn-handoff-title', '交接上下文预览'))
+  const handoffClose = document.createElement('button')
+  handoffClose.type = 'button'
+  handoffClose.className = 'tn-icon-btn'
+  handoffClose.textContent = '×'
+  handoffClose.setAttribute('aria-label', '关闭交接上下文预览')
+  handoffClose.addEventListener('click', () => {
+    handlers.onHandoffCancel()
+  })
+  handoffHead.append(handoffClose)
+  const handoffHint = createEl(
+    'div',
+    'tn-handoff-hint',
+    '可编辑。复制后粘贴到新聊天，或在确认后由 TurnRail 填入新聊天输入框（绝不自动发送）。'
+  )
+  const handoffWarnings = createEl('div', 'tn-handoff-warnings tn-handoff-hidden', '')
+  const handoffText = document.createElement('textarea')
+  handoffText.className = 'tn-handoff-text'
+  handoffText.spellcheck = false
+  handoffText.setAttribute('aria-label', '交接上下文内容（可编辑）')
+  const handoffActions = createEl('div', 'tn-handoff-actions')
+  const handoffCopy = document.createElement('button')
+  handoffCopy.type = 'button'
+  handoffCopy.className = 'tn-handoff-btn'
+  handoffCopy.textContent = '复制'
+  handoffCopy.addEventListener('click', () => handlers.onHandoffCopy(handoffText.value))
+  const handoffRegen = document.createElement('button')
+  handoffRegen.type = 'button'
+  handoffRegen.className = 'tn-handoff-btn'
+  handoffRegen.textContent = '重新生成'
+  handoffRegen.addEventListener('click', () => handlers.onOpenHandoff())
+  const handoffCancel = document.createElement('button')
+  handoffCancel.type = 'button'
+  handoffCancel.className = 'tn-handoff-btn'
+  handoffCancel.textContent = '取消'
+  handoffCancel.addEventListener('click', () => {
+    handlers.onHandoffCancel()
+  })
+  // 确认继续：在新标签页打开新聊天并自动"填入"输入框；TurnRail 绝不自动发送
+  const handoffContinue = document.createElement('button')
+  handoffContinue.type = 'button'
+  handoffContinue.className = 'tn-handoff-btn tn-handoff-continue'
+  handoffContinue.textContent = '在新聊天继续'
+  handoffContinue.title = '在新标签页打开 chatgpt.com 新聊天并自动填入输入框（不会自动发送）'
+  handoffContinue.addEventListener('click', () => handlers.onHandoffContinue(handoffText.value))
+  handoffActions.append(handoffCopy, handoffRegen, handoffContinue, handoffCancel)
+  handoffView.append(handoffHead, handoffHint, handoffWarnings, handoffText, handoffActions)
 
   // 列表
   const list = createEl('div', 'tn-list')
@@ -109,11 +192,13 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   loadButton.addEventListener('click', () => handlers.onLoadHistory())
   foot.append(status, loadButton)
 
-  element.append(head, search, health, list, foot)
+  element.append(head, search, health, list, handoffView, foot)
 
   const items = new Map<string, HTMLButtonElement>()
   let activeId: string | undefined
   let lastUserScrollAt = 0
+  /** checkpoint 状态查询（bootstrap 注入；缺省视为未标记） */
+  let checkpointLookup: (turnId: string) => boolean = () => false
 
   list.addEventListener('wheel', () => (lastUserScrollAt = Date.now()), { passive: true })
   list.addEventListener('pointerdown', () => (lastUserScrollAt = Date.now()), { passive: true })
@@ -155,6 +240,7 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
       healthMessage.textContent = ''
       healthReasons.textContent = ''
       healthNote.textContent = ''
+      healthCta.classList.add('tn-health-cta-hidden')
       lastAnnouncedHealth = ''
       return
     }
@@ -170,6 +256,18 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
       healthMessage.textContent = ''
     } else {
       healthMessage.textContent = snapshot.recommendation
+    }
+    // Handoff CTA：healthy 不显示（低干扰）；watch 弱提示整理、organize/new-chat 引导创建
+    if (level === 'healthy') {
+      healthCta.classList.add('tn-health-cta-hidden')
+    } else {
+      healthCta.classList.remove('tn-health-cta-hidden')
+      healthCta.textContent =
+        level === 'watch' ? '整理关键结论' : level === 'organize' ? '创建交接上下文' : '生成 Handoff'
+      healthCta.setAttribute(
+        'aria-label',
+        level === 'new-chat' ? '生成 Handoff 交接上下文（不会自动发送）' : healthCta.textContent
+      )
     }
     const maxReasons = level === 'healthy' ? 0 : level === 'watch' ? 1 : 3
     const reasons = snapshot.reasons.slice(0, maxReasons)
@@ -200,6 +298,67 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
 
   function setCacheEnabled(value: boolean): void {
     cacheButton.disabled = !value
+  }
+
+  function setCheckpointLookup(lookup: (turnId: string) => boolean): void {
+    checkpointLookup = lookup
+  }
+
+  function showHandoffPreview(payload: { text: string; warnings: string[] }): void {
+    handoffText.value = payload.text
+    if (payload.warnings.length > 0) {
+      handoffWarnings.textContent = payload.warnings.join(' ')
+      handoffWarnings.classList.remove('tn-handoff-hidden')
+    } else {
+      handoffWarnings.textContent = ''
+      handoffWarnings.classList.add('tn-handoff-hidden')
+    }
+    handoffView.classList.remove('tn-handoff-hidden')
+    list.classList.add('tn-handoff-covered')
+  }
+
+  function hideHandoffPreview(): void {
+    handoffView.classList.add('tn-handoff-hidden')
+    handoffText.value = ''
+    handoffWarnings.textContent = ''
+    handoffWarnings.classList.add('tn-handoff-hidden')
+    list.classList.remove('tn-handoff-covered')
+  }
+
+  function isHandoffPreviewOpen(): boolean {
+    return !handoffView.classList.contains('tn-handoff-hidden')
+  }
+
+  function setHandoffEntryVisible(visible: boolean): void {
+    handoffOpenButton.classList.toggle('tn-handoff-hidden', !visible)
+  }
+
+  /**
+   * 检查点星标（Handoff V1）：低干扰设计 —— 未标记时 hover 才显现，
+   * 标记后常驻 ★。item 本身是 <button>，内部不允许再嵌 button，
+   * 因此用 span[role="button"] 并阻断冒泡（点击星标不触发跳转）。
+   */
+  function createCheckpointButton(turnId: string): HTMLSpanElement {
+    const marked = checkpointLookup(turnId)
+    const star = document.createElement('span')
+    star.className = marked ? 'tn-checkpoint-btn tn-checkpointed' : 'tn-checkpoint-btn'
+    star.textContent = marked ? '★' : '☆'
+    star.setAttribute('role', 'button')
+    star.tabIndex = 0
+    star.setAttribute('aria-pressed', String(marked))
+    star.setAttribute('aria-label', marked ? '取消检查点标记' : '标记为检查点')
+    star.title = marked ? '取消检查点标记' : '标记为检查点：生成 Handoff 时必带此轮'
+    const toggle = (event: Event): void => {
+      event.preventDefault()
+      event.stopPropagation()
+      handlers.onToggleCheckpoint(turnId)
+    }
+    star.addEventListener('click', toggle)
+    star.addEventListener('keydown', (event) => {
+      const key = (event as KeyboardEvent).key
+      if (key === 'Enter' || key === ' ') toggle(event)
+    })
+    return star
   }
 
   function renderItems(turns: ConversationTurn[], query: string, detectFailed: boolean): void {
@@ -244,6 +403,7 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
       if (!turn.user?.element?.isConnected) {
         item.appendChild(createEl('span', 'tn-flag', '未加载'))
       }
+      item.appendChild(createCheckpointButton(turn.id))
       if (turn.id === activeId) item.classList.add('tn-active')
       item.addEventListener('click', () => handlers.onJump(turn.id))
 
@@ -281,5 +441,5 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     handlers.onSearchInput('')
   }
 
-  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled }
+  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled, setCheckpointLookup, showHandoffPreview, hideHandoffPreview, isHandoffPreviewOpen, setHandoffEntryVisible }
 }

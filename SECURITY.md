@@ -15,6 +15,13 @@ TurnRail 是 **local-first 浏览器扩展**：
 - 最小权限：Manifest V3，仅 `storage` 权限 + 两条 chatgpt.com host（合同测试强制）
 - 聊天正文只以 `textContent` 渲染进 Shadow DOM，绝不作为 HTML 注入（防 XSS）
 - 本地缓存只含导航元数据（turn ID / 顺序 / 标题 / 短 preview），存于 `chrome.storage.local`，不上传
+- **Pending Handoff（Conversation Handoff 功能）是唯一短暂包含聊天正文的本地存储**：
+  仅在用户主动确认后写入独立命名空间 `turnrail:handoff:pending`，10 分钟 TTL 到期
+  作废、新聊天页注入成功即删除（身份安全：多标签页竞争下旧消费者绝不误删
+  被覆盖写入的新记录）；只填入输入框草稿（写入后回读验证），TurnRail 没有任何
+  发送消息的代码路径；新标签页先以空白页（about:blank）预留、pending 保存成功后
+  才导航到 chatgpt.com —— 交接文本在任何路径下都不进入 URL；诊断与控制台零输出
+  （合同测试强制）
 - 无 background service worker、无遥测、无后端
 
 ## 报告安全漏洞

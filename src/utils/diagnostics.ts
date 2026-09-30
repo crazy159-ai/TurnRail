@@ -24,6 +24,14 @@ export interface TurnRailDiagnosticsContext {
   performance: PerformanceSnapshot | null
   /** rail marker 数量（Shadow DOM 内，UI 自行统计） */
   markers: () => number
+  /** 当前会话 checkpoint 数（Handoff 元数据，不含任何正文） */
+  checkpointCount?: number
+  /** pending handoff 元数据（纯数字；payload 绝不出现在诊断中） */
+  handoff?: {
+    pending: boolean
+    ageMs: number | null
+    characters: number | null
+  }
 }
 
 export interface TurnRailDiagnostics {
@@ -73,6 +81,14 @@ export interface TurnRailDiagnostics {
     pinned: boolean | null
     readMs: number | null
     writeMs: number | null
+  }
+
+  /** Handoff 元数据（白名单；绝不含 handoff 文本 / checkpoint 正文 / 会话 ID） */
+  handoff: {
+    checkpointCount: number
+    pending: boolean
+    ageMs: number | null
+    characters: number | null
   }
 }
 
@@ -130,6 +146,13 @@ export function buildDiagnostics(ctx: TurnRailDiagnosticsContext): TurnRailDiagn
       pinned: cacheStats.pinned,
       readMs: cacheStats.readMs,
       writeMs: cacheStats.lastWriteMs
+    },
+
+    handoff: {
+      checkpointCount: ctx.checkpointCount ?? 0,
+      pending: ctx.handoff?.pending ?? false,
+      ageMs: ctx.handoff?.ageMs ?? null,
+      characters: ctx.handoff?.characters ?? null
     }
   }
 }
