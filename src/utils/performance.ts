@@ -52,12 +52,28 @@ export interface HealthStats {
   analyzes: number
 }
 
+/**
+ * 后台历史预热指标（DEBUG-only，规格 #50）：纯数字，绝无正文 / turn ID。
+ * 用于验证性能合同：每 batch full scan ≤ 1、无单次长任务、无 full-scan storm。
+ */
+export interface HistoryWarmupStats {
+  batches: number
+  steps: number
+  productiveBatches: number
+  emptyBatches: number
+  pauses: number
+  totalWarmupMs: number
+  maxBatchMs: number
+  turnsDiscovered: number
+}
+
 export interface PerformanceSnapshot {
   startup: StartupStats
   indexer: IndexerStats
   observer: ObserverStats
   render: RenderStats
   health: HealthStats
+  historyWarmup: HistoryWarmupStats
 }
 
 class PerformanceStats {
@@ -89,6 +105,16 @@ class PerformanceStats {
     outlineSkippedRenders: 0
   }
   readonly health: HealthStats = { analyzes: 0 }
+  readonly historyWarmup: HistoryWarmupStats = {
+    batches: 0,
+    steps: 0,
+    productiveBatches: 0,
+    emptyBatches: 0,
+    pauses: 0,
+    totalWarmupMs: 0,
+    maxBatchMs: 0,
+    turnsDiscovered: 0
+  }
 
   reset(): void {
     this.startup.bootstrapStart = performance.now()
@@ -113,6 +139,10 @@ class PerformanceStats {
       outlineFullRenders: 0, outlineSkippedRenders: 0
     })
     this.health.analyzes = 0
+    Object.assign(this.historyWarmup, {
+      batches: 0, steps: 0, productiveBatches: 0, emptyBatches: 0,
+      pauses: 0, totalWarmupMs: 0, maxBatchMs: 0, turnsDiscovered: 0
+    })
   }
 
   snapshot(): PerformanceSnapshot {
@@ -121,7 +151,8 @@ class PerformanceStats {
       indexer: { ...this.indexer },
       observer: { ...this.observer },
       render: { ...this.render },
-      health: { ...this.health }
+      health: { ...this.health },
+      historyWarmup: { ...this.historyWarmup }
     }
   }
 }
@@ -133,6 +164,7 @@ interface StatsCore {
   observer: ObserverStats
   render: RenderStats
   health: HealthStats
+  historyWarmup: HistoryWarmupStats
   reset(): void
   snapshot(): PerformanceSnapshot | null
 }
@@ -153,6 +185,10 @@ class NoopPerformanceStats implements StatsCore {
     outlineFullRenders: 0, outlineSkippedRenders: 0
   }
   health: HealthStats = { analyzes: 0 }
+  historyWarmup: HistoryWarmupStats = {
+    batches: 0, steps: 0, productiveBatches: 0, emptyBatches: 0,
+    pauses: 0, totalWarmupMs: 0, maxBatchMs: 0, turnsDiscovered: 0
+  }
   reset(): void {}
   snapshot(): PerformanceSnapshot | null {
     return null
@@ -193,6 +229,12 @@ export type TurnRailPerformanceStats = {
   outlineSkipped(): void
   /** 记录一次健康分析真正执行（含耗时不记录正文；验证流式期间不重复分析） */
   markHealthAnalyze(): void
+  /** 记录一次 warmup batch 收尾（耗时 / 步数 / 是否有收获） */
+  warmupBatch(ms: number, steps: number, productive: boolean): void
+  /** 记录一次 warmup 暂停（门控失败 / 被高优先级任务打断） */
+  warmupPause(): void
+  /** 记录 warmup 新发现的 turn 数 */
+  warmupDiscovered(count: number): void
   reset(): void
   snapshot(): PerformanceSnapshot | null
 }
@@ -278,6 +320,23 @@ function createStats(enabled: boolean): TurnRailPerformanceStats {
     markHealthAnalyze(): void {
       if (!enabled) return
       stats.health.analyzes++
+    },
+    warmupBatch(ms, steps, productive): void {
+      if (!enabled) return
+      stats.historyWarmup.batches++
+      stats.historyWarmup.steps += steps
+      if (productive) stats.historyWarmup.productiveBatches++
+      else stats.historyWarmup.emptyBatches++
+      stats.historyWarmup.totalWarmupMs += ms
+      stats.historyWarmup.maxBatchMs = Math.max(stats.historyWarmup.maxBatchMs, ms)
+    },
+    warmupPause(): void {
+      if (!enabled) return
+      stats.historyWarmup.pauses++
+    },
+    warmupDiscovered(count): void {
+      if (!enabled) return
+      stats.historyWarmup.turnsDiscovered += count
     },
     reset(): void {
       stats.reset()

@@ -1,6 +1,7 @@
 import type { ChatProvider } from '../providers/types'
 import type { ConversationStore } from '../conversation/store'
 import type { ConversationCacheStore } from '../cache/cacheStore'
+import type { HistoryWarmupSnapshot } from '../conversation/historyWarmup'
 import { getScrollBounds, isAtVisualBottom, isAtVisualTop, isReversedContainer } from '../navigation/scrollGeometry'
 import type { PerformanceSnapshot } from './performance'
 
@@ -32,6 +33,8 @@ export interface TurnRailDiagnosticsContext {
     ageMs: number | null
     characters: number | null
   }
+  /** 后台历史预热快照（纯数字 / 枚举，无正文无 turn ID，规格 #49） */
+  historyWarmup?: HistoryWarmupSnapshot | null
 }
 
 export interface TurnRailDiagnostics {
@@ -90,6 +93,17 @@ export interface TurnRailDiagnostics {
     ageMs: number | null
     characters: number | null
   }
+
+  /** 后台历史预热（白名单：状态枚举 + 纯数字；无标题 / preview / turn ID） */
+  historyWarmup: {
+    state: string
+    batches: number
+    steps: number
+    indexedTurns: number
+    previewTurns: number
+    reachedTop: boolean
+    pauseReason: string | null
+  } | null
 }
 
 export function buildDiagnostics(ctx: TurnRailDiagnosticsContext): TurnRailDiagnostics {
@@ -153,6 +167,18 @@ export function buildDiagnostics(ctx: TurnRailDiagnosticsContext): TurnRailDiagn
       pending: ctx.handoff?.pending ?? false,
       ageMs: ctx.handoff?.ageMs ?? null,
       characters: ctx.handoff?.characters ?? null
-    }
+    },
+
+    historyWarmup: ctx.historyWarmup
+      ? {
+          state: ctx.historyWarmup.state,
+          batches: ctx.historyWarmup.batches,
+          steps: ctx.historyWarmup.steps,
+          indexedTurns: ctx.historyWarmup.fullUserTurns + ctx.historyWarmup.previewUserTurns,
+          previewTurns: ctx.historyWarmup.previewUserTurns,
+          reachedTop: ctx.historyWarmup.reachedTop,
+          pauseReason: ctx.historyWarmup.pausedReason
+        }
+      : null
   }
 }
