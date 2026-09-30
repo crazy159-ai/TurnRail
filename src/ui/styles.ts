@@ -418,6 +418,14 @@ export const navigationCss = `
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 后台历史预热状态：低干扰纯文本，不动画、不抢占空间 */
+.tn-warmup-status {
+  flex: none;
+  color: var(--tn-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .tn-load-btn {
   appearance: none;
   border: 1px solid var(--tn-border);

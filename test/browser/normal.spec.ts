@@ -83,7 +83,7 @@ test('normal mock: assistant streaming 无错误、无 fallback full-scan 回归
   expect(hostConnected).toBe(true)
 })
 
-test('normal mock: 虚拟化卸载后 metadata 保留、outline 有未加载项', async ({ page }) => {
+test('normal mock: 虚拟化卸载后 metadata 保留、已收获的 detached 项不显示"未加载"', async ({ page }) => {
   await page.click('button[data-act="add150-dup"]')
   await waitForMarkers(page, 162, 30_000)
 
@@ -101,9 +101,11 @@ test('normal mock: 虚拟化卸载后 metadata 保留、outline 有未加载项'
   expect(debug.turnRoots).toBeLessThan(162)
   expect(debug.markers).toBe(162)
 
-  // 打开 outline 面板：应有"未加载"标记条目
+  // 打开 outline 面板：所有 item 都曾被完整解析（full），卸载 ≠ 未收获，
+  // 规格规格 #58 U2：full + detached 不得显示"未加载"
   await page.hover('.tn-rail')
-  await expect.poll(async () => page.locator('.tn-flag').count(), { timeout: 10_000 }).toBeGreaterThan(0)
+  await expect.poll(async () => page.locator('.tn-item').count(), { timeout: 10_000 }).toBeGreaterThan(0)
+  expect(await page.locator('.tn-flag').count()).toBe(0)
 })
 
 test('normal mock: 点击未挂载 turn 触发 recover 并成功跳转', async ({ page }) => {
