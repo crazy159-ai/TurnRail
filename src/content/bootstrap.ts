@@ -17,6 +17,9 @@ import { DEBUG, debugLog, debugWarn, reportError } from '../utils/logger'
 import { debounce } from '../utils/debounce'
 import { ConversationCacheStore } from '../cache/cacheStore'
 import { CheckpointStore } from '../handoff/checkpointStore'
+import { buildConversationHandoff } from '../handoff/builder'
+import { formatConversationHandoff } from '../handoff/formatter'
+import type { HandoffTurnSnapshot } from '../handoff/types'
 import { serializeConversation } from '../cache/serializer'
 import { hydrateCachedConversation } from '../cache/hydrator'
 import { isLikelyStale } from '../cache/reconciler'
@@ -51,7 +54,10 @@ export function bootstrap(): void {
     onLoadHistory: () => void handleLoadHistory(),
     onToggleCache: () => void handleToggleCache(),
     onToggleCheckpoint: (turnId) => handleToggleCheckpoint(turnId),
-    isCheckpointed: (turnId) => isTurnCheckpointed(turnId)
+    isCheckpointed: (turnId) => isTurnCheckpointed(turnId),
+    onOpenHandoff: () => handleOpenHandoff(),
+    onHandoffCopy: (text) => void handleHandoffCopy(text),
+    onHandoffCancel: () => handleHandoffCancel()
   })
   document.body.appendChild(ui.host)
   ui.setCacheEnabled(cacheStore.isAvailable())
@@ -127,6 +133,59 @@ export function bootstrap(): void {
     if (!conversationId || !turn) return
     checkpointStore.toggle(conversationId, { id: turn.id, index: turn.index })
     ui.refreshList()
+  }
+
+  // ---------- Handoff（确定性结构化交接：Preview → 用户审核 → 复制/继续） ----------
+  // 只在用户点击 CTA 时执行（用户事件驱动，绝不进入 observer hot path）。
+  // Snapshot 在点击时刻同步复制正文 —— 之后 DOM/store 再变不影响预览内容。
+
+  function snapshotTurnsForHandoff(): HandoffTurnSnapshot[] {
+    return store.turns.map((turn) => ({
+      id: turn.id,
+      index: turn.index,
+      userText: turn.user?.text ?? '',
+      assistantText: turn.assistant?.text ?? null,
+      userCompleteness: turn.user?.contentCompleteness,
+      assistantCompleteness: turn.assistant?.contentCompleteness
+    }))
+  }
+
+  function handleOpenHandoff(): void {
+    try {
+      const conversationId = currentCheckpointConversationId()
+      const health = ui.getHealthSnapshot()
+      const handoff = buildConversationHandoff({
+        conversationId,
+        turns: snapshotTurnsForHandoff(),
+        checkpoints: conversationId ? checkpointStore.list(conversationId) : [],
+        health: health
+          ? { score: health.score, level: health.level, confidence: health.confidence }
+          : undefined
+      })
+      ui.showHandoffPreview({
+        text: formatConversationHandoff(handoff),
+        warnings: handoff.warnings
+      })
+    } catch (err) {
+      reportError('handoff.build', err)
+      ui.setStatus('生成交接上下文失败，请重试')
+      window.setTimeout(() => ui.setStatus(''), 3500)
+    }
+  }
+
+  async function handleHandoffCopy(text: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text)
+      ui.setStatus('交接上下文已复制，可粘贴到新聊天')
+    } catch {
+      // 剪贴板不可用（权限 / 非安全上下文）：绝不谎报成功
+      ui.setStatus('复制失败，请在预览框中手动全选复制')
+    }
+    window.setTimeout(() => ui.setStatus(''), 3500)
+  }
+
+  function handleHandoffCancel(): void {
+    ui.hideHandoffPreview()
   }
 
   /** 仅当会话已被用户缓存时才调度自动保存（v1.1 不做全量自动缓存） */

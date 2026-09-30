@@ -223,6 +223,97 @@ export const navigationCss = `
 .tn-health-note-hidden {
   display: none;
 }
+.tn-health-cta {
+  appearance: none;
+  border: 1px solid var(--tn-accent);
+  background: transparent;
+  color: var(--tn-accent);
+  font: inherit;
+  font-size: 12px;
+  margin-top: 7px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  width: 100%;
+}
+.tn-health-cta:hover {
+  background: color-mix(in srgb, var(--tn-accent) 12%, transparent);
+}
+.tn-health-cta-hidden {
+  display: none;
+}
+
+/* ---------- Handoff 预览层（覆盖列表区；editable） ---------- */
+.tn-handoff-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--tn-bg);
+  z-index: 3;
+}
+.tn-handoff-hidden {
+  display: none;
+}
+.tn-handoff-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.tn-handoff-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.tn-handoff-hint {
+  color: var(--tn-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.tn-handoff-warnings {
+  border: 1px solid rgba(184, 134, 11, 0.35);
+  border-radius: 8px;
+  padding: 5px 8px;
+  color: var(--tn-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.tn-handoff-text {
+  flex: 1;
+  resize: none;
+  border: 1px solid var(--tn-border);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--tn-text);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 8px;
+  white-space: pre;
+}
+.tn-handoff-text:focus {
+  outline: 1px solid var(--tn-accent);
+}
+.tn-handoff-actions {
+  display: flex;
+  gap: 6px;
+}
+.tn-handoff-btn {
+  appearance: none;
+  border: 1px solid var(--tn-border);
+  background: transparent;
+  color: var(--tn-text);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.tn-handoff-btn:hover {
+  border-color: var(--tn-accent);
+  color: var(--tn-accent);
+}
 .tn-health[data-level="healthy"] .tn-health-score {
   color: var(--tn-accent);
 }
