@@ -257,7 +257,60 @@ test('builder: superseded checkpoint 永不进入 handoff', () => {
   assert.deepEqual(numbers, [3])
 })
 
-test('builder: checkpoint 超上限按 turn 序保留前 N 个 + warning', () => {
+// ---------- Test O1：最后一轮不是 checkpoint → 结构完整 ----------
+
+test('builder O1: last turn 非 checkpoint → checkpoint + recent + objective 正常', () => {
+  const turns = buildTurns(12)
+  const handoff = buildConversationHandoff({
+    conversationId: CONV,
+    turns,
+    checkpoints: [checkpoint(0)]
+  })
+  assert.equal(handoff.sections.some((s) => s.kind === 'objective'), true)
+  assert.equal(handoff.currentObjectiveReference, undefined)
+  const text = formatConversationHandoff(handoff)
+  assert.ok(text.includes('## Current Objective'))
+  assert.ok(text.includes('第 12 个问题'))
+})
+
+// ---------- Test O2 / O3：最后一轮是 checkpoint → 正文绝不重复 ----------
+
+test('builder O2: last turn 是 checkpoint → user/assistant 正文全文只出现一次', () => {
+  const turns = buildTurns(12)
+  const handoff = buildConversationHandoff({
+    conversationId: CONV,
+    turns,
+    checkpoints: [checkpoint(0), checkpoint(11)]
+  })
+  // 无独立 objective section；引用形态生效
+  assert.equal(handoff.sections.some((s) => s.kind === 'objective'), false)
+  assert.deepEqual(handoff.currentObjectiveReference, { checkpointTurnNumber: 12 })
+
+  const text = formatConversationHandoff(handoff)
+  const userText = '第 12 个问题：请继续完成任务的下一步。'
+  const assistantText = '这是第 12 轮的回答正文。'
+  assert.equal(text.split(userText).length - 1, 1, 'objective user 正文重复')
+  assert.equal(text.split(assistantText).length - 1, 1, 'objective assistant 正文重复')
+  // 语义结构保留：Current Objective 标题仍存在（引用形态）
+  assert.ok(text.includes('## Current Objective'))
+})
+
+test('builder O3: 最新 checkpoint 即 objective → 引用段指向 Checkpoint 序号', () => {
+  const turns = buildTurns(12)
+  const handoff = buildConversationHandoff({
+    conversationId: CONV,
+    turns,
+    checkpoints: [checkpoint(3), checkpoint(11)]
+  })
+  const text = formatConversationHandoff(handoff)
+  // checkpoint 段顺序：Checkpoint 1 = turn 4，Checkpoint 2 = turn 12（= objective）
+  assert.ok(text.includes('Checkpoint 2 — Turn 12'))
+  assert.ok(text.includes('already included above as Checkpoint 2 — Turn 12'))
+})
+
+// ---------- P1-2：checkpoint 超上限保留最新 ----------
+
+test('builder: checkpoint 超上限保留最新 N 个 + warning 指明省略的是更旧项', () => {
   const turns = buildTurns(30)
   const handoff = buildConversationHandoff({
     conversationId: CONV,
@@ -265,7 +318,24 @@ test('builder: checkpoint 超上限按 turn 序保留前 N 个 + warning', () =>
     checkpoints: [3, 6, 9, 12, 15, 18, 21, 24, 27, 2, 5, 8, 11].map((i) => checkpoint(i))
   })
   assert.equal(handoff.source.checkpointCount, HANDOFF_LIMITS.maxCheckpoints)
-  assert.ok(handoff.warnings.some((w) => /checkpoint\(s\) were omitted/.test(w)))
+  // 13 个 checkpoint 保留最新 12 个：最旧的 turn-3（编号 3）被省略
+  const numbers = handoff.sections.filter((s) => s.kind === 'checkpoint').map((s) => s.turnNumber)
+  assert.equal(numbers.includes(3), false, '最旧 checkpoint 必须被省略')
+  assert.equal(numbers.includes(12), true, '最新 checkpoint 必须保留')
+  assert.ok(handoff.warnings.some((w) => /older selected checkpoint\(s\) were omitted/.test(w)))
+})
+
+test('builder: 15 个 checkpoint、上限 12 → 保留第 4–15 个，最后一个绝不丢', () => {
+  const turns = buildTurns(30)
+  const marked = Array.from({ length: 15 }, (_, i) => checkpoint(i)) // turn-0..14
+  const handoff = buildConversationHandoff({ conversationId: CONV, turns, checkpoints: marked })
+  const numbers = handoff.sections.filter((s) => s.kind === 'checkpoint').map((s) => s.turnNumber)
+  assert.equal(numbers.length, 12)
+  // 保留编号 4..15（最新 12 个），省略编号 1..3（最旧 3 个）
+  assert.deepEqual(numbers, [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+  // 最后一个 checkpoint 必须保留
+  assert.equal(numbers[numbers.length - 1], 15)
+  assert.ok(handoff.warnings.some((w) => /3 older selected checkpoint\(s\) were omitted/.test(w)))
 })
 
 test('builder: 无任何 turn → 仅续写规则 + warning，不崩溃', () => {
@@ -275,4 +345,13 @@ test('builder: 无任何 turn → 仅续写规则 + warning，不崩溃', () => 
   const text = formatConversationHandoff(handoff)
   assert.ok(text.includes('## Continuation Rules'))
   assert.ok(text.includes('## Next Action'))
+})
+
+test('formatter: continuation rules 包含 later-checkpoint-wins 冲突规则', () => {
+  const handoff = buildConversationHandoff({ conversationId: CONV, turns: buildTurns(6), checkpoints: [] })
+  const text = formatConversationHandoff(handoff)
+  assert.ok(
+    text.includes('If two selected checkpoints conflict, prefer the later checkpoint'),
+    '必须告知新模型多个 checkpoint 冲突时后者优先'
+  )
 })

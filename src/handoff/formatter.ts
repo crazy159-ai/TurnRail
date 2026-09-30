@@ -25,6 +25,9 @@ export function formatConversationHandoff(handoff: ConversationHandoff): string 
   lines.push('- Treat the selected checkpoints below as the most important carried-forward state.')
   lines.push('- Do not assume omitted discussion is still authoritative.')
   lines.push('- If older context conflicts with a selected checkpoint, prefer the checkpoint.')
+  lines.push(
+    '- If two selected checkpoints conflict, prefer the later checkpoint unless the user explicitly states otherwise.'
+  )
   lines.push('- Do not redo completed work unless required by the current task.')
   lines.push('- Distinguish confirmed decisions from unresolved questions.', '')
 
@@ -63,6 +66,18 @@ export function formatConversationHandoff(handoff: ConversationHandoff): string 
       lines.push(objective.assistantText, '')
       if (objective.assistantCompleteness === 'preview') lines.push(PREVIEW_NOTE, '')
     }
+  } else if (handoff.currentObjectiveReference) {
+    // objective 与 selected checkpoint 同轮：正文已在上方出现，这里只给指引，
+    // 绝不重复同一 user/assistant turn 的完整文本
+    const referenceTurn = handoff.currentObjectiveReference.checkpointTurnNumber
+    const ordinal = checkpoints.findIndex((section) => section.turnNumber === referenceTurn)
+    lines.push('## Current Objective', '')
+    lines.push(
+      ordinal >= 0
+        ? `The current objective is already included above as Checkpoint ${ordinal + 1} — Turn ${referenceTurn}.`
+        : 'The current objective is already included above in the latest selected checkpoint.',
+      ''
+    )
   }
 
   if (handoff.warnings.length > 0) {

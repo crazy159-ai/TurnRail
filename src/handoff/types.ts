@@ -59,7 +59,7 @@ export interface CheckpointTurnRef {
 export interface HandoffLimits {
   /** 最终 markdown 文本字符上限 */
   maxCharacters: number
-  /** 单条 checkpoint 数上限（超出按 turn 序保留前 N 条 + warning） */
+  /** 单条 checkpoint 数上限（超出保留最新 N 条，更旧的省略 + warning） */
   maxCheckpoints: number
   /** Recent Tail 的 user turn 数上限（不含当前目标轮） */
   maxRecentTurns: number
@@ -144,6 +144,16 @@ export interface ConversationHandoff {
   health?: HandoffHealthSummary
 
   sections: HandoffSection[]
+
+  /**
+   * objective 与最新 selected checkpoint 同轮时的引用形态：
+   * 该轮完整正文只在 checkpoint 段出现一次，objective 段仅保留指引
+   * （Release Candidate：最终 markdown 中同一 user/assistant turn 绝不重复）。
+   */
+  currentObjectiveReference?: {
+    /** 该 checkpoint 轮的人类可读编号（turnIndex + 1，与目录 Q 编号一致） */
+    checkpointTurnNumber: number
+  }
 
   /** 全部截断 / 省略 / 覆盖度告警（元数据级，绝不含正文） */
   warnings: string[]

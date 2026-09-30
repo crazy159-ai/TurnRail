@@ -92,15 +92,18 @@ export function buildConversationHandoff(input: HandoffBuildInput): Conversation
     .filter((checkpoint) => checkpoint.status !== 'superseded')
     .sort((a, b) => a.turnIndex - b.turnIndex)
 
+  // 超限保留最新 N 个：长期任务的最新工作状态最有价值，被省略的永远是最旧的
+  //（Release Candidate 策略；formatter 仍按旧 → 新渲染 retained）
+  const retainedCheckpoints =
+    activeCheckpoints.length > limits.maxCheckpoints
+      ? activeCheckpoints.slice(-limits.maxCheckpoints)
+      : activeCheckpoints
+  const omittedCheckpoints = activeCheckpoints.length - retainedCheckpoints.length
+
   const checkpointSections: HandoffSection[] = []
   const checkpointTurnIds = new Set<string>()
-  let omittedCheckpoints = 0
   let unresolvedCheckpoints = 0
-  for (const checkpoint of activeCheckpoints) {
-    if (checkpointSections.length >= limits.maxCheckpoints) {
-      omittedCheckpoints++
-      continue
-    }
+  for (const checkpoint of retainedCheckpoints) {
     const turn = turnById.get(checkpoint.turnId)
     if (!turn) {
       // 标记后 Store 被重置 / stale 清理：宁可丢弃并明示，也不输出错位内容
@@ -112,7 +115,7 @@ export function buildConversationHandoff(input: HandoffBuildInput): Conversation
   }
   if (omittedCheckpoints > 0) {
     warnings.push(
-      `${omittedCheckpoints} selected checkpoint(s) were omitted to fit the local checkpoint limit (${limits.maxCheckpoints}).`
+      `${omittedCheckpoints} older selected checkpoint(s) were omitted to fit the local checkpoint limit (${limits.maxCheckpoints}); the most recent checkpoints are retained.`
     )
   }
   if (unresolvedCheckpoints > 0) {
@@ -138,7 +141,16 @@ export function buildConversationHandoff(input: HandoffBuildInput): Conversation
       warnings: ['No indexed user turns were available; only the continuation rules are included.']
     }
   }
-  const objectiveSection = sectionFromTurn(objectiveTurn, 'objective')
+  // objective 与 selected checkpoint 同轮：正文不重复（引用形态，同一 turn
+  // 的完整 user/assistant 文本在最终 markdown 中只出现一次）
+  const objectiveIsCheckpoint = checkpointTurnIds.has(objectiveTurn.id)
+  let currentObjectiveReference: ConversationHandoff['currentObjectiveReference'] | undefined
+  let objectiveSection: HandoffSection | null = null
+  if (objectiveIsCheckpoint) {
+    currentObjectiveReference = { checkpointTurnNumber: objectiveTurn.index + 1 }
+  } else {
+    objectiveSection = sectionFromTurn(objectiveTurn, 'objective')
+  }
 
   // ---------- 3. Recent tail（目标轮之前、排除 checkpoint 轮，取最近 N 个） ----------
   const tailCandidates = userTurns.filter(
@@ -162,7 +174,12 @@ export function buildConversationHandoff(input: HandoffBuildInput): Conversation
     )
   }
 
-  const sections: HandoffSection[] = [...checkpointSections, ...tailSections, objectiveSection]
+  const assemble = (): HandoffSection[] =>
+    objectiveSection
+      ? [...checkpointSections, ...tailSections, objectiveSection]
+      : [...checkpointSections, ...tailSections]
+
+  const sections: HandoffSection[] = assemble()
 
   // ---------- 5. 逐条消息限额（fence 安全） ----------
   const capped = applyPerMessageCap(sections, limits.maxSingleMessageCharacters)
@@ -189,6 +206,7 @@ export function buildConversationHandoff(input: HandoffBuildInput): Conversation
     },
     health: input.health,
     sections,
+    currentObjectiveReference,
     warnings
   }
 
@@ -198,7 +216,7 @@ export function buildConversationHandoff(input: HandoffBuildInput): Conversation
   let droppedRecent = 0
   while (tailSections.length > 0 && measure() > limits.maxCharacters) {
     tailSections.shift()
-    draft.sections = [...checkpointSections, ...tailSections, objectiveSection]
+    draft.sections = assemble()
     draft.source.selectedTurns = draft.sections.length
     droppedRecent++
   }
@@ -214,11 +232,13 @@ export function buildConversationHandoff(input: HandoffBuildInput): Conversation
     for (const section of tailSections) {
       if (section.assistantText) shrinkTargets.push({ section, field: 'assistantText' })
     }
-    if (objectiveSection.assistantText) {
-      shrinkTargets.push({ section: objectiveSection, field: 'assistantText' })
+    if (objectiveSection) {
+      if (objectiveSection.assistantText) {
+        shrinkTargets.push({ section: objectiveSection, field: 'assistantText' })
+      }
     }
     for (const section of tailSections) shrinkTargets.push({ section, field: 'userText' })
-    shrinkTargets.push({ section: objectiveSection, field: 'userText' })
+    if (objectiveSection) shrinkTargets.push({ section: objectiveSection, field: 'userText' })
     for (const section of checkpointSections) {
       if (section.assistantText) shrinkTargets.push({ section, field: 'assistantText' })
     }

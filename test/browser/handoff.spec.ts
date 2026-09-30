@@ -466,6 +466,59 @@ test('handoff V: composer 静默拒绝写入 → 注入失败不假成功，pend
   expect(await pendingExists(page)).toBe(true)
 })
 
+test('handoff M: 最后一轮标 checkpoint → 预览正文绝不重复', async ({ page }) => {
+  await injectWorkingStorage(page)
+  await gotoWithDebug(page, MOCK)
+  await waitForMarkers(page, 12)
+
+  // Q1 + Q72?? 会话 A 共 12 轮：标 Q1 与最后一轮 Q12
+  await starFirstTurn(page)
+  await openPanel(page)
+  const lastItem = page.locator('.tn-item').last()
+  await lastItem.hover()
+  await lastItem.locator('.tn-checkpoint-btn').click()
+  await expect(lastItem.locator('.tn-checkpoint-btn')).toHaveAttribute('aria-pressed', 'true')
+
+  const text = await openHandoffPreview(page)
+
+  // objective 与最新 checkpoint 同轮：Current Objective 语义保留但正文不重复
+  expect(text).toContain('## Current Objective')
+  expect(text).toContain('already included above as Checkpoint 2 — Turn 12')
+  const occurrences = text.split('第 12 次提问').length - 1
+  expect(occurrences).toBe(1)
+})
+
+test('handoff N: checkpoint 超上限 → 保留最新 12 个，省略最旧项并有 warning', async ({ page }) => {
+  await injectWorkingStorage(page)
+  await gotoWithDebug(page, MOCK)
+  await waitForMarkers(page, 12)
+
+  await page.click('button[data-act="add60"]')
+  await waitForMarkers(page, 72)
+
+  // 标记前 15 轮 → 超过上限 12：应保留 Q4..Q15，省略 Q1..Q3
+  await openPanel(page)
+  for (let i = 0; i < 15; i++) {
+    const item = page.locator('.tn-item').nth(i)
+    await item.hover()
+    await item.locator('.tn-checkpoint-btn').click()
+    await expect(item.locator('.tn-checkpoint-btn')).toHaveAttribute('aria-pressed', 'true')
+  }
+
+  const text = await openHandoffPreview(page)
+
+  // 最新 checkpoint 全部保留（含第 15 轮），最旧 3 个被省略
+  expect(text).toContain('第 15 次提问')
+  expect(text).toContain('- Selected checkpoints: 12')
+  expect(text).not.toContain('第 1 次提问')
+  expect(text).not.toContain('第 2 次提问')
+  expect(text).not.toContain('第 3 次提问')
+  // warning 明确告知省略的是更旧 checkpoint
+  const warnings = page.locator('.tn-handoff-warnings')
+  await expect(warnings).toBeVisible()
+  await expect(warnings).toContainText('older selected checkpoint(s) were omitted')
+})
+
 test('handoff J: assistant streaming 不影响 checkpoint 与 handoff UI', async ({ page }) => {
   await injectWorkingStorage(page)
   await gotoWithDebug(page, MOCK)
