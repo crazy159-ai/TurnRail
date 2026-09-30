@@ -47,11 +47,17 @@ export interface RenderStats {
   outlineSkippedRenders: number
 }
 
+/** 健康分析执行计数（纯数字指标，验证 assistant 流式期间不重复分析） */
+export interface HealthStats {
+  analyzes: number
+}
+
 export interface PerformanceSnapshot {
   startup: StartupStats
   indexer: IndexerStats
   observer: ObserverStats
   render: RenderStats
+  health: HealthStats
 }
 
 class PerformanceStats {
@@ -82,6 +88,7 @@ class PerformanceStats {
     outlineFullRenders: 0,
     outlineSkippedRenders: 0
   }
+  readonly health: HealthStats = { analyzes: 0 }
 
   reset(): void {
     this.startup.bootstrapStart = performance.now()
@@ -105,6 +112,7 @@ class PerformanceStats {
       railFullRenders: 0, railIncrementalUpdates: 0,
       outlineFullRenders: 0, outlineSkippedRenders: 0
     })
+    this.health.analyzes = 0
   }
 
   snapshot(): PerformanceSnapshot {
@@ -112,7 +120,8 @@ class PerformanceStats {
       startup: { ...this.startup },
       indexer: { ...this.indexer },
       observer: { ...this.observer },
-      render: { ...this.render }
+      render: { ...this.render },
+      health: { ...this.health }
     }
   }
 }
@@ -123,6 +132,7 @@ interface StatsCore {
   indexer: IndexerStats
   observer: ObserverStats
   render: RenderStats
+  health: HealthStats
   reset(): void
   snapshot(): PerformanceSnapshot | null
 }
@@ -142,6 +152,7 @@ class NoopPerformanceStats implements StatsCore {
     railFullRenders: 0, railIncrementalUpdates: 0,
     outlineFullRenders: 0, outlineSkippedRenders: 0
   }
+  health: HealthStats = { analyzes: 0 }
   reset(): void {}
   snapshot(): PerformanceSnapshot | null {
     return null
@@ -180,6 +191,8 @@ export type TurnRailPerformanceStats = {
   railIncremental(): void
   outlineFull(): void
   outlineSkipped(): void
+  /** 记录一次健康分析真正执行（含耗时不记录正文；验证流式期间不重复分析） */
+  markHealthAnalyze(): void
   reset(): void
   snapshot(): PerformanceSnapshot | null
 }
@@ -261,6 +274,10 @@ function createStats(enabled: boolean): TurnRailPerformanceStats {
     outlineSkipped(): void {
       if (!enabled) return
       stats.render.outlineSkippedRenders++
+    },
+    markHealthAnalyze(): void {
+      if (!enabled) return
+      stats.health.analyzes++
     },
     reset(): void {
       stats.reset()

@@ -127,24 +127,22 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
   }
 
   let outlineDirty = false
-  let healthSignature = ''
+  // 健康重算以 Store 的 semanticRevision 为准（structure / user-text 递增）：
+  // - assistant 流式（assistant-text）与纯元素绑定（elements）不推进修订号，
+  //   物理上不会触发重算 —— 流式优化合同由事件语义保证，无需拼接全文 signature；
+  // - 历史上用"末轮全文 signature"去重，既复制 prompt 又漏检早期 turn 的修改。
+  let lastHealthRevision = -1
 
-  // 健康分只在 structure 事件时重算，且经 signature 去重：
-  // - 'text' 事件 = assistant 流式输出快路径（见 indexer 快路径注释），健康语义信号
-  //   只读 user prompt，不会变；流式期间每个文本批都重算会毁掉 v1.2 的流式优化。
-  // - 'elements' 只换 DOM 绑定，同样不重算。
   function renderHealth(): void {
     const store = storeRef
     if (!store) {
       outline.setHealth(null)
-      healthSignature = ''
+      lastHealthRevision = -1
       return
     }
-    const userTurns = store.turns.filter((turn) => turn.user)
-    const last = userTurns[userTurns.length - 1]
-    const signature = `${userTurns.length}:${last?.id ?? ''}:${last?.user?.text ?? ''}`
-    if (signature === healthSignature) return
-    healthSignature = signature
+    if (store.semanticRevision === lastHealthRevision) return
+    lastHealthRevision = store.semanticRevision
+    perf.markHealthAnalyze()
     outline.setHealth(analyzeConversationHealth(store.turns))
   }
 
@@ -253,15 +251,15 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     storeRef = store
     applyVisibility()
     if (layer.classList.contains('tn-hidden')) return
-    if (kind === 'structure' || kind === 'elements') {
+    if (kind === 'structure' || kind === 'elements' || kind === 'user-text') {
       renderRail()
       renderList()
       outline.setCount(store.turns.filter((turn) => turn.user).length)
-      renderHealth()
       refreshScrollListener()
     }
-    // 'text'（assistant 流式）刻意不触发健康重算：语义信号只依赖 user prompt，
-    // 结构未变时重算纯属浪费，且会在流式期间造成每批一次的全量分析。
+    // 健康重算：structure / user-text 触发；'assistant-text'（流式快路径）
+    // 与 'elements'（纯 DOM 绑定）绝不重算 —— 由 semanticRevision 去重兜底
+    if (kind === 'structure' || kind === 'user-text') renderHealth()
   }
 
   function setActive(turnId: string | undefined): void {
@@ -277,7 +275,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.setCount(0)
     outline.setCached(false)
     outline.setHealth(null)
-    healthSignature = ''
+    lastHealthRevision = -1
     rail.render([], { tops: [], railHeight: 0, markerHeight: 0 })
     rail.setActive(undefined)
     layer.classList.add('tn-hidden')
