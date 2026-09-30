@@ -71,14 +71,46 @@ async function injectWorkingStorage(page: Page): Promise<void> {
   })
 }
 
-/** 拦截 window.open：记录 URL，不真打开外网（注入流程由下方 home 路由模拟） */
+/**
+ * 拦截 window.open：返回可导航的假窗口并记录"预留地址"与"最终导航地址"，
+ * 不真打开外网。新聊天页在同一 mock 内以 home 路由（无会话 id）模拟，
+ * 与真实 chatgpt.com/ 首页的注入条件（conversationId === null）一致。
+ */
 async function interceptWindowOpen(page: Page): Promise<void> {
   await page.addInitScript(() => {
-    ;(globalThis as Record<string, unknown>).__tnOpenedUrl = null
+    const g = globalThis as Record<string, unknown>
+    g.__tnOpenedUrl = null // window.open 的实参（预留 = about:blank）
+    g.__tnNavigatedUrl = null // reservation.navigate() 写入的最终地址
+    g.__tnReservationClosed = false
     window.open = ((url?: string | URL) => {
-      ;(globalThis as Record<string, unknown>).__tnOpenedUrl = String(url ?? '')
-      return null
-    }) as typeof window.open
+      g.__tnOpenedUrl = String(url ?? '')
+      const win: Record<string, unknown> = {
+        closed: false,
+        opener: null,
+        close() {
+          win.closed = true
+          g.__tnReservationClosed = true
+        }
+      }
+      Object.defineProperty(win, 'location', {
+        value: {
+          get href() {
+            return 'about:blank'
+          },
+          set href(value: string) {
+            g.__tnNavigatedUrl = String(value)
+          }
+        }
+      })
+      return win as unknown as Window
+    }) as unknown as typeof window.open
+  })
+}
+
+/** 模拟浏览器弹窗拦截：window.open 恒返回 null（popup blocked） */
+async function blockWindowOpen(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    window.open = (() => null) as typeof window.open
   })
 }
 
@@ -128,6 +160,16 @@ async function pendingExists(page: Page): Promise<boolean> {
 
 async function openedUrl(page: Page): Promise<string | null> {
   return page.evaluate(() => (globalThis as Record<string, unknown>).__tnOpenedUrl as string | null)
+}
+
+async function navigatedUrl(page: Page): Promise<string | null> {
+  return page.evaluate(() => (globalThis as Record<string, unknown>).__tnNavigatedUrl as string | null)
+}
+
+async function reservationClosed(page: Page): Promise<boolean> {
+  return page.evaluate(
+    () => (globalThis as Record<string, unknown>).__tnReservationClosed === true
+  )
 }
 
 /** hover 轨道展开面板并等待列表项出现 */
@@ -224,7 +266,7 @@ test('handoff E: 取消预览不产生 pending handoff', async ({ page }) => {
   expect(await pendingExists(page)).toBe(false)
 })
 
-test('handoff F: 确认继续 → pending 创建 + 新聊天打开意图（不发送）', async ({ page }) => {
+test('handoff F: 确认继续 → 预留新标签页 + pending 创建 + 导航新聊天（不发送）', async ({ page }) => {
   await injectWorkingStorage(page)
   await interceptWindowOpen(page)
   await gotoWithDebug(page, MOCK)
@@ -234,8 +276,9 @@ test('handoff F: 确认继续 → pending 创建 + 新聊天打开意图（不�
   const text = await openHandoffPreview(page)
   await page.locator('.tn-handoff-continue').click()
 
-  // 打开新聊天（URL 精确为新聊天页；内容不经 URL 传递）
-  await expect.poll(() => openedUrl(page)).toBe('https://chatgpt.com/')
+  // 同步预留 about:blank（正文不经 URL），pending 落盘后再导航到新聊天页
+  await expect.poll(() => openedUrl(page)).toBe('about:blank')
+  await expect.poll(() => navigatedUrl(page)).toBe('https://chatgpt.com/')
   // pending handoff 已落盘
   await expect.poll(() => pendingExists(page)).toBe(true)
   const stored = await page.evaluate(() =>
@@ -286,6 +329,7 @@ test('handoff G/H/I: 新聊天页自动读取 pending → 填入 composer（不�
 test('handoff K: storage 失败 + clipboard 失败 → 状态绝不谎报"已复制"', async ({ page }) => {
   await injectFailingStorage(page)
   await overrideClipboard(page, 'reject')
+  await interceptWindowOpen(page)
   await gotoWithDebug(page, MOCK)
   await waitForMarkers(page, 12)
 
@@ -293,12 +337,14 @@ test('handoff K: storage 失败 + clipboard 失败 → 状态绝不谎报"已复
   await openHandoffPreview(page)
   await page.locator('.tn-handoff-continue').click()
 
-  // 两条回退路径都失败：状态必须明确"无法自动传递 + 请手动复制"，绝不出现"已复制"
+  // 两条回退路径都失败：状态必须明确"无法自动传递 + 请手动复制"，绝不出现"已复制"。
+  // 预留的空白标签页必须回滚关闭，不留孤儿 tab。
   const status = page.locator('.tn-status')
   await expect(status).toContainText('无法自动传递')
   await expect(status).toContainText('手动全选复制')
   await expect(status).not.toContainText('已复制')
   expect(await pendingExists(page)).toBe(false)
+  expect(await reservationClosed(page)).toBe(true)
   // 预览保持打开，用户仍可手动全选复制
   await expect(page.locator('.tn-handoff-text')).toBeVisible()
 })
@@ -306,6 +352,7 @@ test('handoff K: storage 失败 + clipboard 失败 → 状态绝不谎报"已复
 test('handoff C3: storage 失败 + clipboard 成功 → 明示剪贴板兜底路径', async ({ page }) => {
   await injectFailingStorage(page)
   await overrideClipboard(page, 'ok')
+  await interceptWindowOpen(page)
   await gotoWithDebug(page, MOCK)
   await waitForMarkers(page, 12)
 
@@ -316,6 +363,46 @@ test('handoff C3: storage 失败 + clipboard 成功 → 明示剪贴板兜底路
   const status = page.locator('.tn-status')
   await expect(status).toContainText('已复制 Handoff')
   await expect(status).toContainText('手动打开新聊天并粘贴')
+  expect(await pendingExists(page)).toBe(false)
+})
+
+test('handoff L: popup blocked → 绝不显示"已打开"，不创建 pending', async ({ page }) => {
+  await injectWorkingStorage(page)
+  await blockWindowOpen(page)
+  await overrideClipboard(page, 'ok')
+  await gotoWithDebug(page, MOCK)
+  await waitForMarkers(page, 12)
+
+  await starFirstTurn(page)
+  await openHandoffPreview(page)
+  await page.locator('.tn-handoff-continue').click()
+
+  // 浏览器阻止新标签页：不显示"已打开"，pending 不创建，剪贴板兜底
+  const status = page.locator('.tn-status')
+  await expect(status).toContainText('浏览器阻止了新标签页')
+  await expect(status).toContainText('已复制')
+  await expect(status).not.toContainText('已打开')
+  expect(await pendingExists(page)).toBe(false)
+  // 预览保持打开，用户可手动复制或重试
+  await expect(page.locator('.tn-handoff-text')).toBeVisible()
+})
+
+test('handoff L2: popup blocked + clipboard 失败 → 引导手动复制', async ({ page }) => {
+  await injectWorkingStorage(page)
+  await blockWindowOpen(page)
+  await overrideClipboard(page, 'reject')
+  await gotoWithDebug(page, MOCK)
+  await waitForMarkers(page, 12)
+
+  await starFirstTurn(page)
+  await openHandoffPreview(page)
+  await page.locator('.tn-handoff-continue').click()
+
+  const status = page.locator('.tn-status')
+  await expect(status).toContainText('浏览器阻止了新标签页')
+  await expect(status).toContainText('手动全选复制')
+  await expect(status).not.toContainText('已复制')
+  await expect(status).not.toContainText('已打开')
   expect(await pendingExists(page)).toBe(false)
 })
 

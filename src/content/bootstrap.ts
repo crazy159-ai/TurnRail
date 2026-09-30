@@ -227,32 +227,62 @@ export function bootstrap(): void {
     if (
       typeof candidate.getComposer === 'function' &&
       typeof candidate.setComposerText === 'function' &&
-      typeof candidate.openNewConversation === 'function'
+      typeof candidate.reserveNewConversation === 'function'
     ) {
       return candidate as ConversationContinuationCapability
     }
     return null
   }
 
+  /** 回退提示：按剪贴板真实结果给用户可恢复路径（storage / 弹窗失败共用） */
+  async function fallbackToClipboard(text: string): Promise<void> {
+    const copied = await tryCopyText(text)
+    ui.setStatus(
+      copied
+        ? '无法自动传递到新标签页，已复制 Handoff，请手动打开新聊天并粘贴'
+        : '无法自动传递，也未能写入剪贴板，请在预览框中手动全选复制'
+    )
+    window.setTimeout(() => ui.setStatus(''), 4500)
+  }
+
   async function handleHandoffContinue(text: string): Promise<void> {
     if (text.length === 0) return
-    // 先保存 pending 再开新标签页：保存失败绝不打开（避免"新页面无事发生"的假成功）。
-    // storage 失败路径必须按剪贴板真实结果显示状态（成功 / 失败两套文案，绝不谎报）。
-    const saved = await pendingHandoffStore.save(text)
-    if (!saved) {
+    const capability = getContinuationCapability()
+
+    // 同步链路第一步：预留新标签页。window.open 必须仍在用户点击手势内执行，
+    // 否则 await storage 之后弹窗会被浏览器拦截（popup blocked 假成功的根源）。
+    // 预留失败 = 弹窗被阻止：绝不显示"已打开"，pending 也不创建（正文走预览/剪贴板）。
+    const reservation = capability ? capability.reserveNewConversation() : null
+    if (!reservation) {
+      if (!capability) {
+        await fallbackToClipboard(text)
+        return
+      }
       const copied = await tryCopyText(text)
       ui.setStatus(
         copied
-          ? '无法自动传递到新标签页，已复制 Handoff，请手动打开新聊天并粘贴'
-          : '无法自动传递，也未能写入剪贴板，请在预览框中手动全选复制'
+          ? '浏览器阻止了新标签页，Handoff 已复制，请手动打开新聊天并粘贴'
+          : '浏览器阻止了新标签页，也无法自动复制，请在预览框中手动全选复制'
       )
       window.setTimeout(() => ui.setStatus(''), 4500)
       return
     }
+
+    // 预留成功后再异步保存 pending；保存失败 → 关闭空白标签页 + 剪贴板兜底
+    const saved = await pendingHandoffStore.save(text)
+    if (!saved) {
+      reservation.close()
+      await fallbackToClipboard(text)
+      return
+    }
     handoffPendingMeta = { pending: true, ageMs: 0, characters: text.length }
     ui.hideHandoffPreview()
-    getContinuationCapability()?.openNewConversation()
-    ui.setStatus('已打开新聊天，Handoff 将自动填入输入框（不会自动发送）')
+    const navigated = reservation.navigate()
+    ui.setStatus(
+      navigated
+        ? '已打开新聊天，Handoff 将自动填入输入框（不会自动发送）'
+        : '新聊天标签页已被关闭，Handoff 已保留，请重新点击或手动打开新聊天'
+    )
     window.setTimeout(() => ui.setStatus(''), 4500)
   }
 

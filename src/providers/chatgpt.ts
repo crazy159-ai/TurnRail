@@ -7,6 +7,7 @@ import type {
   LocatedMessage,
   LocatedTurn,
   LocatedTurnRoot,
+  NewConversationReservation,
   ProviderDiagnostics,
   ProviderMutationHints,
   ProviderRole
@@ -482,8 +483,42 @@ export class ChatGptProvider implements ChatProvider, ConversationContinuationCa
     }
   }
 
-  /** 打开新聊天（用户点击链路内调用；不携带任何聊天内容，不经 URL 传正文） */
-  openNewConversation(): void {
-    window.open('https://chatgpt.com/', '_blank', 'noopener')
+  /**
+   * 同步预留新聊天标签页（用户手势链路内调用才不会被弹窗拦截）：
+   * 先 window.open('about:blank') 探测弹窗资格（null = 被浏览器阻止），
+   * 成功后切断 opener 再返回窄接口；正文绝不写入 URL —— 导航地址是常量
+   * 新聊天页，与 handoff 内容零关联。
+   */
+  reserveNewConversation(): NewConversationReservation | null {
+    let target: Window | null = null
+    try {
+      target = window.open('about:blank', '_blank')
+    } catch {
+      return null
+    }
+    if (!target) return null
+    try {
+      target.opener = null
+    } catch {
+      // 个别浏览器不允许改写 opener：不影响后续导航与关闭
+    }
+    return {
+      navigate: () => {
+        try {
+          if (target!.closed) return false
+          target!.location.href = 'https://chatgpt.com/'
+          return true
+        } catch {
+          return false
+        }
+      },
+      close: () => {
+        try {
+          target!.close()
+        } catch {
+          // 关闭失败只留下一个空白标签页，由用户手动处理
+        }
+      }
+    }
   }
 }

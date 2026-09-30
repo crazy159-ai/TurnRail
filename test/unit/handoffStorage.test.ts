@@ -23,7 +23,7 @@ const rejectingStorage = {
 
 /** capability spy：记录每次调用，getComposer 可配置 */
 function fakeCapability(options: { composer: HTMLElement | null } = { composer: null }) {
-  const calls = { getComposer: 0, setComposerText: 0, openNewConversation: 0 }
+  const calls = { getComposer: 0, setComposerText: 0, reserveNewConversation: 0 }
   let lastText: string | null = null
   const capability: ConversationContinuationCapability = {
     getComposer: () => {
@@ -35,8 +35,9 @@ function fakeCapability(options: { composer: HTMLElement | null } = { composer: 
       lastText = text
       return true
     },
-    openNewConversation: () => {
-      calls.openNewConversation++
+    reserveNewConversation: () => {
+      calls.reserveNewConversation++
+      return null
     }
   }
   return { capability, calls, getLastText: () => lastText }
@@ -177,7 +178,7 @@ test('pending: composer 写入失败 → failed 且 pending 保留（TTL 兜底�
       setCalls++
       return false
     },
-    openNewConversation: () => undefined
+    reserveNewConversation: () => null
   }
   assert.equal(await injectPendingHandoff(capability, store, { composerWaitMs: 200, pollIntervalMs: 50 }), 'failed')
   assert.equal(setCalls, 1)
@@ -205,8 +206,9 @@ test('pending: 注入成功 → composer 写入 payload + consume 删除（不�
   assert.equal(result, 'injected')
   assert.equal(getLastText(), PAYLOAD)
   assert.equal(await store.peek(), null, '注入成功必须消费删除')
-  // capability 接口只有"填草稿"，没有任何 send / submit 方法（产品约束的静态证明）
-  assert.deepEqual(Object.keys(capability).sort(), ['getComposer', 'openNewConversation', 'setComposerText'])
+  // capability 接口只有"填草稿"与"预留标签页"窄接口，没有任何 send / submit
+  // 方法，也不暴露 Window / location（产品约束的静态证明）
+  assert.deepEqual(Object.keys(capability).sort(), ['getComposer', 'reserveNewConversation', 'setComposerText'])
 })
 
 test('pending: composer 迟迟不出现 → no-composer，pending 保留', async () => {
@@ -302,7 +304,7 @@ test('race R3: 注入窗口内 pending 被替换 → composer 收到 A，B 完�
       lastText = text
       return true
     },
-    openNewConversation: () => undefined
+    reserveNewConversation: () => null
   }
 
   const result = await injectPendingHandoff(capability, store, { composerWaitMs: 100, pollIntervalMs: 20 })
