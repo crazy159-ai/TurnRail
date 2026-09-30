@@ -19,9 +19,10 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 - 长对话支持：
   - 消息被虚拟化卸载后 metadata 保留（已完整收获的条目不显示任何"未加载"标记；
     仅缓存 preview 截断文本的条目显示"仅预览"）
-  - Background History Warmup：用户空闲时以低优先级小批次自动补全长对话历史
-    （用户一操作立即让路，随时可中断，绝不与用户抢滚动）
-  - 「加载全部历史」：立即、高优先级的受控向上滚动渐进收获（有超时/迭代上限，结束恢复阅读位置）
+  - Passive History Harvest：被动收获 ChatGPT 当前已经加载到页面中的历史内容，
+    不会为了补全历史自动滚动你的聊天页面
+  - 「加载全部历史」：唯一由用户显式授权的滚动加载（有超时/迭代上限，结束恢复阅读位置，
+    按钮明确提示会滚动）
   - 点击未加载问题自动受控滚动查找（recover），失败安全回退
 - 目录内搜索（大小写不敏感子串匹配）
 - 🩺 Chat health check：完全本地的多信号启发式评估（0–100），结合对话长度、方案反转、纠错频率、主题漂移、跨轮依赖与复杂度，在风险叠加时提示整理阶段结论或新开聊天；**不声称知道 ChatGPT 实际上下文窗口，也不会自动替用户换聊**
@@ -89,7 +90,8 @@ lifecycle 日志，绝不以 warning / error 记录），也不会自动刷新�
 
 调试日志：在页面控制台执行 `localStorage.setItem('tn-debug', '1')` 并刷新（生产默认关闭）。
 性能指标：`__tnDebug.performance`（TTFR / TTLR / 扫描与 observer 分类计数），`__tn.resetPerformanceStats()` 重置。
-后台历史预热状态（DEBUG）：`__tnDebug.historyWarmup`（state / batches / steps / reachedTop 等，纯数字）。
+历史覆盖状态（DEBUG）：`__tnDebug.historyCoverage`（indexedTurns / previewUserTurns /
+reachedTop / state 等，纯数字）。
 生命周期诊断（DEBUG）：`__tnDebug.bootstrapCount`（同一页面 bootstrap 次数，正常恒为 1）、
 `__tnDebug.extensionVersion`、`__tnDebug.extensionIdHash`（extension ID 的短 hash，
 用于排查"同时装了开发版 + Release 版两个副本"类问题；绝不输出完整 ID）。
@@ -157,7 +159,9 @@ Store ──► Handoff 服务 (handoff/)   ← 仅用户点击时运行，不�
 | `providers/chatgpt.ts` | 站点适配层：多策略 selector、角色/文本提取、会话 ID、滚动容器定位 |
 | `conversation/indexer.ts` | 扫描 → 稳定 ID → 去重 → 调和 turn 列表（含未挂载 turn 的锚定保留） |
 | `conversation/store.ts` | 纯数据仓库 + 事件广播；UI 从 store 渲染，不把 DOM 当 store |
-| `conversation/historyCapture.ts` | 「加载全部历史」受控滚动捕获 |
+| `conversation/historyCapture.ts` | 「加载全部历史」受控滚动捕获（唯一被用户授权的主动滚动） |
+| `conversation/historyCoverage.ts` | 历史覆盖统计（纯函数：full/preview/missing + reachedTop → state） |
+| `content/passiveTopWatch.ts` | 被动到顶证据采集（只监听容器滚动，绝不写 scrollTop） |
 | `health/analyzer.ts` / `health/types.ts` | 本地聊天健康评估：六类可解释信号 → 风险/健康分级；不联网、不读取模型内部上下文状态 |
 | `navigation/scrollSpy.ts` | 阅读位置检测（active turn） |
 | `navigation/jump.ts` | 平滑跳转 + sticky header 补偿 + 一次性 outline 脉冲 |
@@ -313,8 +317,8 @@ TurnRail runs locally in your browser.
   诊断导出只含纯数字元数据（pending / 字符数 / age），绝不含交接文本
 - 聊天正文仅以 `textContent` 渲染进 Shadow DOM，绝不作为 HTML 注入（防 XSS）
 - Manifest 仅申请 `storage` 权限 + content script 匹配两条 host
-- **Background History Warmup 同样零网络**：不请求 ChatGPT 任何 API（公开或私有）、
-  不抓取内部接口、不上传任何数据 —— 只滚动页面并观察 ChatGPT 自己加载出来的 DOM；
+- **历史收获同样零网络**：不请求 ChatGPT 任何 API（公开或私有）、
+  不抓取内部接口、不上传任何数据 —— 只观察 ChatGPT 自己加载出来的 DOM；
   收获的完整正文只存在于当前页面内存（Store），不写入长期缓存
 - 以上承诺由 `test/unit/privacyContract.test.ts` 自动强制（含 handoff 模块零
   console 输出、零网络原语、composer selector 边界）
@@ -351,51 +355,54 @@ TurnRail runs locally in your browser.
 
 ## How long conversation handling works（长对话策略）
 
-1. **Level 1（自动）**：消息挂载即收获入库；被虚拟化卸载后 metadata 保留、DOM 引用释放。
-   卸载 ≠ 未收获：正文已完整读取的条目不显示任何标记；仅缓存 preview 截断文本的条目显示
-   "仅预览"。索引随浏览逐渐完整。
-2. **Level 1.5（自动、低优先级）**：Background History Warmup —— 用户空闲时后台逐步补全
-   旧历史（见下一节）。
-3. **Level 2（用户主动触发）**：点击「加载全部历史」→ 记录阅读锚点 → 渐进向上滚动 →
-   等待懒加载渲染 → 收获 → 连续无新增/到顶/达到迭代上限（300 次/45s）即停止 →
-   按锚点 + 内容增量精确恢复原阅读位置。
-4. **未挂载目标跳转**：点击未挂载的问题 → 判断方向 → 受控逐屏滚动 → 每步收获扫描 →
-   命中即跳转；带最大迭代（60 次/20s）与边界终止，失败恢复原位置并提示。
-5. **分支/编辑/regenerate**：以"当前可见 branch 为真实索引"；检测到大面积 turn 更换时
+1. **Passive indexing（自动、零干扰）**：消息挂载即收获入库；被虚拟化卸载后 metadata
+   保留、DOM 引用释放。卸载 ≠ 未收获：正文已完整读取的条目不显示任何标记；仅缓存
+   preview 截断文本的条目显示"仅预览"。用户正常浏览到哪里，索引就收获到哪里 ——
+   TurnRail 绝不为补全历史自动滚动页面。
+2. **Jump recovery（用户点击触发）**：点击未挂载的问题 → 判断方向 → 受控逐屏滚动 →
+   每步收获扫描 → 命中即跳转；带最大迭代（60 次/20s）与边界终止，失败恢复原位置并提示。
+3. **Load full history（用户显式授权）**：点击「加载全部历史」→ 记录阅读锚点 →
+   渐进向上滚动 → 等待懒加载渲染 → 收获 → 连续无新增/到顶/达到迭代上限（300 次/45s）
+   即停止 → 按锚点 + 内容增量精确恢复原阅读位置。这是唯一会主动滚动页面的后台级操作，
+   按钮文案与 tooltip 明确告知"会暂时滚动聊天"。
+4. **分支/编辑/regenerate**：以"当前可见 branch 为真实索引"；检测到大面积 turn 更换时
    丢弃失效的离线 metadata，不猜测不可见分支。
 
-## Background History Warmup（后台历史预热）
+## Passive History Harvest（被动历史收获）
 
-ChatGPT 对长会话采用 lazy loading + DOM virtualization：当前视口只挂载部分历史 turn，
-TurnRail 打开长聊天时只能"看到什么、索引什么"，Health / Checkpoint / Handoff 因而可能
-只有 preview 级别的覆盖。**Background History Warmup** 在用户正常浏览、进入空闲时，
-用很短的低优先级时间片缓慢向上探索，借 ChatGPT 自己的 DOM lazy loading 逐步把更旧的
-历史收获进 Store（contentCompleteness: preview → full）。
+**产品原则：TurnRail 绝不为补全历史主动滚动当前聊天。**
+优先级永远是：用户阅读位置 > 用户滚动 > 用户输入 > 用户导航 > Handoff > Health >
+历史完整度。如果加载更早历史需要改变用户当前阅读位置，TurnRail 会等待用户显式点击
+「加载全部历史」，而不是自己动手。
 
-**它不是**：不是 Web Worker / Service Worker，不调用 ChatGPT（任何）API，不抓取内部
-网络接口，不请求任何远程服务 —— 只观察用户浏览器里 ChatGPT 页面已经（或将要）加载出来的
-DOM。manifest 权限保持 `storage` 不变。
+> TurnRail does not auto-scroll a conversation in the background.
+> If loading older ChatGPT history would require moving the user's current reading
+> position, TurnRail waits for explicit user action instead.
 
-调度要点（`src/conversation/historyWarmup.ts`）：
+ChatGPT 对长会话采用 lazy loading + DOM virtualization：当前视口只挂载部分历史 turn。
+TurnRail 的收获模型因此只有三种数据来源：
 
-- 进入会话路由后等待约 5 秒（让 bootstrap / 首渲染 / 缓存 hydrate 先稳定），之后每个
-  **batch** 最多移动 2 步、每步约 0.5 viewport，完全让出主线程，数秒后再调度下一批；
-- **任何用户操作（wheel / touch / 按键 / 输入 / 滚动）、assistant 流式输出、手动
-  「加载全部历史」、目录跳转 recover，全部优先于 warmup** —— 一旦发生立即暂停且绝不
-  把页面拉回旧位置；用户主动滚动后的位置永远以用户为准；
-- 动态退避：有收获 2.5s 后继续，无收获 8s 后再试；连续 6 个 batch 无内容收获即休眠
-  （不空转）；到达视觉顶部且连续稳定无新增才标记"已尽量补全"；
-- 会话结束（补全完成）时把阅读位置精确恢复到用户最近的有意位置；
-- 缓存此前已确认 complete（`complete = true`）的会话不重复自动预热；
-- 后台标签页（`visibilityState !== 'visible'`）不运行。
+- **Live Passive Harvest（自动）**：用户正常滚动 / 阅读 / 跳转 / 继续聊天时，
+  ChatGPT 自己挂载新的 DOM，TurnRail 经既有 MutationObserver → Indexer → Store
+  管道被动收获（preview → full 完整度升级会广播 `coverage` 事件，Health / Handoff
+  随之受益）。TurnRail 不制造任何新的 DOM churn，也没有任何后台定时器。
+- **Cache Hydration（自动）**：已缓存会话重新打开时先恢复目录（title / preview /
+  turn id）。preview ≠ full —— 截断文本的条目显示"仅预览"，等 Live 挂载升级。
+- **Explicit Full History Capture（用户点击）**：只有点击「加载全部历史」才运行
+  `captureFullHistory()` 受控滚动，按钮 busy 明确、结束后恢复阅读位置。
 
-**覆盖语义**：目标是 History Coverage（本页面生命周期内已完整收获的正文），而不是
-DOM Mount Coverage —— ChatGPT 的 virtualization 会继续卸载 turn，但 TurnRail Store 的
-完整 metadata 常驻可用于 Health / Handoff。目录区分三种状态：已完整收获（无标记，
-detached 也不标记）、仅预览（"仅预览"）、从未解析（保守兜底"未加载"）。
+**到顶证据（reachedTop）只在两种情况下成立**：显式捕获确认到顶，或用户自然停在
+视觉顶部且稳定窗口内没有新的懒加载（`src/content/passiveTopWatch.ts`，纯滚动监听、
+零滚动写入）。绝不以"很久没有新增"推测 complete。
 
-完整正文不写入长期导航缓存（隐私边界不变）：页面刷新后后台预热会重新逐步补全，
-这符合"只观察页面 DOM、不持久化完整正文"的隐私设计。
+**为什么没有后台自动加载**：曾经实现过 Cooperative History Warmup（用户空闲时低优先级
+小批次滚动探索），真实使用证明程序化滚动当前聊天本身就是不可接受的副作用 —— 即使
+"滚过去再滚回来"，也会产生页面闪动、内容跳动、阅读干扰。相关调度器 / 空闲门控 /
+批量指标已全部移除。源码级合同 `BACKGROUND_TASK_MUST_NOT_SCROLL` 由
+`test/unit/passiveHistory.test.ts` 强制：除 jump / recover / manual capture /
+scrollAnchor / 几何层外，任何模块出现滚动写入即测试失败。
+
+完整正文不写入长期导航缓存（隐私边界不变）：页面刷新后，随用户再次浏览逐步重新收获。
 
 ## Performance（v1.2）
 
@@ -441,7 +448,12 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 - 无原生 ID（`data-turn-key` / `data-chatgpt-search-message-ids` 均缺失）时，完全相同文本的问题
   在虚拟化滚动时可能出现序号漂移（ID 重新分配），目录顺序可能短暂重排。
 - 分支切换靠启发式检测（"大量卸载 + 大量全新 id"同时出现时重置离线索引），极端场景可能残留少量"未加载"条目。
-- Background History Warmup 是渐进补全而非瞬时加载：完整跑完一个 100+ 轮的长会话需要数分钟（刻意保守，用户可随时用「加载全部历史」立即完成）；仅在可见标签页运行；预热完成的完整正文只存在于页面内存，刷新页面后需要重新逐步补全（隐私设计，完整正文不入长期缓存）；"已尽量补全"仅表示已确认到达当前会话视觉顶部，绝不表示模型 context / 服务端数据完整。
+- TurnRail 不做后台自动历史加载（刻意的产品决策）：用户不浏览到的旧历史不会被自动收获，
+  coverage 保持 partial；Health 在低覆盖时显示低置信度并收敛建议强度。
+  需要完整历史时点击「加载全部历史」（唯一被授权的滚动加载）。
+  被动收获的完整正文只存在于页面内存，刷新页面后需随浏览重新收获（隐私设计，
+  完整正文不入长期缓存）；"已补全"仅表示已确认到达当前会话视觉顶部，
+  绝不表示模型 context / 服务端数据完整。
 - 导航缓存只让"已见过的 turn"提前可见：缓存无法凭空提供未加载过的历史；partial 缓存在发现更多 turn 前保持 partial。
 - 缓存的分支 / edit / regenerate 行为是 best-effort：Live 与缓存零重叠（判定为另一分支）时丢弃缓存 turn 并以 Live 重建。
 - Handoff checkpoint 为纯内存标记：页面刷新后需重新标星（附着稳定 turnId，虚拟化卸载 / SPA 切换不受影响）；pending handoff 注入依赖新聊天页 `#prompt-textarea` selector，站点改版时需更新 `providers/chatgpt.ts`。
@@ -456,7 +468,7 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 | --- | --- |
 | 右侧看不到轨道 | 当前不在会话页（新会话 0 提问时隐藏）；或 DOM 策略失效——看面板是否显示"无法识别" |
 | 轨道出现但点击无反应 | 控制台执行 `localStorage.setItem('tn-debug','1')` 后刷新，查看 `[TurnRail]` 日志 |
-| 部分问题带"仅预览" | TurnRail 只有该轮的截断缓存 preview，尚未完整收获：正常浏览或后台预热到该区域后会自动升级；也可用「加载全部历史」立即补全 |
+| 部分问题带"仅预览" | TurnRail 只有该轮的截断缓存 preview，尚未完整收获：自然浏览到该区域后自动升级（无需任何操作）；也可用「加载全部历史」立即补全 |
 | 跳转后目标仍被遮挡 | 极少见；目标样式变化导致 header 测量偏差，欢迎提 issue |
 | 缓存按钮突然变灰 | 开发过程中重新加载过 TurnRail：旧 ChatGPT 标签页失去 extension context（预期生命周期事件），导航与 Health 仍可用；刷新该 ChatGPT 页面即可恢复缓存 |
 
@@ -492,11 +504,12 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   预览内容边界（含 checkpoint / 不含超范围旧轮）、取消零 pending、确认继续 →
   pending 落盘 + 打开意图、新聊天页自动填入 composer（不发送）+ 消费删除、
   streaming 不影响 checkpoint、Health CTA 分档。
-  Warmup 增量：`test/browser/historyWarmup.spec.ts` —— 长会话（40/72/120 轮 mock）
-  自动逐步收获、用户滚动 / composer 输入 / streaming 三类立即暂停与恢复、
-  完成后阅读锚点恢复、用户滚动位置优先不回拉、detached full turn 不显示"未加载"、
-  manual capture / recover 打断时滚动所有权唯一、路由切换隔离、complete 后零空转、
-  每 batch full scan ≤ 1 与 batch 墙钟上限。
+  Passive History Harvest 增量：`test/browser/passiveHistory.spec.ts` ——
+  长会话（40/72/120 轮 mock）idle / 阅读 / streaming / composer 输入四类场景
+  绝不自主滚动、用户自然滚旧历史被动收获 + 自然到顶证据（reachedTop）、
+  缓存 preview 目录"仅预览"标记 → 自然升级 full → Health 覆盖度感知（文本相同时也重算）、
+  manual capture busy UI / 恢复阅读位置、源码级 BACKGROUND_TASK_MUST_NOT_SCROLL 合同
+  （`test/unit/passiveHistory.test.ts`）。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
