@@ -299,7 +299,10 @@ export class ConversationIndexer {
       keys.length === store.lastVisibleKeys.length &&
       keys.every((key, i) => key === store.lastVisibleKeys[i])
     ) {
-      let textChanged = false
+      // 按角色区分文本变化：assistant 流式（高频）与 user prompt 变化（低频）
+      // 走不同事件，健康重算等语义级消费方只响应用户侧
+      let userTextChanged = false
+      let assistantTextChanged = false
       let allConnected = true
       for (let i = 0; i < incoming.length; i++) {
         const msg = store.messages.get(keys[i]!)
@@ -310,11 +313,14 @@ export class ConversationIndexer {
         const text = incoming[i]!.record.text
         if (msg.text !== text) {
           msg.text = text
-          textChanged = true
+          if (msg.role === 'user') userTextChanged = true
+          else assistantTextChanged = true
         }
       }
       if (allConnected) {
-        store.commit(textChanged ? 'text' : 'none')
+        store.commit(
+          userTextChanged ? 'user-text' : assistantTextChanged ? 'assistant-text' : 'none'
+        )
         return
       }
     }
@@ -322,6 +328,8 @@ export class ConversationIndexer {
     // ---- 全量调和 ----
     const visibleIds: string[] = []
     let elementChanged = false
+    let userTextChanged = false
+    let assistantTextChanged = false
     for (const { record, key } of incoming) {
       const existing = store.messages.get(key)
       if (existing) {
@@ -329,7 +337,14 @@ export class ConversationIndexer {
           existing.element = record.element
           elementChanged = true
         }
-        if (existing.text !== record.text) existing.text = record.text
+        if (existing.text !== record.text) {
+          existing.text = record.text
+          if (record.role === 'user') userTextChanged = true
+          else assistantTextChanged = true
+        }
+        // 该消息已被 Live DOM 重新解析绑定 → 文本即完整原文
+        //（缓存 hydrate 恢复的截断 preview 在此升级为 full）
+        if (record.role === 'user') existing.contentCompleteness = 'full'
         existing.role = record.role
         existing.isMounted = true
       } else {
@@ -340,7 +355,8 @@ export class ConversationIndexer {
           turnIndex: -1,
           element: record.element,
           firstSeenAt: Date.now(),
-          isMounted: true
+          isMounted: true,
+          contentCompleteness: 'full'
         })
         elementChanged = true
       }
@@ -459,7 +475,17 @@ export class ConversationIndexer {
 
     const idsChanged =
       finalTurns.length !== prevTurns.length || finalTurns.some((turn, i) => turn.id !== prevTurns[i]?.id)
-    const kind: ChangeKind = idsChanged ? 'structure' : elementChanged ? 'elements' : 'text'
+    // 同批多类变化时按用户侧优先上报（健康重算依赖 user-text）：
+    // structure > user-text > elements > assistant-text
+    const kind: ChangeKind = idsChanged
+      ? 'structure'
+      : userTextChanged
+        ? 'user-text'
+        : elementChanged
+          ? 'elements'
+          : assistantTextChanged
+            ? 'assistant-text'
+            : 'none'
     store.commit(kind)
   }
 
