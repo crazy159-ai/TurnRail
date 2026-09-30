@@ -174,9 +174,10 @@ TurnRail 支持由用户**主动**缓存所选会话的导航元数据（面板�
 ## Chat Health Check
 
 长对话常见风险不是"轮数多"，而是方案反复、纠错累积、主题漂移、跨轮依赖过长。
-TurnRail 在目录面板内提供一个低干扰健康卡，基于**已索引的 user prompt 结构**做
-本地启发式评估（六信号加权：长度压力 30% / 方案反转 20% / 纠错频率 20% /
-主题漂移 15% / 跨轮依赖 10% / 复杂度 5%），任何单一信号都不足以单独触发换聊建议。
+TurnRail 在目录面板内提供一个低干扰健康卡，基于**已索引的 user prompt**（user-only，
+assistant 正文不参与评分）做本地启发式评估（六信号加权：长度压力 30% / 方案反转 20% /
+纠错频率 20% / 主题漂移 15% / 跨轮依赖 10% / 复杂度 5%），任何单一信号都不足以
+单独触发换聊建议。
 
 | 分数 | 等级 | 含义 |
 | --- | --- | --- |
@@ -185,10 +186,22 @@ TurnRail 在目录面板内提供一个低干扰健康卡，基于**已索引的
 | 45–64 | organize | 建议先整理阶段结论；任务已换阶段时可考虑新开聊天 |
 | 0–44 | new-chat | 多项长对话风险叠加，建议带着目标/结论/约束/状态新开聊天 |
 
+**分数 ≠ 等级**：分数是连续加权量，等级是给用户的建议，两者经 guardrail 解耦——
+任一核心信号进入强区间时至少显示 watch（"12 轮全在纠错"不会因加权平均仍显示 healthy）；
+organize / new-chat 要求多项核心语义信号实质支持；**缓存 preview 覆盖不足（置信度低）
+时绝不输出"新开聊天"这类强建议**，健康卡会显式标注"低置信度"并提示加载更多历史。
+
+**Coverage / Confidence**：缓存恢复的目录只含截断 preview 文本（Runtime 标记
+`contentCompleteness: 'preview'`），对它们的评分证据不足。健康卡按 Live 文本覆盖率
+给出 high（≥85%）/ medium（≥50%）/ low 三档置信度；Live reconcile 绑定后自动升级为
+full 并重算，无需任何手动操作。
+
 边界：评估只使用浏览器本地已索引内容（**不联网、无模型调用**），不代表 ChatGPT
 真实 token 用量、上下文裁剪或 Memory 状态；建议均为非强制提示，是否换聊始终由用户决定，
-TurnRail 绝不自动创建或切换聊天。健康分是派生状态，不写入缓存（每次从当前 Store 重算），
-且在 assistant 流式输出期间不重算（不影响流式性能优化）。
+TurnRail 绝不自动创建或切换聊天。健康分是派生状态，不写入缓存（每次从当前 Store 重算，
+缓存 schema 保持 v1 不变）；重算只由 structure / user-text 事件触发，
+**assistant 流式输出期间不重算**（由 `semanticRevision` 事件语义保证，
+`__tnDebug.performance.health.analyzes` 可验证）。
 
 ## Privacy
 
@@ -266,19 +279,22 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 
 ## Roadmap
 
-- **v1.3 — Cache Management & Storage Correctness**：多标签页安全的缓存索引
+- **v1.3 — Conversation Health + Cache Management**：Chat Health 转正与真实对话校准
+  （Golden Cases 持续扩充、信号阈值随样本调整）；多标签页安全的缓存索引
   （当前共享 `turnrail:cache:index` 为 read-modify-write，last-writer-wins 可能丢条目）、
   recent cache / LRU、存储管理 UI。
 - **v1.4 — Large Conversation Scalability**：100 / 300 / 500 / 1000 turn 基准测试；
   当前 `scanDirty()` 虽只解析 dirty turn，但仍经 `locateTurnRoots()` 全量枚举
   （增量解析 ≠ 严格 O(1) 索引，属 v1.2 正常设计），届时按实测决定是否引入
   direct dirty-root upsert、outline virtualization、marker clustering、geometry index。
-- **v1.5 — Provider Architecture**：Provider 能力抽象与注册机制。
+- **v1.5 — Conversation Handoff & Provider Architecture**：整理/新聊场景的交接上下文生成
+  （基于健康卡建议的后续能力）；Provider 能力抽象与注册机制。
 - **v2.0 — Multi-provider**：Claude / Gemini / DeepSeek 等站点支持。
 
 ## Known limitations
 
 - 聊天健康分数是 TurnRail 基于**已索引内容**的本地启发式估算，不等于 ChatGPT 的真实 token 使用量、上下文裁剪状态或 Memory 状态；其作用是提醒长对话中的工程风险，而不是给出模型内部状态的确定结论。
+- 健康信号依赖中英文关键词启发式：同义换题（词面不同）检不出主题漂移，长尾表达可能漏检或误检；缓存 preview 覆盖不足时分数仅作参考（UI 已标注低置信度并禁用强建议）。
 - ChatGPT DOM 改版（尤其 `data-turn-key` / `data-chatgpt-search-unit-key` 结构变化）时需更新
   `providers/chatgpt.ts` 中的 `SELECTORS` 表；legacy fallback 的启发式角色推断可能失效。
 - 无原生 ID（`data-turn-key` / `data-chatgpt-search-message-ids` 均缺失）时，完全相同文本的问题
