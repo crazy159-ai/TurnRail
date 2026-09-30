@@ -871,6 +871,9 @@ export function bootstrap(): void {
       cache: cacheStore,
       recoverLog: getRecoverLog,
       warmup,
+      // DEBUG 跳转钩子：与点击目录项同一 handleJump 路径（jump → 失败时 recoverAndJump）。
+      // 供诊断 / 浏览器测试在虚拟化频繁重建 DOM 时稳定触发恢复跳转
+      jump: (turnId: string) => void handleJump(turnId),
       resetPerformanceStats: () => perf.reset(),
       // 诊断导出（纯元数据，无聊天正文；见 utils/diagnostics.ts 隐私合同）：
       // 生成 JSON → 尝试写入剪贴板；剪贴板不可用时返回 JSON 字符串。绝不自动发送。
