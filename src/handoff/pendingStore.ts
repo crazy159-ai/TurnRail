@@ -12,6 +12,9 @@ import type { PendingHandoff } from './types'
  * - 与 CacheStore 的 terminal 状态机刻意不同：这是极小的一次性读写，
  *   任何失败（含 extension context invalidated）都返回 false / null，
  *   由调用方回退"复制到剪贴板"路径，绝不假成功、绝不重试轮询。
+ * - 删除一律身份安全（removeIfMatches）：多标签页竞争下，旧消费者只允许
+ *   删除"自己读到的那个"pending，绝不误删之后被覆盖写入的新 pending
+ *   （TOCTOU：peek A → save B → 删除必须是"仍是 A 才删"）。
  * - 隐私契约：短生命周期、可能包含用户选定的完整正文（README/SECURITY 已声明），
  *   绝不导出 payload 到诊断 / 控制台。
  */
@@ -48,7 +51,7 @@ export class PendingHandoffStore {
     }
   }
 
-  /** 读取有效 pending；过期记录立即删除并返回 null。任何失败返回 null */
+  /** 读取有效 pending；过期记录身份安全删除并返回 null。任何失败返回 null */
   async peek(): Promise<PendingHandoff | null> {
     const storage = this.storage
     if (!storage) return null
@@ -57,7 +60,8 @@ export class PendingHandoffStore {
       const pending = parsePendingHandoff(result[PENDING_HANDOFF_KEY])
       if (!pending) return null
       if (Date.now() > pending.expiresAt) {
-        await this.remove()
+        // 身份安全：读取与删除之间可能已被其他标签页覆盖写入，只能删自己读到的
+        await this.removeIfMatches(pending.id)
         return null
       }
       return pending
@@ -66,20 +70,30 @@ export class PendingHandoffStore {
     }
   }
 
-  /** 消费：peek + 立即删除（注入成功后调用） */
-  async consume(): Promise<PendingHandoff | null> {
-    const pending = await this.peek()
-    if (pending) await this.remove()
-    return pending
+  /**
+   * 身份安全消费：仅当当前 pending 仍是 expectedId 时才删除。
+   * true = 本次调用真实删除了 expectedId；
+   * false = pending 不存在 / 已过期 / 已被其他 handoff 覆盖 —— 绝不误删新数据。
+   */
+  async consume(expectedId: string): Promise<boolean> {
+    return this.removeIfMatches(expectedId)
   }
 
-  async remove(): Promise<void> {
+  /**
+   * 守卫式删除：read → validate(id) → remove 三步只在 id 匹配时落地删除。
+   * 这是多标签页竞争下唯一合法的删除路径（过期清理与消费共用）。
+   */
+  async removeIfMatches(expectedId: string): Promise<boolean> {
     const storage = this.storage
-    if (!storage) return
+    if (!storage) return false
     try {
+      const result = await storage.get(PENDING_HANDOFF_KEY)
+      const current = parsePendingHandoff(result[PENDING_HANDOFF_KEY])
+      if (!current || current.id !== expectedId) return false
       await storage.remove(PENDING_HANDOFF_KEY)
+      return true
     } catch {
-      // 删除失败同样静默：TTL 到期后记录自然作废
+      return false
     }
   }
 }

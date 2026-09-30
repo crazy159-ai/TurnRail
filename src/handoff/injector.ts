@@ -41,7 +41,10 @@ export async function injectPendingHandoff(
   }
 
   if (!capability.setComposerText(pending.payload)) return 'failed'
-  await store.consume()
+  // 身份安全消费：只删除"刚刚实际注入的那个"pending。若等待 composer 期间
+  // 另一标签页已写入新 handoff B，consume(A.id) 返回 false —— B 必须保留，
+  // 且本轮不算失败（A 的正文已真实写入 composer）。
+  await store.consume(pending.id)
   return 'injected'
 }
 
