@@ -80,16 +80,18 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   search.setAttribute('aria-label', '搜索当前对话的问题')
   search.addEventListener('input', () => handlers.onSearchInput(search.value))
 
-  // 对话健康：仅展示 TurnRail 本地启发式结果，不声称知道模型真实上下文窗口
+  // 对话健康：仅展示 TurnRail 本地启发式结果，不声称知道模型真实上下文窗口。
+  // 估算性质说明放 tooltip（#49），常驻空间留给分数与建议
   const health = createEl('section', 'tn-health tn-health-hidden')
   health.setAttribute('aria-live', 'polite')
   const healthTop = createEl('div', 'tn-health-top')
   const healthLabel = createEl('span', 'tn-health-label', '对话健康')
   const healthScore = createEl('strong', 'tn-health-score', '100')
-  healthTop.append(healthLabel, healthScore)
+  const healthConf = createEl('span', 'tn-health-conf tn-health-conf-hidden', '低置信度')
+  healthTop.append(healthLabel, healthScore, healthConf)
   const healthMessage = createEl('div', 'tn-health-message', '')
   const healthReasons = createEl('div', 'tn-health-reasons', '')
-  const healthNote = createEl('div', 'tn-health-note', '本地启发式评估，不代表 ChatGPT 实际剩余上下文。')
+  const healthNote = createEl('div', 'tn-health-note', '')
   health.append(healthTop, healthMessage, healthReasons, healthNote)
 
   // 列表
@@ -133,25 +135,58 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     count.textContent = String(value)
   }
 
+  let lastAnnouncedHealth = ''
+
+  /**
+   * 健康卡分层降噪（P2-3）：
+   * - healthy 且置信度正常 → 只保留一行"对话健康 NN"；
+   * - watch → 建议 + 至多 1 条原因；organize / new-chat → 展开至多 3 条原因；
+   * - 低置信度（缓存 preview 覆盖不足）→ 显式标注，并提示覆盖不足，
+   *   绝不让用户把截断样本上的分数当成可靠结论；
+   * - 估算性质说明放 tooltip，不常驻占空间；
+   * - 可访问文本仅在 level / confidence 变化时更新（aria-live 防分数波动刷屏）。
+   */
   function setHealth(snapshot: ConversationHealthSnapshot | null): void {
     if (!snapshot || snapshot.evidence.turnCount < 3) {
       health.classList.add('tn-health-hidden')
       health.removeAttribute('data-level')
       healthScore.textContent = ''
+      healthConf.classList.add('tn-health-conf-hidden')
       healthMessage.textContent = ''
       healthReasons.textContent = ''
+      healthNote.textContent = ''
+      lastAnnouncedHealth = ''
       return
     }
 
+    const low = snapshot.confidence === 'low'
+    const level = snapshot.level
     health.classList.remove('tn-health-hidden')
-    health.dataset.level = snapshot.level
+    health.dataset.level = level
     healthScore.textContent = String(snapshot.score)
-    healthMessage.textContent = snapshot.recommendation
-    healthReasons.textContent = snapshot.reasons.join(' · ')
-    healthReasons.classList.toggle('tn-health-reasons-hidden', snapshot.reasons.length === 0)
-    const label = `对话健康度 ${snapshot.score} 分。 ${snapshot.recommendation}`
-    health.setAttribute('aria-label', label)
-    health.title = label
+    healthConf.classList.toggle('tn-health-conf-hidden', !low)
+
+    if (level === 'healthy' && !low) {
+      healthMessage.textContent = ''
+    } else {
+      healthMessage.textContent = snapshot.recommendation
+    }
+    const maxReasons = level === 'healthy' ? 0 : level === 'watch' ? 1 : 3
+    const reasons = snapshot.reasons.slice(0, maxReasons)
+    healthReasons.textContent = reasons.join(' · ')
+    healthReasons.classList.toggle('tn-health-reasons-hidden', reasons.length === 0)
+    healthNote.textContent = low ? '当前仅掌握部分历史，加载更多后评估更可靠。' : ''
+    healthNote.classList.toggle('tn-health-note-hidden', !low)
+
+    health.title = `本地启发式评估（基于已索引的用户提问），不代表 ChatGPT 实际剩余上下文。${snapshot.recommendation}`
+    const announced = `${level}:${snapshot.confidence}`
+    if (announced !== lastAnnouncedHealth) {
+      lastAnnouncedHealth = announced
+      health.setAttribute(
+        'aria-label',
+        `对话健康度 ${snapshot.score} 分${low ? '，低置信度' : ''}。 ${snapshot.recommendation}`
+      )
+    }
   }
 
   function setCached(value: boolean): void {

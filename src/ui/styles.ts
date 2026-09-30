@@ -191,6 +191,16 @@ export const navigationCss = `
   font-size: 13px;
   font-variant-numeric: tabular-nums;
 }
+.tn-health-conf {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--tn-border);
+  color: var(--tn-muted);
+}
+.tn-health-conf-hidden {
+  display: none;
+}
 .tn-health-message {
   font-size: 12px;
   line-height: 1.45;
@@ -209,6 +219,9 @@ export const navigationCss = `
   color: var(--tn-muted);
   font-size: 10px;
   line-height: 1.35;
+}
+.tn-health-note-hidden {
+  display: none;
 }
 .tn-health[data-level="healthy"] .tn-health-score {
   color: var(--tn-accent);
