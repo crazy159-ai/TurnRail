@@ -82,6 +82,40 @@ async function interceptWindowOpen(page: Page): Promise<void> {
   })
 }
 
+/** 注入全故障 chrome.storage.local（模拟 extension context invalidated / storage 故障） */
+async function injectFailingStorage(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const reject = (): Promise<never> => Promise.reject(new Error('Extension context invalidated.'))
+    const stub = { get: reject, set: reject, remove: reject }
+    try {
+      ;(globalThis as Record<string, unknown>).chrome = { storage: { local: stub } }
+    } catch {
+      Object.defineProperty(globalThis, 'chrome', {
+        configurable: true,
+        value: { storage: { local: stub } }
+      })
+    }
+  })
+}
+
+/**
+ * 覆盖 navigator.clipboard.writeText（测试台 content.js 以页面脚本加载，
+ * 与 main world 同上下文）：'ok' 恒成功 / 'reject' 恒失败，确定性地模拟
+ * 真实 Chrome 的剪贴板权限授予与拒绝。
+ */
+async function overrideClipboard(page: Page, behavior: 'ok' | 'reject'): Promise<void> {
+  await page.addInitScript((mode) => {
+    const writeText =
+      mode === 'ok'
+        ? (): Promise<void> => Promise.resolve()
+        : (): Promise<never> => Promise.reject(new Error('clipboard write denied'))
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText }
+    })
+  }, behavior)
+}
+
 async function pendingExists(page: Page): Promise<boolean> {
   return page.evaluate(() => {
     try {
@@ -247,6 +281,68 @@ test('handoff G/H/I: 新聊天页自动读取 pending → 填入 composer（不�
   await expect.poll(() => pendingExists(page)).toBe(false)
   // 不自动发送：home 路由 thread 无任何 turn（rail 隐藏但 marker DOM 保留为既有行为）
   await expect(page.locator('[data-turn-key]')).toHaveCount(0)
+})
+
+test('handoff K: storage 失败 + clipboard 失败 → 状态绝不谎报"已复制"', async ({ page }) => {
+  await injectFailingStorage(page)
+  await overrideClipboard(page, 'reject')
+  await gotoWithDebug(page, MOCK)
+  await waitForMarkers(page, 12)
+
+  await starFirstTurn(page)
+  await openHandoffPreview(page)
+  await page.locator('.tn-handoff-continue').click()
+
+  // 两条回退路径都失败：状态必须明确"无法自动传递 + 请手动复制"，绝不出现"已复制"
+  const status = page.locator('.tn-status')
+  await expect(status).toContainText('无法自动传递')
+  await expect(status).toContainText('手动全选复制')
+  await expect(status).not.toContainText('已复制')
+  expect(await pendingExists(page)).toBe(false)
+  // 预览保持打开，用户仍可手动全选复制
+  await expect(page.locator('.tn-handoff-text')).toBeVisible()
+})
+
+test('handoff C3: storage 失败 + clipboard 成功 → 明示剪贴板兜底路径', async ({ page }) => {
+  await injectFailingStorage(page)
+  await overrideClipboard(page, 'ok')
+  await gotoWithDebug(page, MOCK)
+  await waitForMarkers(page, 12)
+
+  await starFirstTurn(page)
+  await openHandoffPreview(page)
+  await page.locator('.tn-handoff-continue').click()
+
+  const status = page.locator('.tn-status')
+  await expect(status).toContainText('已复制 Handoff')
+  await expect(status).toContainText('手动打开新聊天并粘贴')
+  expect(await pendingExists(page)).toBe(false)
+})
+
+test('handoff C1: 复制按钮 clipboard 成功 → 明确成功提示', async ({ page }) => {
+  await injectWorkingStorage(page)
+  await overrideClipboard(page, 'ok')
+  await gotoWithDebug(page, MOCK)
+  await waitForMarkers(page, 12)
+
+  await starFirstTurn(page)
+  await openHandoffPreview(page)
+  await page.locator('.tn-handoff-btn', { hasText: '复制' }).click()
+  await expect(page.locator('.tn-status')).toContainText('已复制')
+})
+
+test('handoff C2: 复制按钮 clipboard 抛错 → 绝不显示成功', async ({ page }) => {
+  await injectWorkingStorage(page)
+  await overrideClipboard(page, 'reject')
+  await gotoWithDebug(page, MOCK)
+  await waitForMarkers(page, 12)
+
+  await starFirstTurn(page)
+  await openHandoffPreview(page)
+  await page.locator('.tn-handoff-btn', { hasText: '复制' }).click()
+  const status = page.locator('.tn-status')
+  await expect(status).toContainText('复制失败')
+  await expect(status).not.toContainText('已复制')
 })
 
 test('handoff J: assistant streaming 不影响 checkpoint 与 handoff UI', async ({ page }) => {

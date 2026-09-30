@@ -185,14 +185,26 @@ export function bootstrap(): void {
     }
   }
 
-  async function handleHandoffCopy(text: string): Promise<void> {
+  /**
+   * 剪贴板写入的"复制行为"与"UI 提示"分离：返回真实结果，
+   * 由调用方按成败渲染状态 —— 失败绝不显示"已复制"（no fake success）。
+   */
+  async function tryCopyText(text: string): Promise<boolean> {
     try {
       await navigator.clipboard.writeText(text)
-      ui.setStatus('交接上下文已复制，可粘贴到新聊天')
+      return true
     } catch {
-      // 剪贴板不可用（权限 / 非安全上下文）：绝不谎报成功
-      ui.setStatus('复制失败，请在预览框中手动全选复制')
+      return false
     }
+  }
+
+  async function handleHandoffCopy(text: string): Promise<void> {
+    const copied = await tryCopyText(text)
+    ui.setStatus(
+      copied
+        ? '交接上下文已复制，可粘贴到新聊天'
+        : '复制失败，请在预览框中手动全选复制'
+    )
     window.setTimeout(() => ui.setStatus(''), 3500)
   }
 
@@ -224,12 +236,16 @@ export function bootstrap(): void {
 
   async function handleHandoffContinue(text: string): Promise<void> {
     if (text.length === 0) return
-    // 先保存 pending 再开新标签页：保存失败绝不打开（避免"新页面无事发生"的假成功）
+    // 先保存 pending 再开新标签页：保存失败绝不打开（避免"新页面无事发生"的假成功）。
+    // storage 失败路径必须按剪贴板真实结果显示状态（成功 / 失败两套文案，绝不谎报）。
     const saved = await pendingHandoffStore.save(text)
     if (!saved) {
-      // storage 不可用（含 extension context invalidated）：回退剪贴板
-      await handleHandoffCopy(text)
-      ui.setStatus('无法自动传递到新标签页，已复制 Handoff，请手动粘贴到新聊天')
+      const copied = await tryCopyText(text)
+      ui.setStatus(
+        copied
+          ? '无法自动传递到新标签页，已复制 Handoff，请手动打开新聊天并粘贴'
+          : '无法自动传递，也未能写入剪贴板，请在预览框中手动全选复制'
+      )
       window.setTimeout(() => ui.setStatus(''), 4500)
       return
     }
