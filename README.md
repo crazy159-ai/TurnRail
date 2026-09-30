@@ -72,11 +72,22 @@ npm run test:browser  # Playwright 浏览器冒烟测试（Chromium，见「测�
 
 Development note（Chrome 正常行为，非缺陷）：重新加载 unpacked extension 后，已经打开的
 ChatGPT 标签页仍持有旧 content-script context，其 `chrome.storage` 调用会以
-"Extension context invalidated." 失败；TurnRail 对此会安静降级为 Live-only 模式
-（仅 tn-debug 下留痕），请同时刷新这些 ChatGPT 页面以恢复完整缓存功能。
+"Extension context invalidated." 失败。TurnRail detects the invalidated context,
+stops using cache for the remainder of that page lifetime, and continues in
+Live-only mode. Reload the ChatGPT page to obtain a fresh extension context.
+
+即：这是扩展重载的预期生命周期事件（Cache Runtime Lifecycle 状态机的 terminal
+转换），不是 TurnRail 故障 —— TurnRail 检测到 context 失效后，在该页面生命周期的
+剩余时间里停用缓存并继续以 Live-only 模式工作：导航与 Health 完全不受影响，
+后续不再访问 chrome.storage，production 模式完全静默（DEBUG 下仅一条 debug 级
+lifecycle 日志，绝不以 warning / error 记录），也不会自动刷新页面。
+刷新该 ChatGPT 页面获得新的 extension context 后，缓存功能自动恢复。
 
 调试日志：在页面控制台执行 `localStorage.setItem('tn-debug', '1')` 并刷新（生产默认关闭）。
 性能指标：`__tnDebug.performance`（TTFR / TTLR / 扫描与 observer 分类计数），`__tn.resetPerformanceStats()` 重置。
+生命周期诊断（DEBUG）：`__tnDebug.bootstrapCount`（同一页面 bootstrap 次数，正常恒为 1）、
+`__tnDebug.extensionVersion`、`__tnDebug.extensionIdHash`（extension ID 的短 hash，
+用于排查"同时装了开发版 + Release 版两个副本"类问题；绝不输出完整 ID）。
 
 ## Build
 
@@ -146,7 +157,7 @@ ConversationIndexer (conversation/indexer.ts)
 | `cache/types.ts` / `validate.ts` | 缓存 schema（CachedConversation DTO）与全部入读校验（损坏 / 未来版本 → 忽略） |
 | `cache/serializer.ts` / `hydrator.ts` | Runtime Store ↔ 缓存 DTO 显式双向转换（纯数据，无 DOM 依赖） |
 | `cache/reconciler.ts` | 缓存与 Live 零重叠时的 stale 判定（分支切换防护） |
-| `cache/cacheStore.ts` | chrome.storage.local 持久层（索引 + 全链路容错，失败即 Live-only） |
+| `cache/cacheStore.ts` | chrome.storage.local 持久层（索引 + 显式 CacheRuntimeState 状态机：available / terminal unavailable，context probe pre-flight + 全链路容错，失败即 Live-only） |
 | `content/observers.ts` | 两层 Observer：短命 Root Watch（root 缺失时等出现）+ scoped Conversation Observer（root 出现即断开 document 级监听） |
 | `content/mutationPipeline.ts` | Mutation 分类器 + Dirty Turn 队列（streaming 忽略 / turn 内变化 / unknown 回退 full scan；40ms 批量去重） |
 | `content/startupScan.ts` | 启动稳定性退避扫描（100→2400ms，连续 2 次签名不变即停，替代固定 8×400ms） |
@@ -314,6 +325,7 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 | 轨道出现但点击无反应 | 控制台执行 `localStorage.setItem('tn-debug','1')` 后刷新，查看 `[TurnRail]` 日志 |
 | 部分问题带"未加载" | 该历史尚未被浏览器挂载：点击它自动查找，或用「加载全部历史」 |
 | 跳转后目标仍被遮挡 | 极少见；目标样式变化导致 header 测量偏差，欢迎提 issue |
+| 缓存按钮突然变灰 | 开发过程中重新加载过 TurnRail：旧 ChatGPT 标签页失去 extension context（预期生命周期事件），导航与 Health 仍可用；刷新该 ChatGPT 页面即可恢复缓存 |
 
 ## 测试
 
@@ -331,7 +343,13 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   启动稳定性退避（恒定签名 3 扫即停 / 不稳定走满 / root 缺失不计稳定）。
   v1.2.1 增量：版本一致性、隐私合同（manifest 权限 / host / 运行时无网络原语）、
   Provider selector 边界、RootWatch 超时低频恢复、诊断导出隐私、打包清单一致性。
+  v1.2.3 增量：Cache Runtime Lifecycle 状态机 —— context probe 提前拦截、TOCTOU
+  catch 兜底、unknown 测试环境不误判、invalidation 后 100 轮全量 API storage
+  计数零增长（terminal circuit breaker）、probe 迟后失效拦截、transition 幂等。
 - `test/browser/`：Playwright 浏览器冒烟测试，直接自动化下列既有测试资产（无需登录 ChatGPT）。
+  v1.2.3 增量：console 分类统计（production 0 warn / 0 error；DEBUG 无 warning 级
+  invalidated 输出、console.debug lifecycle 恰 1 条）、storage 调用计数断言
+  （首次失效后 SPA 路由不重新触碰 chrome.storage）、被动失败不弹 UI 提示。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
