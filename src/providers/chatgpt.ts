@@ -3,6 +3,7 @@ import { debugLog } from '../utils/logger'
 import { fnv1a } from '../conversation/stableId'
 import type {
   ChatProvider,
+  ConversationContinuationCapability,
   LocatedMessage,
   LocatedTurn,
   LocatedTurnRoot,
@@ -28,6 +29,8 @@ export const SELECTORS = {
   assistantRole: '[data-conversation-role="assistant"]',
   assistantMarkdown: '[data-markdown-text-style="assistant-message"]',
   assistantMessage: '[data-chatgpt-selection-message-id]',
+  /** 新聊天输入框（Handoff draft 注入；只填草稿，绝不提交） */
+  composer: '#prompt-textarea',
   /** 站点标记为非正文（操作 UI 等）的节点 */
   skipContent: '[data-thread-find-skip="true"]'
 } as const
@@ -104,7 +107,7 @@ function inferLegacyRole(element: HTMLElement): ProviderRole {
   return 'unknown'
 }
 
-export class ChatGptProvider implements ChatProvider {
+export class ChatGptProvider implements ChatProvider, ConversationContinuationCapability {
   readonly name = 'chatgpt'
 
   private cachedScrollContainer: HTMLElement | null = null
@@ -439,5 +442,48 @@ export class ChatGptProvider implements ChatProvider {
 
   invalidateDomCache(): void {
     this.cachedScrollContainer = null
+  }
+
+  // ---------- ConversationContinuationCapability（Handoff draft 注入） ----------
+
+  getComposer(): HTMLElement | null {
+    return document.querySelector<HTMLElement>(SELECTORS.composer)
+  }
+
+  /**
+   * 只填草稿，绝不提交。contenteditable（ProseMirror 类）优先走
+   * execCommand('insertText')（框架可感知）；textarea 走 value + input 事件；
+   * 两者都失败才退回 textContent + 手动 input 事件。失败返回 false，
+   * 绝不让注入器产生假成功。
+   */
+  setComposerText(text: string): boolean {
+    const composer = this.getComposer()
+    if (!composer) return false
+    try {
+      if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+        composer.value = text
+        composer.dispatchEvent(new Event('input', { bubbles: true }))
+        return true
+      }
+      composer.focus()
+      const selection = window.getSelection()
+      if (selection) {
+        const range = document.createRange()
+        range.selectNodeContents(composer)
+        selection.removeAllRanges()
+        selection.addRange(range)
+      }
+      if (document.execCommand('insertText', false, text)) return true
+      composer.textContent = text
+      composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** 打开新聊天（用户点击链路内调用；不携带任何聊天内容，不经 URL 传正文） */
+  openNewConversation(): void {
+    window.open('https://chatgpt.com/', '_blank', 'noopener')
   }
 }

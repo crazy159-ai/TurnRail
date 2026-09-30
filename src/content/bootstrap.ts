@@ -17,9 +17,12 @@ import { DEBUG, debugLog, debugWarn, reportError } from '../utils/logger'
 import { debounce } from '../utils/debounce'
 import { ConversationCacheStore } from '../cache/cacheStore'
 import { CheckpointStore } from '../handoff/checkpointStore'
+import { PendingHandoffStore } from '../handoff/pendingStore'
+import { injectPendingHandoff } from '../handoff/injector'
 import { buildConversationHandoff } from '../handoff/builder'
 import { formatConversationHandoff } from '../handoff/formatter'
 import type { HandoffTurnSnapshot } from '../handoff/types'
+import type { ConversationContinuationCapability } from '../providers/types'
 import { serializeConversation } from '../cache/serializer'
 import { hydrateCachedConversation } from '../cache/hydrator'
 import { isLikelyStale } from '../cache/reconciler'
@@ -48,6 +51,7 @@ export function bootstrap(): void {
   const indexer = new ConversationIndexer(provider, store)
   const cacheStore = new ConversationCacheStore()
   const checkpointStore = new CheckpointStore()
+  const pendingHandoffStore = new PendingHandoffStore()
 
   const ui = createNavigationUi(provider, {
     onJump: (turnId) => void handleJump(turnId),
@@ -57,6 +61,7 @@ export function bootstrap(): void {
     isCheckpointed: (turnId) => isTurnCheckpointed(turnId),
     onOpenHandoff: () => handleOpenHandoff(),
     onHandoffCopy: (text) => void handleHandoffCopy(text),
+    onHandoffContinue: (text) => void handleHandoffContinue(text),
     onHandoffCancel: () => handleHandoffCancel()
   })
   document.body.appendChild(ui.host)
@@ -186,6 +191,74 @@ export function bootstrap(): void {
 
   function handleHandoffCancel(): void {
     ui.hideHandoffPreview()
+  }
+
+  // ---------- PendingHandoff：跨标签页注入（只填草稿，绝不自动发送） ----------
+
+  /** DEBUG 诊断元数据（纯数字，绝不含 payload；保存/注入后更新） */
+  let handoffPendingMeta: { pending: boolean; ageMs: number | null; characters: number | null } = {
+    pending: false,
+    ageMs: null,
+    characters: null
+  }
+
+  /** Provider 的会话延续能力（capability 探测，未实现返回 null） */
+  function getContinuationCapability(): ConversationContinuationCapability | null {
+    const candidate = provider as unknown as Partial<ConversationContinuationCapability>
+    if (
+      typeof candidate.getComposer === 'function' &&
+      typeof candidate.setComposerText === 'function' &&
+      typeof candidate.openNewConversation === 'function'
+    ) {
+      return candidate as ConversationContinuationCapability
+    }
+    return null
+  }
+
+  async function handleHandoffContinue(text: string): Promise<void> {
+    if (text.length === 0) return
+    // 先保存 pending 再开新标签页：保存失败绝不打开（避免"新页面无事发生"的假成功）
+    const saved = await pendingHandoffStore.save(text)
+    if (!saved) {
+      // storage 不可用（含 extension context invalidated）：回退剪贴板
+      await handleHandoffCopy(text)
+      ui.setStatus('无法自动传递到新标签页，已复制 Handoff，请手动粘贴到新聊天')
+      window.setTimeout(() => ui.setStatus(''), 4500)
+      return
+    }
+    handoffPendingMeta = { pending: true, ageMs: 0, characters: text.length }
+    ui.hideHandoffPreview()
+    getContinuationCapability()?.openNewConversation()
+    ui.setStatus('已打开新聊天，Handoff 将自动填入输入框（不会自动发送）')
+    window.setTimeout(() => ui.setStatus(''), 4500)
+  }
+
+  /** 注入互斥：resetForRoute 可能连续触发，避免并发双重注入 */
+  let handoffInjectInFlight = false
+
+  /**
+   * 新建聊天页（无会话 id）读取 pending handoff 并填入 composer。
+   * 会话路由直接跳过（不多一次 storage 读）；无 pending 时页面零行为。
+   */
+  async function maybeInjectPendingHandoff(): Promise<void> {
+    if (provider.getConversationId() !== null) return
+    if (handoffInjectInFlight) return
+    handoffInjectInFlight = true
+    try {
+      const startedAt = Date.now()
+      const result = await injectPendingHandoff(getContinuationCapability(), pendingHandoffStore)
+      if (result === 'injected') {
+        handoffPendingMeta = {
+          pending: false,
+          ageMs: Date.now() - startedAt,
+          characters: null
+        }
+        ui.setStatus('已填入上一段会话的 Handoff，请检查后手动发送')
+        window.setTimeout(() => ui.setStatus(''), 5000)
+      }
+    } finally {
+      handoffInjectInFlight = false
+    }
   }
 
   /** 仅当会话已被用户缓存时才调度自动保存（v1.1 不做全量自动缓存） */
@@ -574,6 +647,11 @@ export function bootstrap(): void {
     if (conversationId && cacheStore.isAvailable()) {
       void loadCachedConversation(conversationId)
     }
+
+    // 新建聊天 / 首页：检查是否有待注入的 Handoff（无 pending 时零行为）
+    if (conversationId === null) {
+      void maybeInjectPendingHandoff()
+    }
   }
 
   const stopRouteWatcher = createRouteWatcher(() => resetForRoute())
@@ -617,7 +695,12 @@ export function bootstrap(): void {
         store,
         cache: cacheStore,
         performance: perf.snapshot(),
-        markers: () => ui.host.shadowRoot?.querySelectorAll('.tn-marker').length ?? 0
+        markers: () => ui.host.shadowRoot?.querySelectorAll('.tn-marker').length ?? 0,
+        // Handoff 元数据（纯数字；payload / checkpoint 正文绝不进入诊断）
+        checkpointCount: currentCheckpointConversationId()
+          ? checkpointStore.count(currentCheckpointConversationId()!)
+          : 0,
+        handoff: { ...handoffPendingMeta }
       })
     }
 
@@ -645,6 +728,16 @@ export function bootstrap(): void {
             hydrateMs: lastHydrateMs,
             reconcileMs: lastReconcileMs,
             hydratedTurns: hydratedTurnIds?.size ?? null
+          },
+          // Handoff 元数据（纯数字：checkpoint 数 / pending 状态；
+          // handoff 文本与 checkpoint 正文绝不暴露）
+          handoff: {
+            checkpointCount: currentCheckpointConversationId()
+              ? checkpointStore.count(currentCheckpointConversationId()!)
+              : 0,
+            pending: handoffPendingMeta.pending,
+            ageMs: handoffPendingMeta.ageMs,
+            characters: handoffPendingMeta.characters
           },
           // 滚动几何（真实 ChatGPT 为 column-reverse：scrollTop ∈ [-extent, 0]）
           flexDirection: sc ? window.getComputedStyle(sc).flexDirection : null,

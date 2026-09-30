@@ -58,6 +58,26 @@ export interface ProviderDiagnostics {
 }
 
 /**
+ * 会话延续能力（Conversation Handoff 注入，可选 capability）：
+ * 只有具备"新聊天输入框"概念的 Provider 才实现；handoff / UI 模块只依赖
+ * 本接口，绝不允许出现任何站点 selector。未来新增 Provider 时按需实现。
+ */
+export interface ConversationContinuationCapability {
+  /** 新聊天 composer 元素；不存在 / 站点改版返回 null */
+  getComposer(): HTMLElement | null
+
+  /**
+   * 将 draft 文本写入 composer 并触发框架感知的 input 事件。
+   * 只填草稿 —— 绝不提交 / 点击发送（TurnRail 的硬性产品约束）。
+   * true = 写入真实完成。
+   */
+  setComposerText(text: string): boolean
+
+  /** 打开新聊天页面（必须在用户点击的同步链路中调用，避免弹窗拦截） */
+  openNewConversation(): void
+}
+
+/**
  * 站点适配层：所有"针对 ChatGPT DOM 的查询"必须集中在这里，
  * 其余模块只依赖本接口。站点改版时只改这个实现。
  */

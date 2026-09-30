@@ -25,6 +25,8 @@ export interface NavigationUiHandlers {
   onOpenHandoff: () => void
   /** 复制预览文本（text = textarea 当前内容，含用户手改） */
   onHandoffCopy: (text: string) => void
+  /** 确认在新聊天继续：保存 pending → 打开新标签页（只填草稿，绝不发送） */
+  onHandoffContinue: (text: string) => void
   /** 关闭预览（取消，无副作用） */
   onHandoffCancel: () => void
 }
@@ -79,6 +81,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     onToggleCheckpoint: handlers.onToggleCheckpoint,
     onOpenHandoff: handlers.onOpenHandoff,
     onHandoffCopy: handlers.onHandoffCopy,
+    onHandoffContinue: handlers.onHandoffContinue,
     onHandoffCancel: handlers.onHandoffCancel,
     onSearchInput: (query) => {
       searchQuery = query

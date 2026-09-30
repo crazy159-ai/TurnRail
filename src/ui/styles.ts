@@ -314,6 +314,14 @@ export const navigationCss = `
   border-color: var(--tn-accent);
   color: var(--tn-accent);
 }
+.tn-handoff-continue {
+  border-color: var(--tn-accent);
+  color: var(--tn-accent);
+  flex: 1;
+}
+.tn-handoff-continue:hover {
+  background: color-mix(in srgb, var(--tn-accent) 12%, transparent);
+}
 .tn-health[data-level="healthy"] .tn-health-score {
   color: var(--tn-accent);
 }

@@ -15,6 +15,8 @@ export interface OutlineHandlers {
   onOpenHandoff: () => void
   /** 复制预览文本（text = textarea 当前内容，含用户手改） */
   onHandoffCopy: (text: string) => void
+  /** 确认在新聊天继续：保存 pending → 打开新标签页（只填草稿，绝不发送） */
+  onHandoffContinue: (text: string) => void
   /** 关闭预览（无任何副作用；确认/取消均不产生 pending） */
   onHandoffCancel: () => void
 }
@@ -154,7 +156,14 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   handoffCancel.addEventListener('click', () => {
     handlers.onHandoffCancel()
   })
-  handoffActions.append(handoffCopy, handoffRegen, handoffCancel)
+  // 确认继续：在新标签页打开新聊天并自动"填入"输入框；TurnRail 绝不自动发送
+  const handoffContinue = document.createElement('button')
+  handoffContinue.type = 'button'
+  handoffContinue.className = 'tn-handoff-btn tn-handoff-continue'
+  handoffContinue.textContent = '在新聊天继续'
+  handoffContinue.title = '在新标签页打开 chatgpt.com 新聊天并自动填入输入框（不会自动发送）'
+  handoffContinue.addEventListener('click', () => handlers.onHandoffContinue(handoffText.value))
+  handoffActions.append(handoffCopy, handoffRegen, handoffContinue, handoffCancel)
   handoffView.append(handoffHead, handoffHint, handoffWarnings, handoffText, handoffActions)
 
   // 列表
