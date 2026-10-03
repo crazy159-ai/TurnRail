@@ -2,14 +2,16 @@ import { test, expect } from '@playwright/test'
 import { gotoWithDebug, readDebug, waitForMarkers, expectPoll } from './helpers'
 
 /**
- * Route Lifecycle 浏览器测试（B19–B27，规格 #37–#48）：
+ * Route Lifecycle 浏览器测试（B19–B31，规格 #37–#48 + eventual recovery）：
  * 测试台 test/mock/route.html —— 全部会话使用确定性 turn id、chrome.storage
  * 内存模拟、History.prototype 原生路由动作（绕过任何实例级 wrapper，等价
  * isolated world 中 MAIN world 页面自行导航）。
  *
  * 核心验收：event fast path 真正生效（不是 800ms/300ms 轮询蒙混）、
  * URL/DOM 时序竞态下旧内容绝不冒充新会话、rapid A→B→C 收敛、
- * 缓存 / Health / History / Handoff 严格会话隔离。
+ * 缓存 / Health / History / Handoff 严格会话隔离；以及 Phase B 最终
+ * 确定性恢复 —— fast 窗口耗尽后 DOM 迟到（same-root 原地换 / root 换代 /
+ * 慢加载）也必须零交互自动就绪，绝不永久卡在 Transition Gate（B28–B31）。
  */
 
 const MOCK = '/test/mock/route.html'
@@ -280,6 +282,106 @@ test('B27: PassiveTopWatch 隔离 —— A 的 reachedTop 不残留 B，B 重新
     true,
     15_000
   )
+})
+
+test('B28: late same-root swap —— DOM 在 fast 窗口后 2.5s 才原地换 B，零交互自动恢复', async ({
+  page
+}) => {
+  // 真实 P0 场景：URL=B 但 React 2.5s 后才 replaceChildren（root 不消失、
+  // 无 focus / visibility 变化）—— RootWatch 与事件恢复都打不到，只有
+  // Mutation Wake / Recovery Poll 能兜住（规格：VALID_NEW_DOM → EVENTUALLY READY）
+  await page.click('button[data-act="late-swap-b"]')
+
+  const mid = await readDebug(page)
+  expect(mid.routeLifecycle?.transitioning).toBe(true)
+  expect(mid.storeTurns).toBe(0)
+  expect(mid.markers).toBe(0)
+
+  // fast 窗口（~1.57s）耗尽后：仍不就绪、Store 仍空、进入低频恢复模式
+  await page.waitForTimeout(2200)
+  const mid2 = await readDebug(page)
+  expect(mid2.routeLifecycle?.transitioning).toBe(true)
+  expect(mid2.storeTurns).toBe(0)
+  expect(['mutation-wait', 'recovery-poll']).toContain(mid2.routeLifecycle?.transitionMode)
+
+  // t=2.5s：B DOM 原地换入 → 自动恢复（全程无点击 / 无切 tab / 无刷新）
+  await waitForMarkers(page, 24)
+  const end = await readDebug(page)
+  expect(end.routeLifecycle?.transitioning).toBe(false)
+  expect(end.routeLifecycle?.transitionMode).toBe('ready')
+  expect(end.markers).toBe(24)
+  const ids = await readStoreTurnIds(page)
+  expect(ids.every((id) => id.startsWith('kb-'))).toBe(true)
+})
+
+test('B29: DOM 先换成 B、route event 后到 —— previous 取 accepted A 签名，立即就绪', async ({
+  page
+}) => {
+  // A 已接受：accepted 基线必须已建立（DEBUG-only boolean，不含任何 ID）
+  await expectPoll(async () => (await readRouteLifecycle(page))?.acceptedSignaturePresent, true)
+
+  // Order B（规格 #23）：DOM → route event。若 previous 读 route-event 后的
+  // 当前 DOM（= B），则 previous == current → gate 永久等待（P0 根因 2）
+  await page.click('button[data-act="dom-first-b"]')
+
+  await waitForMarkers(page, 24)
+  const end = await readDebug(page)
+  expect(end.routeLifecycle?.transitioning).toBe(false)
+  expect(end.routeLifecycle?.acceptedSignaturePresent).toBe(true)
+  const ids = await readStoreTurnIds(page)
+  expect(ids.every((id) => id.startsWith('kb-'))).toBe(true)
+
+  // route event（~150ms）到达时首探测即 ready：远小于 fast 窗口
+  expect(end.routeLifecycle?.lastReadyMs ?? 9999).toBeLessThan(1500)
+})
+
+test('B30: 旧 root 保留 >2s 后移除并插入全新 root —— wake / recovery 识别 root 换代', async ({
+  page
+}) => {
+  await page.click('button[data-act="late-root-replace-b"]')
+
+  await page.waitForTimeout(400)
+  expect((await readDebug(page)).routeLifecycle?.transitioning).toBe(true)
+
+  // t=2.3s：旧 root remove + 新 root insert（fast 窗口已耗尽）
+  await waitForMarkers(page, 24, 15_000)
+  const end = await readDebug(page)
+  expect(end.routeLifecycle?.transitioning).toBe(false)
+  // 就绪必须由恢复路径驱动（mutation wake 或 recovery poll 二者其一）
+  expect(
+    (end.routeLifecycle?.mutationWakeCount ?? 0) + (end.routeLifecycle?.recoveryProbeCount ?? 0)
+  ).toBeGreaterThanOrEqual(1)
+  const ids = await readStoreTurnIds(page)
+  expect(ids.every((id) => id.startsWith('kb-'))).toBe(true)
+  expect(end.markers).toBe(24)
+})
+
+test('B31: DOM 延迟 4.5s（超所有 fast probe）—— 不 focus / 不切 tab，transitioning 最终必然 false', async ({
+  page
+}) => {
+  await page.click('button[data-act="very-slow-native-b"]')
+
+  const mid = await readDebug(page)
+  expect(mid.routeLifecycle?.transitioning).toBe(true)
+  expect(mid.storeTurns).toBe(0)
+
+  // t≈2.2s：fast 已耗尽、无任何用户交互 —— gate 必须仍活着而不是死等
+  await page.waitForTimeout(2000)
+  const mid2 = await readDebug(page)
+  expect(mid2.routeLifecycle?.transitioning).toBe(true)
+  expect(mid2.storeTurns).toBe(0)
+  expect(['mutation-wait', 'recovery-poll']).toContain(mid2.routeLifecycle?.transitionMode)
+  // 低干扰 footer 提示（>1.2s 未就绪；无 toast / 无 spinner）
+  expect(await page.locator('.tn-status').textContent()).toBe('正在同步当前对话…')
+
+  // t=4.5s DOM 到达 → 最终就绪（真实用户"侧边栏一直不加载"的最终防线）
+  await waitForMarkers(page, 24)
+  const end = await readDebug(page)
+  expect(end.routeLifecycle?.transitioning).toBe(false)
+  expect(end.routeLifecycle?.transitionMode).toBe('ready')
+  expect(await page.locator('.tn-status').textContent()).toBe('')
+  const ids = await readStoreTurnIds(page)
+  expect(ids.every((id) => id.startsWith('kb-'))).toBe(true)
 })
 
 test('Route 隐私合同: routeLifecycle 元数据不含会话 ID / URL（规格 #56/#57）', async ({

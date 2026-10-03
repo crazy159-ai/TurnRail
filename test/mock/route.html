@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>Route Lifecycle Mock — TurnRail 浏览器测试台（B19–B27）</title>
+<title>Route Lifecycle Mock — TurnRail 浏览器测试台（B19–B31）</title>
 <style>
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -46,6 +46,10 @@
   <button data-act="native-home">native→/</button>
   <button data-act="native-deep72">native→deep72</button>
   <button data-act="slow-native-b">native→B（DOM 延迟 300ms）</button>
+  <button data-act="very-slow-native-b">native→B（DOM 延迟 4.5s）</button>
+  <button data-act="late-swap-b">native→B（DOM 迟 2.5s 原地换）</button>
+  <button data-act="dom-first-b">native→B（DOM 先换，URL 后到）</button>
+  <button data-act="late-root-replace-b">native→B（迟 2.3s 换 root 元素）</button>
   <button data-act="reuse-root-b">native→B（root 原地换内容）</button>
   <button data-act="query-same">同会话 ?temporary=1</button>
   <button data-act="hash-same">同会话 #something</button>
@@ -103,7 +107,8 @@
   window.addEventListener('unhandledrejection', () => { window.__tnErrCount++ })
 
   const scroller = document.getElementById('scroller')
-  const thread = document.getElementById('thread')
+  // B30 会整体替换 #thread 元素（旧 root 移除 + 新 root 插入），必须可重绑
+  let thread = document.getElementById('thread')
   const routeLabel = document.getElementById('route')
   const logEl = document.getElementById('log')
 
@@ -299,6 +304,21 @@
 
   // ---------- 动作分发 ----------
   let slowSwapTimer = 0
+  let domFirstTimer = 0
+  /** B20/B31 共用：URL 先行，DOM 延迟 delayMs 后按当前路由重建（路由被取代则放弃） */
+  function scheduleSlowSwap(delayMs, label) {
+    nativePushState(CONVERSATIONS.b.path)
+    logAction(label + ': URL=B，DOM ' + delayMs + 'ms 后到达')
+    clearTimeout(slowSwapTimer)
+    slowSwapTimer = setTimeout(() => {
+      if (location.pathname !== CONVERSATIONS.b.path) {
+        logAction(label + ': 渲染已被取代，放弃 B DOM')
+        return
+      }
+      syncDomToRoute()
+      logAction(label + ': B DOM 已挂载')
+    }, delayMs)
+  }
   document.body.addEventListener('click', (event) => {
     const act = event.target?.dataset?.act
     if (!act) return
@@ -315,18 +335,52 @@
       case 'native-home': nativePushState('/'); syncDomToRoute(); break
       case 'native-deep72': nativePushState(DEEP_PATH); syncDomToRoute(); break
       // B20/B22：URL 先行，DOM 延迟 300ms；若路由已被取代（B22 切 C）则放弃渲染
-      case 'slow-native-b':
+      case 'slow-native-b': scheduleSlowSwap(300, 'slow-native-b'); break
+      // B31：DOM 延迟 4.5s —— 超过全部 fast probe（~1.57s），验证最终确定性恢复
+      case 'very-slow-native-b': scheduleSlowSwap(4500, 'very-slow-native-b'); break
+      // B28：URL 先行，DOM 保持 A 至 2500ms 后 same-root 原地换内容
+      //（root 不消失、无 focus / visibility 变化 —— RootWatch 与事件恢复都打不到的窗口）
+      case 'late-swap-b':
         nativePushState(CONVERSATIONS.b.path)
-        logAction('slow-native-b: URL=B，DOM 300ms 后到达')
+        logAction('late-swap-b: URL=B，DOM 保持 A 至 2500ms')
         clearTimeout(slowSwapTimer)
         slowSwapTimer = setTimeout(() => {
           if (location.pathname !== CONVERSATIONS.b.path) {
-            logAction('slow-native-b: 渲染已被取代，放弃 B DOM')
+            logAction('late-swap-b: 渲染已被取代，放弃 B DOM')
             return
           }
-          syncDomToRoute()
-          logAction('slow-native-b: B DOM 已挂载')
-        }, 300)
+          thread.replaceChildren(buildTurns(CONVERSATIONS.b))
+          logAction('late-swap-b: B DOM 已原地换入')
+        }, 2500)
+        break
+      // B29：DOM 先换成 B，route event 150ms 后才到（规格 #23 Order B 合法顺序）
+      case 'dom-first-b':
+        clearTimeout(domFirstTimer)
+        thread.replaceChildren(buildTurns(CONVERSATIONS.b))
+        logAction('dom-first-b: B DOM 已换入，150ms 后 URL 才切换')
+        domFirstTimer = setTimeout(() => {
+          nativePushState(CONVERSATIONS.b.path)
+          logAction('dom-first-b: route event 已送达')
+        }, 150)
+        break
+      // B30：旧 root 元素保留 >2s 后被移除，插入全新 root 元素（root 换代而非内容换代）
+      case 'late-root-replace-b':
+        nativePushState(CONVERSATIONS.b.path)
+        logAction('late-root-replace-b: 旧 root 保留至 2300ms')
+        clearTimeout(slowSwapTimer)
+        slowSwapTimer = setTimeout(() => {
+          if (location.pathname !== CONVERSATIONS.b.path) {
+            logAction('late-root-replace-b: 渲染已被取代，放弃 B DOM')
+            return
+          }
+          const fresh = document.createElement('div')
+          fresh.id = 'thread'
+          fresh.dataset.threadFindTarget = 'conversation'
+          fresh.appendChild(buildTurns(CONVERSATIONS.b))
+          thread.replaceWith(fresh)
+          thread = fresh
+          logAction('late-root-replace-b: 旧 root 已移除并插入新 root')
+        }, 2300)
         break
       // B21：root（#thread）复用，仅 replaceChildren 原地换内容
       case 'reuse-root-b':
