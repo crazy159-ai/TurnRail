@@ -8,6 +8,18 @@ export interface TnDebug {
   userUnits: number
   assistantUnits: number
   providerMode: string
+  routeLifecycle?: {
+    generation: number
+    conversationIdPresent: boolean
+    transitioning: boolean
+    lastSource: string | null
+    lastReadyMs: number | null
+    detected: number
+    duplicateIgnored: number
+    navigationApiSignals: number
+    pollSignals: number
+    transitions: number
+  }
   historyCoverage?: {
     indexedTurns: number
     fullUserTurns: number

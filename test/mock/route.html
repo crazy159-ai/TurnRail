@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Route Lifecycle Mock — TurnRail 浏览器测试台（B19–B27）</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; display: flex; background: #ffffff; color: #0d0d0d; }
+  aside { width: 240px; flex: none; border-right: 1px solid rgba(0,0,0,.08); padding: 12px; display: flex; flex-direction: column; gap: 8px; background: #f9f9f9; }
+  aside button { text-align: left; padding: 8px 10px; border-radius: 8px; border: 0; background: transparent; cursor: pointer; color: inherit; font-size: 13px; }
+  aside button:hover { background: rgba(0,0,0,.06); }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  header { height: 52px; flex: none; position: sticky; top: 0; z-index: 10; display: flex; align-items: center; padding: 0 24px; font-weight: 600; background: rgba(255,255,255,.85); border-bottom: 1px solid rgba(0,0,0,.06); }
+  #scroller { flex: 1; overflow-y: auto; padding: 8px 0 120px; }
+  #thread { max-width: 760px; margin: 0 auto; padding: 0 24px; display: flex; flex-direction: column; gap: 18px; }
+  [data-turn-key] { border-radius: 14px; }
+  [data-user-message-bubble] { background: #f4f4f4; border-radius: 14px; padding: 10px 16px; margin-left: auto; max-width: 70%; width: fit-content; }
+  [data-markdown-text-tone="user-message"] { white-space: pre-wrap; word-break: break-word; }
+  [data-markdown-text-style="assistant-message"] p { margin: 0.4em 0; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  #toolbar { position: fixed; left: 250px; top: 8px; z-index: 500; display: flex; flex-wrap: wrap; gap: 6px; background: rgba(20,90,70,.08); border: 1px solid rgba(16,163,127,.35); padding: 6px; border-radius: 10px; }
+  #toolbar button { font-size: 12px; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(16,163,127,.4); background: #fff; cursor: pointer; }
+  #route { position: fixed; left: 250px; bottom: 8px; z-index: 500; font-size: 11px; opacity: .6; }
+  #log { position: fixed; right: 8px; bottom: 8px; z-index: 500; font-size: 11px; opacity: .6; max-width: 320px; }
+</style>
+</head>
+<body>
+<aside>
+  <strong style="font-size:13px">Route Lifecycle Mock</strong>
+  <button data-act="conv-a">会话 A（wrapped pushState）</button>
+  <button data-act="conv-b">会话 B（wrapped pushState）</button>
+  <button data-act="home">首页（wrapped）</button>
+  <button data-act="deep72">长会话 deep72（wrapped）</button>
+</aside>
+<main>
+  <header id="topbar">Route Lifecycle Mock — sticky header</header>
+  <div id="scroller" data-app-action-timeline-scroll class="overflow-y-auto">
+    <div id="thread" data-thread-find-target="conversation"></div>
+  </div>
+</main>
+<div id="toolbar">
+  <button data-act="native-a">native→A</button>
+  <button data-act="native-b">native→B</button>
+  <button data-act="native-c">native→C</button>
+  <button data-act="native-home">native→/</button>
+  <button data-act="native-deep72">native→deep72</button>
+  <button data-act="slow-native-b">native→B（DOM 延迟 300ms）</button>
+  <button data-act="reuse-root-b">native→B（root 原地换内容）</button>
+  <button data-act="query-same">同会话 ?temporary=1</button>
+  <button data-act="hash-same">同会话 #something</button>
+  <button data-act="new-chat-send">新聊天首条消息（/ → /c/new）</button>
+  <button data-act="add1">+1 轮</button>
+  <button data-act="clear">清空</button>
+</div>
+<div id="route">route: ?</div>
+<div id="log"></div>
+
+<script>
+  // ============ chrome.storage.local 内存模拟（B26 缓存隔离测试） ============
+  // 必须在 content.js 之前定义：CacheStore 构造期 detectChromeLocalStorage() 探测。
+  // context probe 读 chrome.runtime.id → 'alive'。
+  const memStore = new Map()
+  // 可控读延迟：{ key, delayMs } —— 模拟"cache read 迟到"竞态（规格 #47/B26）
+  const cacheControl = { delayKey: null, delayMs: 0 }
+  window.__tnCacheControl = cacheControl
+  const clone = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)))
+  window.chrome = {
+    runtime: { id: 'turnrail-route-mock-extension' },
+    storage: {
+      local: {
+        async get(key) {
+          const k = typeof key === 'string' ? key : Object.keys(key ?? {})[0]
+          if (cacheControl.delayKey && k === cacheControl.delayKey && cacheControl.delayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, cacheControl.delayMs))
+          }
+          const out = {}
+          if (memStore.has(k)) out[k] = clone(memStore.get(k))
+          return out
+        },
+        async set(items) {
+          for (const [k, v] of Object.entries(items)) memStore.set(k, clone(v))
+        },
+        async remove(key) {
+          memStore.delete(key)
+        }
+      }
+    }
+  }
+</script>
+<script src="/dist/content.js"></script>
+<script>
+  // ================= 模拟 2026-09 真实 ChatGPT DOM（路由生命周期测试台） =================
+  // 与 index.html 的关键差异：
+  // 1. 全部会话使用确定性 turn id（缓存预置 / cache hydrate 对齐的前提）
+  // 2. 提供 native（History.prototype）路由动作 —— 绕过任何实例级 pushState
+  //    wrapper，等价 isolated world 中 MAIN world 页面自行导航（规格 #37/#38）
+  // 3. popstate 同步重建 DOM（模拟 ChatGPT 对前进 / 后退的重渲染，B25）
+  // 4. slow-native-b：URL 先行、DOM 延迟 300ms（规格 #14/#41/B20）
+  // 5. reuse-root-b：root 元素复用、replaceChildren 原地换内容（规格 #21/B21）
+  window.__tnErrCount = 0
+  window.addEventListener('error', () => { window.__tnErrCount++ })
+  window.addEventListener('unhandledrejection', () => { window.__tnErrCount++ })
+
+  const scroller = document.getElementById('scroller')
+  const thread = document.getElementById('thread')
+  const routeLabel = document.getElementById('route')
+  const logEl = document.getElementById('log')
+
+  function logAction(message) {
+    logEl.textContent = message
+  }
+
+  // ---------- 会话定义（确定性 id） ----------
+  const CONVERSATIONS = {
+    a: { path: '/c/mock-aaaa-1111-4444', count: 12, prefix: 'ka' },
+    b: { path: '/c/mock-bbbb-2222-4444', count: 24, prefix: 'kb' },
+    c: { path: '/c/mock-cccc-3333-4444', count: 6, prefix: 'kc' },
+    'new': { path: '/c/mock-new-9999-4444', count: 1, prefix: 'kn' }
+  }
+  const CACHE_KEY_A = 'turnrail:conversation:chatgpt:mock-aaaa-1111-4444'
+
+  let turnCounter = 0
+
+  function makeTurn(turnId, userText, assistantText) {
+    turnCounter++
+    const turnRoot = document.createElement('div')
+    turnRoot.dataset.turnKey = turnId
+
+    const inner = document.createElement('div')
+    inner.dataset.contentSearchTurnKey = `fallback-turn-${turnCounter}`
+
+    const userUnit = document.createElement('div')
+    userUnit.dataset.chatgptSearchUnitKey = `fallback-turn-${turnCounter}:0:user`
+    userUnit.dataset.chatgptSearchMessageIds = turnId
+    const bubble = document.createElement('div')
+    bubble.dataset.userMessageBubble = 'true'
+    const userMd = document.createElement('div')
+    userMd.dataset.markdownTextTone = 'user-message'
+    userMd.textContent = userText
+    bubble.appendChild(userMd)
+    userUnit.appendChild(bubble)
+
+    const assistantUnit = document.createElement('div')
+    assistantUnit.dataset.chatgptSearchUnitKey = `fallback-turn-${turnCounter}:2:assistant`
+    assistantUnit.dataset.chatgptSearchMessageIds = `${turnId}-a ${turnId}-a`
+    const h4 = document.createElement('h4')
+    h4.dataset.conversationRole = 'assistant'
+    h4.className = 'sr-only'
+    h4.textContent = 'Assistant'
+    const selection = document.createElement('div')
+    selection.dataset.chatgptSelectionMessageId = `${turnId}-a`
+    const assistantMd = document.createElement('div')
+    assistantMd.dataset.markdownTextStyle = 'assistant-message'
+    const p = document.createElement('p')
+    p.textContent = assistantText
+    assistantMd.appendChild(p)
+    selection.appendChild(assistantMd)
+    assistantUnit.append(h4, selection)
+
+    inner.append(userUnit, assistantUnit)
+    turnRoot.appendChild(inner)
+    return turnRoot
+  }
+
+  function buildTurns(spec) {
+    const frag = document.createDocumentFragment()
+    for (let i = 1; i <= spec.count; i++) {
+      const id = `${spec.prefix}-${String(i).padStart(3, '0')}`
+      frag.appendChild(makeTurn(id, `Q${i}: 会话 ${spec.prefix} 的第 ${i} 个问题`, `A${i}: 对应的模拟回复。`))
+    }
+    return frag
+  }
+
+  function clearThread() {
+    stopDeepSimulation()
+    thread.replaceChildren()
+  }
+
+  // ---------- 会话 DOM 应用（同步；popstate / 普通切换共用） ----------
+  function applyConversation(name) {
+    stopDeepSimulation()
+    if (name === 'home') {
+      thread.replaceChildren()
+      return
+    }
+    const spec = CONVERSATIONS[name]
+    thread.replaceChildren(buildTurns(spec))
+  }
+
+  // ---------- 长会话 deep72（B27 被动到顶证据：12 挂载 + 懒加载） ----------
+  const DEEP_PATH = '/c/mock-deep-7777-4444'
+  const DEEP_TOTAL = 72
+  const DEEP_WINDOW = 12
+  let pendingDeepHistory = []
+  let deepLazyTimer = 0
+
+  function stopDeepSimulation() {
+    if (deepLazyTimer) { clearInterval(deepLazyTimer); deepLazyTimer = 0 }
+    pendingDeepHistory = []
+  }
+
+  function applyConversationDeep() {
+    stopDeepSimulation()
+    thread.replaceChildren()
+    const all = []
+    for (let i = 1; i <= DEEP_TOTAL; i++) {
+      const id = `kd-${String(i).padStart(3, '0')}`
+      all.push(makeTurn(id, `Q${i}: 长会话深度历史问题 ${i}，内容足够长以产生滚动距离。`, `A${i}: 长会话回复 ${i}。`))
+    }
+    const mounted = all.slice(DEEP_TOTAL - DEEP_WINDOW)
+    pendingDeepHistory = all.slice(0, DEEP_TOTAL - DEEP_WINDOW)
+    const frag = document.createDocumentFragment()
+    for (const node of mounted) frag.appendChild(node)
+    thread.appendChild(frag)
+    requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight })
+    // 懒加载：接近顶部时 prepend 更旧历史（纯 mock 行为；TurnRail 绝不主动滚动）
+    deepLazyTimer = setInterval(() => {
+      if (pendingDeepHistory.length === 0) { clearInterval(deepLazyTimer); deepLazyTimer = 0; return }
+      if (scroller.scrollTop > 160) return
+      const before = scroller.scrollHeight
+      const batch = pendingDeepHistory.splice(0, 8)
+      const frag2 = document.createDocumentFragment()
+      for (const node of batch) frag2.appendChild(node)
+      thread.prepend(frag2)
+      scroller.scrollTop += scroller.scrollHeight - before
+    }, 250)
+  }
+
+  // ---------- 路由动作 ----------
+  // native：History.prototype 直呼 —— 即便存在实例级 wrapper 也完全绕开，
+  // 等价真实浏览器中 MAIN world 页面的导航方式（规格 #37）
+  function nativePushState(path) {
+    History.prototype.pushState.call(history, null, '', path)
+    routeLabel.textContent = 'route: ' + path
+  }
+  function wrappedPushState(path) {
+    history.pushState(null, '', path)
+    routeLabel.textContent = 'route: ' + path
+  }
+
+  function conversationNameForPath(path) {
+    for (const [name, spec] of Object.entries(CONVERSATIONS)) {
+      if (path.startsWith(spec.path)) return name
+    }
+    if (path.startsWith(DEEP_PATH)) return 'deep'
+    return 'home'
+  }
+
+  /** popstate / 普通点击共用的"按当前路由重建 DOM" */
+  function syncDomToRoute() {
+    const path = location.pathname
+    const name = conversationNameForPath(path)
+    if (name === 'deep') applyConversationDeep()
+    else applyConversation(name)
+  }
+
+  // 前进 / 后退：URL 变化 + DOM 重建（模拟 ChatGPT 对 traversal 的重渲染）
+  window.addEventListener('popstate', () => {
+    routeLabel.textContent = 'route: ' + location.pathname + location.search + location.hash
+    syncDomToRoute()
+  })
+
+  // ---------- 缓存预置（B26）：A 会话的确定性 id 与 Live 完全一致 ----------
+  function seedConversationCache(conversationId, spec) {
+    const key = `turnrail:conversation:chatgpt:${conversationId}`
+    const now = Date.now()
+    const turns = []
+    for (let i = 1; i <= spec.count; i++) {
+      const title = `Q${i}: 会话 ${spec.prefix} 的第 ${i} 个问题`
+      turns.push({ id: `${spec.prefix}-${String(i).padStart(3, '0')}`, index: i - 1, title, preview: title })
+    }
+    memStore.set(key, {
+      schemaVersion: 1,
+      provider: 'chatgpt',
+      conversationId,
+      createdAt: now - 86_400_000,
+      updatedAt: now - 3_600_000,
+      lastAccessAt: now - 3_600_000,
+      turnCount: turns.length,
+      complete: false,
+      pinned: true,
+      turns
+    })
+    const indexKey = 'turnrail:cache:index'
+    const index = memStore.get(indexKey) ?? {}
+    index[key] = {
+      provider: 'chatgpt',
+      conversationId,
+      updatedAt: now - 3_600_000,
+      lastAccessAt: now - 3_600_000,
+      turnCount: turns.length,
+      complete: false,
+      pinned: true
+    }
+    memStore.set(indexKey, index)
+  }
+  seedConversationCache('mock-aaaa-1111-4444', CONVERSATIONS.a)
+
+  // ---------- 动作分发 ----------
+  let slowSwapTimer = 0
+  document.body.addEventListener('click', (event) => {
+    const act = event.target?.dataset?.act
+    if (!act) return
+    switch (act) {
+      // wrapped（经 history.pushState 实例调用）
+      case 'conv-a': wrappedPushState(CONVERSATIONS.a.path); syncDomToRoute(); break
+      case 'conv-b': wrappedPushState(CONVERSATIONS.b.path); syncDomToRoute(); break
+      case 'home': wrappedPushState('/'); syncDomToRoute(); break
+      case 'deep72': wrappedPushState(DEEP_PATH); syncDomToRoute(); break
+      // native（History.prototype：绕过任何实例 wrapper，规格 #37/#38）
+      case 'native-a': nativePushState(CONVERSATIONS.a.path); syncDomToRoute(); break
+      case 'native-b': nativePushState(CONVERSATIONS.b.path); syncDomToRoute(); break
+      case 'native-c': nativePushState(CONVERSATIONS.c.path); syncDomToRoute(); break
+      case 'native-home': nativePushState('/'); syncDomToRoute(); break
+      case 'native-deep72': nativePushState(DEEP_PATH); syncDomToRoute(); break
+      // B20/B22：URL 先行，DOM 延迟 300ms；若路由已被取代（B22 切 C）则放弃渲染
+      case 'slow-native-b':
+        nativePushState(CONVERSATIONS.b.path)
+        logAction('slow-native-b: URL=B，DOM 300ms 后到达')
+        clearTimeout(slowSwapTimer)
+        slowSwapTimer = setTimeout(() => {
+          if (location.pathname !== CONVERSATIONS.b.path) {
+            logAction('slow-native-b: 渲染已被取代，放弃 B DOM')
+            return
+          }
+          syncDomToRoute()
+          logAction('slow-native-b: B DOM 已挂载')
+        }, 300)
+        break
+      // B21：root（#thread）复用，仅 replaceChildren 原地换内容
+      case 'reuse-root-b':
+        nativePushState(CONVERSATIONS.b.path)
+        thread.replaceChildren(buildTurns(CONVERSATIONS.b))
+        break
+      // B23：同会话 query / hash 变化 —— DOM 完全不动
+      case 'query-same':
+        nativePushState(CONVERSATIONS.a.path + '?temporary=1')
+        break
+      case 'hash-same':
+        nativePushState(CONVERSATIONS.a.path + '#something')
+        break
+      // B24：新聊天首条消息 —— / → /c/<new-id> + 1 turn
+      case 'new-chat-send':
+        nativePushState(CONVERSATIONS['new'].path)
+        applyConversation('new')
+        break
+      case 'add1': {
+        const name = conversationNameForPath(location.pathname)
+        if (name !== 'home' && name !== 'deep') {
+          const spec = CONVERSATIONS[name]
+          spec.count++
+          const id = `${spec.prefix}-${String(spec.count).padStart(3, '0')}`
+          thread.appendChild(makeTurn(id, `Q${spec.count}: 追加的问题`, `A${spec.count}: 追加的回复。`))
+        }
+        break
+      }
+      case 'clear': clearThread(); break
+    }
+  })
+
+  // 初始：落在会话 A 路由（模拟用户刷新在会话页）
+  History.prototype.replaceState.call(history, null, '', CONVERSATIONS.a.path)
+  routeLabel.textContent = 'route: ' + CONVERSATIONS.a.path
+  applyConversation('a')
+
+  // 测试钩子（纯计数 / 元数据，无正文）
+  window.__deep = {
+    pendingHistoryCount: () => pendingDeepHistory.length
+  }
+</script>
+</body>
+</html>

@@ -261,7 +261,7 @@ test('合同: preview → full 即使文本完全相同也广播 coverage 事件
   )
 })
 
-test('合同: preview → full 文本同时变化时按 user-text 优先上报，组合键仍变化', () => {
+test('合同: preview → full 与文本变化同批时补推 coverage（规格 #36 混合变更封板）', () => {
   const store = new ConversationStore()
   store.reset('conv-1')
   hydrateCachedConversation(store, previewOnlyCache('conv-1', [['q1', '截断的旧预览']]))
@@ -273,11 +273,13 @@ test('合同: preview → full 文本同时变化时按 user-text 优先上报�
   const indexer = new ConversationIndexer(provider, store)
   indexer.scan(true)
 
-  assert.deepEqual(events, ['user-text'])
+  // 主事件 user-text（健康重算语义）+ 补推 coverage（覆盖度 / footer 语义）：
+  // 不能因为 primary event 是 user-text 就漏掉 coverageRevision（规格 #36）
+  assert.deepEqual(events, ['user-text', 'coverage'])
   assert.equal(store.turns[0]!.user?.contentCompleteness, 'full')
-  // 健康缓存键 = semanticRevision + coverageRevision 组合：
-  // user-text 推进 semantic，组合键必然变化 → 覆盖度提升不会漏检
-  assert.equal(store.coverageRevision, 0)
+  // 健康缓存键 = conversationKey + semantic + coverage 组合：
+  // 两个修订号都必须推进，覆盖度提升对任何下游消费方都不漏检
+  assert.equal(store.coverageRevision, 1)
   assert.equal(store.semanticRevision, 1)
 })
 
