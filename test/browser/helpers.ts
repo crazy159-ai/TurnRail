@@ -8,9 +8,36 @@ export interface TnDebug {
   userUnits: number
   assistantUnits: number
   providerMode: string
+  routeLifecycle?: {
+    generation: number
+    conversationIdPresent: boolean
+    transitioning: boolean
+    transitionMode: 'fast' | 'mutation-wait' | 'recovery-poll' | 'ready'
+    transitionProbeCount: number
+    recoveryProbeCount: number
+    mutationWakeCount: number
+    acceptedSignaturePresent: boolean
+    lastSource: string | null
+    lastReadyMs: number | null
+    detected: number
+    duplicateIgnored: number
+    navigationApiSignals: number
+    pollSignals: number
+    transitions: number
+  }
+  historyCoverage?: {
+    indexedTurns: number
+    fullUserTurns: number
+    previewUserTurns: number
+    fullAssistantTurns: number
+    missingAssistantTurns: number
+    reachedTop: boolean
+    state: 'complete' | 'partial' | 'unknown'
+  }
   performance: {
     indexer: { fullScans: number; incrementalScans: number; fallbackFullScans: number; skippedTurns: number }
     observer: { assistantStreamIgnored: number; mutationRecords: number }
+    health: { analyzes: number }
   } | null
   cache: Record<string, unknown>
   flexDirection: string | null

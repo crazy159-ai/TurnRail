@@ -17,6 +17,15 @@ export interface CaptureResult {
   reachedTop: boolean
 }
 
+export interface CaptureOptions {
+  /**
+   * 会话过期检测（规格 #25/#26：generation 贯穿全部 async path）。
+ * 每次循环迭代前调用；返回 true = 路由已切换，立即中止 —— 迟到的捕获
+   * 绝不把旧会话 DOM 扫进新会话 Store，也绝不把旧阅读位置恢复到新容器。
+   */
+  isStale?: () => boolean
+}
+
 /**
  * Level 2 全量历史捕获（用户主动触发，不自动运行）：
  * 记录阅读位置 → 渐进向上滚动 → 等待懒加载 → 收获 → 到顶或无新增即停止 → 恢复阅读位置。
@@ -26,12 +35,13 @@ export async function captureFullHistory(
   provider: ChatProvider,
   indexer: ConversationIndexer,
   store: ConversationStore,
-  onProgress?: (message: string) => void
+  onProgress?: (message: string) => void,
+  options?: CaptureOptions
 ): Promise<CaptureResult> {
   if (captureRunning) return { addedTurns: -1, reachedTop: false }
   captureRunning = true
   try {
-    return await runCapture(provider, indexer, store, onProgress)
+    return await runCapture(provider, indexer, store, onProgress, options)
   } finally {
     captureRunning = false
   }
@@ -41,7 +51,8 @@ async function runCapture(
   provider: ChatProvider,
   indexer: ConversationIndexer,
   store: ConversationStore,
-  onProgress?: (message: string) => void
+  onProgress?: (message: string) => void,
+  options?: CaptureOptions
 ): Promise<CaptureResult> {
   const container = provider.getScrollContainer()
   if (!container) return { addedTurns: 0, reachedTop: false }
@@ -57,6 +68,9 @@ async function runCapture(
 
   for (let i = 0; i < maxIters; i++) {
     if (Date.now() > deadline) break
+    // 路由已切换：立即中止。跳过恢复滚动与收尾扫描 —— 旧会话的锚点 / DOM
+    // 绝不影响新会话（isStale 由 bootstrap 以 conversationGeneration 实现）
+    if (options?.isStale?.()) return { addedTurns: 0, reachedTop: false }
 
     indexer.scan()
     const topTurn = store.turns.find((turn) => turn.user?.element?.isConnected)

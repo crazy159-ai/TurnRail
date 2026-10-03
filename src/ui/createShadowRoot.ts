@@ -37,6 +37,8 @@ export interface NavigationUi {
   setActive(turnId: string | undefined): void
   handleReset(): void
   setStatus(text: string): void
+  /** 静态历史覆盖状态（footer 文本，如"历史 72 · 部分"） */
+  setHistoryStatus(text: string): void
   setBusy(busy: boolean): void
   /** 当前会话是否已缓存（★/☆） */
   setCached(cached: boolean): void
@@ -155,23 +157,28 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
   }
 
   let outlineDirty = false
-  // 健康重算以 Store 的 semanticRevision 为准（structure / user-text 递增）：
-  // - assistant 流式（assistant-text）与纯元素绑定（elements）不推进修订号，
+  // 健康重算以 conversationKey + semanticRevision + coverageRevision 组合为键（规格 #28）：
+  // - assistant 流式（assistant-text）与纯元素绑定（elements）不推进任何修订号，
   //   物理上不会触发重算 —— 流式优化合同由事件语义保证，无需拼接全文 signature；
-  // - 历史上用"末轮全文 signature"去重，既复制 prompt 又漏检早期 turn 的修改。
-  let lastHealthRevision = -1
+  // - coverage（preview → full）即使文本与 preview 完全相同也推进 coverageRevision，
+  //   健康覆盖度 / 置信度必须随之重算 —— 缓存的低置信度提示随之解除；
+  // - 历史上用"末轮全文 signature"去重，既复制 prompt 又漏检早期 turn 的修改；
+  // - conversationKey 前缀保证跨会话绝无误复用：即使两个会话的修订号巧合相同
+  //   （A:3:2 vs B:3:2），key 也必然不同 —— Health 状态严格会话隔离。
+  let lastHealthKey = ''
   let lastHealthSnapshot: ConversationHealthSnapshot | null = null
 
   function renderHealth(): void {
     const store = storeRef
     if (!store) {
       outline.setHealth(null)
-      lastHealthRevision = -1
+      lastHealthKey = ''
       lastHealthSnapshot = null
       return
     }
-    if (store.semanticRevision === lastHealthRevision) return
-    lastHealthRevision = store.semanticRevision
+    const key = `${store.conversationKey}:${store.semanticRevision}:${store.coverageRevision}`
+    if (key === lastHealthKey) return
+    lastHealthKey = key
     perf.markHealthAnalyze()
     lastHealthSnapshot = analyzeConversationHealth(store.turns)
     outline.setHealth(lastHealthSnapshot)
@@ -288,9 +295,11 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
       outline.setCount(store.turns.filter((turn) => turn.user).length)
       refreshScrollListener()
     }
-    // 健康重算：structure / user-text 触发；'assistant-text'（流式快路径）
-    // 与 'elements'（纯 DOM 绑定）绝不重算 —— 由 semanticRevision 去重兜底
-    if (kind === 'structure' || kind === 'user-text') renderHealth()
+    // coverage（preview → full）不改几何 / 数量，只需刷新目录标记（面板关闭时转 dirty）
+    if (kind === 'coverage') renderList()
+    // 健康重算：structure / user-text / coverage 触发；'assistant-text'（流式快路径）
+    // 与 'elements'（纯 DOM 绑定）绝不重算 —— 由修订号组合键去重兜底
+    if (kind === 'structure' || kind === 'user-text' || kind === 'coverage') renderHealth()
   }
 
   function setActive(turnId: string | undefined): void {
@@ -324,12 +333,13 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     outline.clearSearch()
     outline.close()
     outline.setStatus('')
+    outline.setHistoryStatus('')
     outline.setCount(0)
     outline.setCached(false)
     outline.setHealth(null)
     outline.hideHandoffPreview()
     outline.setHandoffEntryVisible(false)
-    lastHealthRevision = -1
+    lastHealthKey = ''
     lastHealthSnapshot = null
     rail.render([], { tops: [], railHeight: 0, markerHeight: 0 })
     rail.setActive(undefined)
@@ -347,5 +357,5 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
     host.remove()
   }
 
-  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, refreshList, getHealthSnapshot, showHandoffPreview, hideHandoffPreview, setHandoffEntryVisible, destroy }
+  return { host, syncFromStore, setActive, handleReset, setStatus: outline.setStatus, setHistoryStatus: outline.setHistoryStatus, setBusy: outline.setBusy, setCached: outline.setCached, setCacheEnabled: outline.setCacheEnabled, refreshList, getHealthSnapshot, showHandoffPreview, hideHandoffPreview, setHandoffEntryVisible, destroy }
 }

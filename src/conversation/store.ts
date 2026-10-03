@@ -32,6 +32,13 @@ export class ConversationStore {
    * reset() 归零。
    */
   semanticRevision = 0
+  /**
+   * 覆盖修订号：TurnRail 对内容"掌握程度"变化的计数（structure 新增 turn /
+   * coverage 完整度升级）。与 semanticRevision 正交 —— preview → full 即使
+   * 文本完全相同（语义未变）也必须递增，健康覆盖度 / 置信度的缓存键由
+   * 两者共同组成。reset() 归零。
+   */
+  coverageRevision = 0
 
   private listeners = new Set<StoreListener>()
 
@@ -61,6 +68,7 @@ export class ConversationStore {
     this.detached = []
     this.cacheHydrated = false
     this.semanticRevision = 0
+    this.coverageRevision = 0
     this.emit('structure')
   }
 
@@ -99,8 +107,10 @@ export class ConversationStore {
   /** 内部使用：由 Indexer 在扫描后提交本轮结果并广播 */
   commit(kind: ChangeKind): void {
     if (kind === 'none') return
-    // 只有影响 user prompt 语义的事件推进修订号（assistant 流式 / 纯元素绑定不推进）
+    // 只有影响 user prompt 语义的事件推进语义修订号（assistant 流式 / 纯元素绑定不推进）
     if (kind === 'structure' || kind === 'user-text') this.semanticRevision++
+    // 掌握程度变化推进覆盖修订号：新 turn 进入（structure）或 preview → full（coverage）
+    if (kind === 'structure' || kind === 'coverage') this.coverageRevision++
     this.emit(kind)
   }
 }

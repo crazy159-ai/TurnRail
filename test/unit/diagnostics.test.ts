@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { buildDiagnostics, type TurnRailDiagnostics } from '../../src/utils/diagnostics.ts'
 import { ConversationStore } from '../../src/conversation/store.ts'
 import { ConversationCacheStore } from '../../src/cache/cacheStore.ts'
+import { computeHistoryCoverage } from '../../src/conversation/historyCoverage.ts'
 import { fakeProvider, liveTurn, makeStorage } from './helpers.ts'
 
 /**
@@ -167,4 +168,42 @@ test('diagnostics: handoff 元数据为纯数字白名单，绝不包含 payload
   const json = JSON.stringify(diagnostics)
   assert.ok(!json.includes(SECRET_PROMPT), 'handoff 元数据不得携带用户 prompt')
   assert.ok(!json.includes('ASSISTANT-SECRET-REPLY'), 'handoff 元数据不得携带 assistant 正文')
+})
+
+test('diagnostics: historyCoverage 为枚举 + 纯数字白名单', () => {
+  const { diagnostics, store } = makeContext()
+  // 未提供覆盖快照 → null（向后兼容）
+  assert.equal(diagnostics.historyCoverage, null)
+
+  const withCoverage = buildDiagnostics({
+    version: '1.2.1-test',
+    provider: fakeProvider([]),
+    store,
+    cache: new ConversationCacheStore(makeStorage()),
+    performance: null,
+    markers: () => 0,
+    historyCoverage: computeHistoryCoverage(store, true)
+  })
+  assert.deepEqual(Object.keys(withCoverage.historyCoverage!).sort(), [
+    'fullAssistantTurns',
+    'fullUserTurns',
+    'indexedTurns',
+    'missingAssistantTurns',
+    'previewUserTurns',
+    'reachedTop',
+    'state'
+  ])
+  assert.deepEqual(withCoverage.historyCoverage, {
+    indexedTurns: 1,
+    fullUserTurns: 1,
+    previewUserTurns: 0,
+    fullAssistantTurns: 1,
+    missingAssistantTurns: 0,
+    reachedTop: true,
+    state: 'complete'
+  })
+  // 覆盖快照不得携带正文 / turn ID（即使 store 含敏感内容）
+  const json = JSON.stringify(withCoverage.historyCoverage)
+  assert.ok(!json.includes(SECRET_PROMPT))
+  assert.ok(!json.includes(SECRET_MESSAGE_ID))
 })

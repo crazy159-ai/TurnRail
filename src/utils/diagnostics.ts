@@ -1,6 +1,7 @@
 import type { ChatProvider } from '../providers/types'
 import type { ConversationStore } from '../conversation/store'
 import type { ConversationCacheStore } from '../cache/cacheStore'
+import type { HistoryCoverage } from '../conversation/historyCoverage'
 import { getScrollBounds, isAtVisualBottom, isAtVisualTop, isReversedContainer } from '../navigation/scrollGeometry'
 import type { PerformanceSnapshot } from './performance'
 
@@ -32,6 +33,38 @@ export interface TurnRailDiagnosticsContext {
     ageMs: number | null
     characters: number | null
   }
+  /** 历史覆盖快照（纯数字 / 枚举，无正文无 turn ID） */
+  historyCoverage?: HistoryCoverage | null
+  /** 路由生命周期元数据（纯数字 / 枚举；绝不包含会话 ID / URL，规格 #56/#57） */
+  routeLifecycle?: RouteLifecycleDiagnostics | null
+}
+
+/**
+ * 路由生命周期（Route Lifecycle）元数据 —— 只允许数字 / 布尔 / 枚举来源：
+ * conversationIdPresent 只报存在性，lastSource 是探测来源枚举。
+ * 会话 UUID / URL / pathname / turn ID 明确禁止（隐私合同，规格 #57）。
+ */
+export interface RouteLifecycleDiagnostics {
+  /** 路由代数（每次路由身份变化 +1） */
+  generation: number
+  /** 当前路由是否为会话路由（只报存在性，绝不输出 ID 本身） */
+  conversationIdPresent: boolean
+  /** Phase B（DOM 就绪门）是否仍在等待 */
+  transitioning: boolean
+  /** 最近一次路由变化的探测来源 */
+  lastSource: string | null
+  /** 最近一次路由从变化到 DOM 就绪的耗时（ms；未就绪为 null） */
+  lastReadyMs: number | null
+  /** 真实路由身份变化次数 */
+  detected: number
+  /** 与当前身份相同被忽略的探测次数 */
+  duplicateIgnored: number
+  /** Navigation API 信号数（fast path 使用度观察，规格 #67） */
+  navigationApiSignals: number
+  /** 兜底轮询信号数 */
+  pollSignals: number
+  /** 路由身份转换次数 */
+  transitions: number
 }
 
 export interface TurnRailDiagnostics {
@@ -90,6 +123,20 @@ export interface TurnRailDiagnostics {
     ageMs: number | null
     characters: number | null
   }
+
+  /** 历史覆盖（白名单：枚举 + 纯数字；无标题 / preview / turn ID / 正文） */
+  historyCoverage: {
+    indexedTurns: number
+    fullUserTurns: number
+    previewUserTurns: number
+    fullAssistantTurns: number
+    missingAssistantTurns: number
+    reachedTop: boolean
+    state: string
+  } | null
+
+  /** 路由生命周期元数据（纯数字 / 枚举；不含会话 ID / URL，规格 #56/#57） */
+  routeLifecycle: RouteLifecycleDiagnostics | null
 }
 
 export function buildDiagnostics(ctx: TurnRailDiagnosticsContext): TurnRailDiagnostics {
@@ -153,6 +200,20 @@ export function buildDiagnostics(ctx: TurnRailDiagnosticsContext): TurnRailDiagn
       pending: ctx.handoff?.pending ?? false,
       ageMs: ctx.handoff?.ageMs ?? null,
       characters: ctx.handoff?.characters ?? null
-    }
+    },
+
+    historyCoverage: ctx.historyCoverage
+      ? {
+          indexedTurns: ctx.historyCoverage.indexedTurns,
+          fullUserTurns: ctx.historyCoverage.fullUserTurns,
+          previewUserTurns: ctx.historyCoverage.previewUserTurns,
+          fullAssistantTurns: ctx.historyCoverage.fullAssistantTurns,
+          missingAssistantTurns: ctx.historyCoverage.missingAssistantTurns,
+          reachedTop: ctx.historyCoverage.reachedTop,
+          state: ctx.historyCoverage.state
+        }
+      : null,
+
+    routeLifecycle: ctx.routeLifecycle ?? null
   }
 }

@@ -2,12 +2,29 @@ import { ChatGptProvider } from '../providers/chatgpt'
 import { ConversationStore } from '../conversation/store'
 import { ConversationIndexer } from '../conversation/indexer'
 import { captureFullHistory, isCaptureRunning } from '../conversation/historyCapture'
+import {
+  computeHistoryCoverage,
+  historyCoverageLabel
+} from '../conversation/historyCoverage'
+import { createPassiveTopWatch } from './passiveTopWatch'
 import { ScrollSpy } from '../navigation/scrollSpy'
 import { jumpToTurn } from '../navigation/jump'
 import { isRecoverRunning, recoverAndJump, getRecoverLog } from '../navigation/recoverTarget'
 import { createNavigationUi } from '../ui/createShadowRoot'
 import { watchConversationRoot, observeConversationTurns } from './observers'
-import { createRouteWatcher } from './routeWatcher'
+import { createRouteWatcher, type RouteChange, type RouteChangeSource } from './routeWatcher'
+import { readRouteIdentity, routeIdentityKey } from './routeIdentity'
+import {
+  beginConversationTransition,
+  createAcceptedDomState,
+  readConversationDomSignature,
+  isConversationDomReady,
+  isSameDomSignature,
+  type AcceptedDomState,
+  type ConversationDomSignature,
+  type ConversationTransitionGate,
+  type TransitionGateStats
+} from './conversationTransition'
 import { createMutationPipeline } from './mutationPipeline'
 import { startStartupScan } from './startupScan'
 import { perf } from '../utils/performance'
@@ -72,10 +89,40 @@ export function bootstrap(): void {
     ui.setActive(turnId)
   })
 
+  // ---------- 被动历史收获（Passive History Harvest） ----------
+  // TurnRail 绝不为补全历史主动滚动当前聊天（BACKGROUND_TASK_MUST_NOT_SCROLL）：
+  // 用户自然浏览挂载的内容由 Observer 管道自动收获；reachedTop 只收集
+  // "用户自然到顶且懒加载稳定"的被动证据，或来自显式捕获 / 缓存 complete。
+  /**
+   * 路由代数（conversation generation，规格 #25）：每次路由身份变化递增。
+   * 所有 async path（cache read / transition / startup scan / 显式捕获 /
+   * 恢复跳转 / handoff 注入 / 延时回调）都必须捕获并复核 —— 不一致即丢弃，
+   * 形成"A 的 async work 绝不写进 B"的硬不变量（规格 #26）。
+   */
+  let conversationGeneration = 0
+  /**
+   * 本轮路由是否已确认到达视觉顶部（无更多旧历史）。依据仅三种：
+   * 用户显式「加载全部历史」确认到顶 / 缓存 complete / 被动到顶证据。
+   * 只影响 coverage 展示语义（state=complete），绝不触发任何滚动。
+   */
+  let reachedTop = false
+
+  function refreshHistoryCoverageUi(): void {
+    ui.setHistoryStatus(historyCoverageLabel(computeHistoryCoverage(store, reachedTop)))
+  }
+
+  const topWatch = createPassiveTopWatch({
+    getContainer: () => provider.getScrollContainer(),
+    getTurnCount: () => store.turns.length,
+    onTopConfirmed: () => {
+      reachedTop = true
+      refreshHistoryCoverageUi()
+    }
+  })
+
   // ---------- 导航缓存桥接（cache-first + live reconcile） ----------
   // generation：每次路由变化递增；异步缓存读取返回时 generation 已变则直接丢弃
-  //（防 A/B 会话竞态串写 —— A 的缓存绝不进入 B 的 Store）
-  let conversationGeneration = 0
+  //（防 A/B 会话竞态串写 —— A 的缓存绝不进入 B 的 Store）。声明见 warmup 段。
   /** 当前路由对应的已缓存会话 id（null = 未缓存 / 未知） */
   let activeCachedId: string | null = null
   /** 已缓存会话的 createdAt（重写缓存时保留创建时间语义） */
@@ -292,14 +339,20 @@ export function bootstrap(): void {
   /**
    * 新建聊天页（无会话 id）读取 pending handoff 并填入 composer。
    * 会话路由直接跳过（不多一次 storage 读）；无 pending 时页面零行为。
+   * 注入等待期间路由切换（用户已离开新聊天页）→ injector shouldAbort 放弃，
+   * 草稿绝不写进非目标页面（规格 #31）。
    */
   async function maybeInjectPendingHandoff(): Promise<void> {
     if (provider.getConversationId() !== null) return
     if (handoffInjectInFlight) return
+    const gen = conversationGeneration
     handoffInjectInFlight = true
     try {
       const startedAt = Date.now()
-      const result = await injectPendingHandoff(getContinuationCapability(), pendingHandoffStore)
+      const result = await injectPendingHandoff(getContinuationCapability(), pendingHandoffStore, {
+        shouldAbort: () => gen !== conversationGeneration
+      })
+      if (gen !== conversationGeneration) return
       if (result === 'injected') {
         handoffPendingMeta = {
           pending: false,
@@ -307,7 +360,9 @@ export function bootstrap(): void {
           characters: null
         }
         ui.setStatus('已填入上一段会话的 Handoff，请检查后手动发送')
-        window.setTimeout(() => ui.setStatus(''), 5000)
+        window.setTimeout(() => {
+          if (gen === conversationGeneration) ui.setStatus('')
+        }, 5000)
       }
     } finally {
       handoffInjectInFlight = false
@@ -354,6 +409,11 @@ export function bootstrap(): void {
    * 路由进入：异步读取导航缓存并 hydrate。
    * 读取期间用户可能已切走（SPA）：generation + conversationId 双重校验，
    * 任一变化即丢弃本次结果，绝不 hydrate 到其他会话。
+   *
+   * 与 Live DOM 相关的步骤（reconcile / stale 检查）通过 ready 队列推迟到
+   * Conversation Transition Gate 就绪之后（规格 #17 Phase B）—— 缓存 hydrate
+   * 本身只写 Store 数据、不读 Live DOM，可先行渲染目录（cache-first）；
+   * 就绪前的 indexer.scan 会解析仍挂载的旧会话 DOM，必须等待。
    */
   async function loadCachedConversation(conversationId: string): Promise<void> {
     const gen = conversationGeneration
@@ -387,17 +447,29 @@ export function bootstrap(): void {
         lastHydrateMs = performance.now() - hydrateStart
         perf.markCacheHydrate(lastHydrateMs)
         if (hydrated > 0) {
-          // 缓存命中：立即渲染目录（先于 ChatGPT 历史挂载），随后与已存在的 Live DOM 调和
+          // 缓存命中：立即渲染目录（纯 Store 数据，先于 Live DOM 就绪），
+          // 与 Live DOM 的调和推迟到 DOM 就绪后执行
           store.commit('structure')
-          const reconcileStart = performance.now()
-          indexer.scan(true)
-          lastReconcileMs = performance.now() - reconcileStart
         }
       } finally {
         hydrating = false
       }
-      // 缓存读取晚于 Live 首扫时，hydrate 刚插入的 turn 需要立即做一次 stale 检查
-      if (hydrated > 0) checkCacheStaleness()
+      if (hydrated > 0) {
+        runWhenTransitionReady(() => {
+          // 就绪后与已存在的 Live DOM 调和；路由再变则丢弃（generation 守卫）
+          if (gen !== conversationGeneration) return
+          const reconcileStart = performance.now()
+          indexer.scan(true)
+          lastReconcileMs = performance.now() - reconcileStart
+          // 缓存此前已确认 complete（到顶）：本轮路由直接继承到顶证据
+          //（不再需要任何补全）；stale 检查同理推迟到 Live 数据进入之后
+          if (cached.complete === true) {
+            reachedTop = true
+            refreshHistoryCoverageUi()
+          }
+          checkCacheStaleness()
+        })
+      }
     } catch (err) {
       reportError('cache.load', err)
     }
@@ -420,7 +492,10 @@ export function bootstrap(): void {
     }
     hydratedTurnIds = null
     store.cacheHydrated = false
+    // 缓存 complete 语义随 stale 判定失效：到顶证据不再可信，退回 partial
+    reachedTop = false
     store.dropTurns(dropIds)
+    refreshHistoryCoverageUi()
   }
 
   // ---------- 两层 Observer + Mutation 管道（v1.2） ----------
@@ -433,6 +508,33 @@ export function bootstrap(): void {
 
   /** streaming / 流式输出导致的布局漂移 → 去抖 geometry refresh（不触发索引） */
   const debouncedSpyRefresh = debounce(() => spy.refresh(), 300)
+
+  // ---------- Live Write Identity Guard（防御纵深，规格 #19-#22） ----------
+  // RouteWatcher 已经很快，但所有 Live DOM → Store 的写入路径仍加最后一道门：
+  // 即使未来时序再变，错会话 DOM 也绝不能进入 Store。全部为 O(1) 检查。
+  /** 本轮路由 reset 时的身份 key；写入守卫据此核对"身份未被再次切换" */
+  let expectedRouteKey: string | null = null
+
+  function isExpectedRouteStillCurrent(): boolean {
+    return (
+      expectedRouteKey !== null &&
+      routeIdentityKey(readRouteIdentity(() => provider.getConversationId())) ===
+        expectedRouteKey
+    )
+  }
+
+  /**
+   * Live DOM 已确认可接受：Phase B 完成 + root 仍连接 + 路由身份仍是本轮预期。
+   * 三条同时成立才允许 indexer 写入（onDirty / onFullScan / startup scan 共用）。
+   */
+  function isLiveDomAccepted(): boolean {
+    return (
+      transitionReadyDone &&
+      activeRoot !== null &&
+      activeRoot.isConnected &&
+      isExpectedRouteStillCurrent()
+    )
+  }
 
   // selector 由 Provider 下发（bootstrap 不 import 站点 SELECTORS，边界见 Provider 契约）
   const mutationHints = provider.getMutationHints()
@@ -460,15 +562,18 @@ export function bootstrap(): void {
     },
     {
       onDirty: (roots) => {
-        // root 已断连（路由切换窗口内的迟到回调）→ 丢弃，防止 A 会话数据写入 B Store（#12/#67）
-        if (!activeRoot?.isConnected) return
+        // root 已断连（路由切换窗口内的迟到回调）→ 丢弃；路由身份已再变 → 同样丢弃，
+        // 防止 A 会话数据写入 B Store（#12/#67 + Live Write Identity Guard）
+        if (!isLiveDomAccepted()) return
         indexer.scanDirty(roots)
       },
       onFullScan: () => {
-        if (!activeRoot?.isConnected) return
+        if (!isLiveDomAccepted()) return
         indexer.scan(true)
       },
       onAssistantStream: () => {
+        // streaming 导致的布局漂移 → 去抖 geometry refresh（历史补全不再消费流式时间戳：
+        // TurnRail 没有任何会因 streaming 而启动的后台任务）
         debouncedSpyRefresh()
       }
     }
@@ -483,6 +588,8 @@ export function bootstrap(): void {
       (records) => pipeline.handle(records),
       handleRootLost
     )
+    // 被动到顶证据采集跟随当前滚动容器（纯监听，绝不写入 scrollTop）
+    topWatch.watch()
     runStartupScan()
   }
 
@@ -490,6 +597,8 @@ export function bootstrap(): void {
   function handleRootLost(): void {
     stopConversationObserver = null
     activeRoot = null
+    // 同一会话 root 暂时丢失：解绑旧容器的到顶采集计时（保留 reachedTop 证据）
+    topWatch.detach()
     startRootWatch()
   }
 
@@ -497,39 +606,68 @@ export function bootstrap(): void {
     stopRootWatch?.()
     stopRootWatch = watchConversationRoot(provider, (root) => {
       stopRootWatch = null
+      if (!transitionReadyDone && transitionGate !== null) {
+        // Phase B 进行中：root 的出现只是"证据"，能否 attach 由 gate 的
+        // 签名比较决定 —— 旧 root 仍挂载时不把它的 mutation 当作新会话（规格 #15）
+        transitionGate.probeNow()
+        return
+      }
       attachConversationObserver(root)
     })
   }
 
-  /** 启动扫描：立即 full scan + 稳定性退避重试（连续 2 次签名不变即停，交给 Observer） */
+  /** 启动扫描：稳定性退避重试（连续 2 次签名不变即停，交给 Observer） */
   function runStartupScan(): void {
     stopStartupScan?.()
     const gen = conversationGeneration
-    indexer.scan(true)
-    if (provider.lastLocatedCount > 0) {
-      perf.markFirstLiveScan()
-      perf.markFirstLiveReconcile()
-    }
-    stopStartupScan = startStartupScan({
-      scan: () => {
-        if (gen !== conversationGeneration) return null
-        indexer.scan()
-        if (provider.lastLocatedCount > 0) perf.markFirstLiveScan()
-        return { turnCount: store.turns.length, lastTurnId: store.turns[store.turns.length - 1]?.id }
-      },
-      hasRoot: () => activeRoot !== null && activeRoot.isConnected,
-      onSettled: () => {
-        stopStartupScan = null
+    // 路由变化与 DOM 交换可能同处一个宏任务（SPA pushState 后同步重渲染）：
+    // 立即扫描会把上一会话仍挂载的 DOM 索引进新会话的 Store（跨会话污染）。
+    // 首扫推迟一个宏任务；期间出现的新 DOM 由刚挂载的 Observer 增量收获。
+    let stabilityStop: (() => void) | null = null
+    let deferHandle: number | null = window.setTimeout(() => {
+      deferHandle = null
+      if (gen !== conversationGeneration) return
+      // Live Write Identity Guard：路由身份已再变（迟到的宏任务）→ 绝不扫描
+      if (!isLiveDomAccepted()) return
+      topWatch.watch()
+      indexer.scan(true)
+      if (provider.lastLocatedCount > 0) {
+        perf.markFirstLiveScan()
+        perf.markFirstLiveReconcile()
       }
-    })
+      stabilityStop = startStartupScan({
+        scan: () => {
+          if (gen !== conversationGeneration || !isLiveDomAccepted()) return null
+          indexer.scan()
+          if (provider.lastLocatedCount > 0) perf.markFirstLiveScan()
+          return { turnCount: store.turns.length, lastTurnId: store.turns[store.turns.length - 1]?.id }
+        },
+        hasRoot: () => activeRoot !== null && activeRoot.isConnected,
+        onSettled: () => {
+          stopStartupScan = null
+        }
+      })
+    }, 0)
+    stopStartupScan = () => {
+      if (deferHandle !== null) window.clearTimeout(deferHandle)
+      stabilityStop?.()
+    }
   }
 
 
   // ---------- Store → UI / spy / 缓存自动保存 ----------
   store.onChange((kind) => {
     ui.syncFromStore(store, kind)
+    // 静态覆盖状态跟随 structure / coverage 变化（纯文本，无后台任务进度）
+    if (kind === 'structure' || kind === 'coverage') refreshHistoryCoverageUi()
     if (kind === 'structure') spy.refresh()
     else if (kind === 'elements') debouncedSpyRefresh()
+    // 正常会话结构变化（新增消息 / lazy mount / virtualization）同步刷新
+    // accepted 基线，防止它漂移成"过时的上一会话描述"（廉价路径，不解析正文）。
+    // hydrate 不是 Live 接受（hydrating 抑制）；未 ready / root 断连时不成立。
+    if (kind === 'structure' && !hydrating && transitionReadyDone && activeRoot?.isConnected) {
+      acceptedDomState.record(readConversationDomSignature(provider))
+    }
     // 自动保存只在 turn 结构变化时调度：assistant 流式输出（text）不触发写盘
     if (kind === 'structure' && !hydrating) {
       checkCacheStaleness()
@@ -537,9 +675,8 @@ export function bootstrap(): void {
     }
   })
 
-  let routeEpoch = 0
-
   async function handleJump(turnId: string): Promise<void> {
+    const gen = conversationGeneration
     try {
       const turn = store.getTurn(turnId)
       if (!turn) return
@@ -549,14 +686,23 @@ export function bootstrap(): void {
         store.activeTurnId = turnId
       } else {
         ui.setStatus('正在定位历史消息…')
-        const result = await recoverAndJump(provider, indexer, store, turnId, (message) =>
-          ui.setStatus(message)
+        const result = await recoverAndJump(
+          provider,
+          indexer,
+          store,
+          turnId,
+          (message) => ui.setStatus(message),
+          // 路由切换即中止：迟到的恢复绝不把旧 DOM 扫进新 Store（规格 #26）
+          { isStale: () => gen !== conversationGeneration }
         )
+        if (gen !== conversationGeneration) return
         if (result === 'jumped') {
           ui.setStatus('')
         } else {
           ui.setStatus('未能定位该问题：对应历史尚未加载，可先点击“加载全部历史”')
-          window.setTimeout(() => ui.setStatus(''), 4000)
+          window.setTimeout(() => {
+            if (gen === conversationGeneration) ui.setStatus('')
+          }, 4000)
         }
       }
     } catch (err) {
@@ -566,18 +712,34 @@ export function bootstrap(): void {
 
   async function handleLoadHistory(): Promise<void> {
     if (isCaptureRunning() || isRecoverRunning()) return
+    const gen = conversationGeneration
     try {
       ui.setBusy(true)
-      const result = await captureFullHistory(provider, indexer, store, (message) => {
-        if (message) ui.setStatus(message)
-      })
+      const result = await captureFullHistory(
+        provider,
+        indexer,
+        store,
+        (message) => {
+          // 进度提示只在会话未切换时展示
+          if (gen === conversationGeneration && message) ui.setStatus(message)
+        },
+        // 路由切换即中止：迟到的捕获绝不把旧 DOM 扫进新 Store（规格 #26）
+        { isStale: () => gen !== conversationGeneration }
+      )
+      // 会话已切换：丢弃迟到的捕获结果（不改状态、不提示）
+      if (gen !== conversationGeneration) return
       // 完整历史捕获确认到顶且当前会话已缓存 → 重新保存并置 complete = true
       if (result.reachedTop && activeCachedId !== null) scheduleCacheSave(true)
+      // 显式捕获确认到顶：记录到顶证据（coverage state → complete）
+      if (result.reachedTop) {
+        reachedTop = true
+        refreshHistoryCoverageUi()
+      }
       ui.setStatus(
         result.addedTurns > 0 ? `已补充 ${result.addedTurns} 条历史` : '没有发现更多历史消息'
       )
       window.setTimeout(() => {
-        if (!isCaptureRunning()) ui.setStatus('')
+        if (gen === conversationGeneration && !isCaptureRunning()) ui.setStatus('')
       }, 3500)
     } catch (err) {
       reportError('history-capture', err)
@@ -664,10 +826,168 @@ export function bootstrap(): void {
     }
   }
 
-  function resetForRoute(): void {
-    conversationGeneration++
+  // ---------- Route Lifecycle：Phase A（身份切换）+ Phase B（DOM 就绪门） ----------
+  // 不变量（规格 #73）：
+  //   ROUTE_IDENTITY_CHANGED  → OLD_STATE_INVALID_IMMEDIATELY
+  //   NEW_LIVE_DATA           → ONLY_AFTER_DOM_READY
+  //   STALE_ASYNC_WORK        → NEVER_MUTATES_NEW_CONVERSATION
+  /** Phase B 状态：transition gate 是否仍在等待新会话 DOM */
+  let transitioning = false
+  /** 本轮路由的 Phase B 已完成（ready 或无需等待）；此后 RootWatch 直接 attach */
+  let transitionReadyDone = false
+  let transitionGate: ConversationTransitionGate | null = null
+  /**
+   * 上一会话"已接受 Live DOM"基线（规格：previous baseline 必须来自已接受
+   * 状态，绝不在 route event 后临时读当前 DOM —— DOM 可能先于 route event
+   * 换成新会话，临时读取会把 previous == current 而永久等待）。
+   * Phase B 完成 / 正常 structure 变化时记录；route change 时作为 previous
+   * 上报并立即失效；缓存 hydrate 不是 Live 接受，绝不记录。
+   */
+  const acceptedDomState: AcceptedDomState = createAcceptedDomState()
+  /**
+   * gate 最近一次探测读到的 DOM 签名（最终 fallback 证据）：ready 前连续
+   * 路由切换时，accepted 与 Store fallback 都可能为空，而"最近看到的旧
+   * DOM"仍是防止 any-root-ready 放行旧会话的有效证据。
+   */
+  let lastSeenDomSignature: ConversationDomSignature | null = null
+  /** 最近一次完成的 transition 统计快照（gate 停止后诊断 continuity 用） */
+  let lastTransitionStats: TransitionGateStats | null = null
+  /** 就绪前延迟执行的任务（缓存 reconcile 等 DOM 相关步骤） */
+  let readyCallbacks: Array<() => void> = []
+  /** 最近一次路由变化的探测来源与就绪耗时（DEBUG 诊断元数据） */
+  let lastRouteSource: RouteChangeSource | null = null
+  let routeChangedAtMs = 0
+  let lastReadyMs: number | null = null
+
+  // ---------- Transition 低干扰提示（UI fallback，规格 #40-#42） ----------
+  // transitioning 超过 1.2s 且仍在会话路由时 footer 提示一次"正在同步"；
+  // 超过 10s 换为"尚未完成加载"（recovery 仍在继续，绝不要求用户刷新）。
+  // 无 toast / 无 spinner / 不闪烁；ready 立即清除，且只清除自己设置的文案。
+  const TRANSITION_HINT_MS = 1200
+  const TRANSITION_SLOW_HINT_MS = 10_000
+  let transitionHintTimer: number | null = null
+  let transitionHintShown = false
+
+  function clearTransitionHint(): void {
+    if (transitionHintTimer !== null) {
+      window.clearTimeout(transitionHintTimer)
+      transitionHintTimer = null
+    }
+    if (transitionHintShown) {
+      transitionHintShown = false
+      ui.setStatus('')
+    }
+  }
+
+  function armTransitionHint(): void {
+    clearTransitionHint()
+    transitionHintTimer = window.setTimeout(() => {
+      transitionHintTimer = null
+      if (!transitioning) return
+      transitionHintShown = true
+      ui.setStatus('正在同步当前对话…')
+      transitionHintTimer = window.setTimeout(() => {
+        transitionHintTimer = null
+        if (transitioning) ui.setStatus('当前对话尚未完成加载')
+      }, TRANSITION_SLOW_HINT_MS - TRANSITION_HINT_MS)
+    }, TRANSITION_HINT_MS)
+  }
+
+  /** 就绪前排队、就绪后立即执行（路由再变时整队丢弃，见 resetForRoute） */
+  function runWhenTransitionReady(fn: () => void): void {
+    if (transitionReadyDone) {
+      fn()
+      return
+    }
+    readyCallbacks.push(fn)
+  }
+
+  /**
+   * Phase B 完成：新会话 DOM 已确认可安全接受。
+   * 挂会话 Observer + 启动扫描，并排空就绪队列（缓存调和等）。
+   */
+  function finishPhaseB(): void {
+    if (transitionReadyDone) return
+    transitionReadyDone = true
+    transitioning = false
+    if (routeChangedAtMs > 0) lastReadyMs = Math.round(performance.now() - routeChangedAtMs)
+    clearTransitionHint()
+    lastTransitionStats = transitionGate?.stats ?? null
+    transitionGate?.stop()
+    transitionGate = null
+    const root = provider.getConversationRoot()
+    if (root) attachConversationObserver(root)
+    else startRootWatch()
+    // 新 DOM 已确认属于当前会话 → 建立下一轮路由的 previous 基线（廉价签名）
+    acceptedDomState.record(readConversationDomSignature(provider))
+    const queue = readyCallbacks
+    readyCallbacks = []
+    for (const fn of queue) fn()
+  }
+
+  /**
+   * Phase B 就绪判定。会话目标：新 DOM 签名证据（root 换绑或首/尾 turn 变化，
+   * 规格 #20/#21）；非会话目标：不期待会话 DOM，旧签名退场（root 消失或内容
+   * 已不同）即就绪 —— 绝不把仍挂载的旧会话 DOM 索引进非会话 Store。
+   */
+  function isPhaseBDomReady(
+    target: RouteChange['current'],
+    previousSignature: ConversationDomSignature | null
+  ): (signature: ConversationDomSignature) => boolean {
+    return (signature) => {
+      if (target.kind !== 'conversation') {
+        if (signature.root === null) return true
+        return previousSignature === null || !isSameDomSignature(signature, previousSignature)
+      }
+      return isConversationDomReady(previousSignature, signature)
+    }
+  }
+
+  function stopTransitionGate(): void {
+    transitionGate?.stop()
+    transitionGate = null
+    readyCallbacks = []
+  }
+  /**
+   * route change 的 previous 基线（绝不读 route-event 后的当前 DOM）：
+   * accepted（上一会话最后已接受状态）→ Store + activeRoot 已接受状态
+   * → gate 最近一次探测读到的签名 → null（真的一无所知，仅初始启动）。
+   * 在 Phase A 拆卸之前调用：activeRoot / Store 此刻仍属上一会话。
+   */
+  function snapshotPreviousDomState(): ConversationDomSignature | null {
+    const fallback =
+      activeRoot !== null && store.turns.length > 0
+        ? () => ({
+            root: activeRoot,
+            turnCount: store.turns.length,
+            firstTurnId: store.turns[0]?.id ?? null,
+            lastTurnId: store.turns[store.turns.length - 1]?.id ?? null
+          })
+        : null
+    return acceptedDomState.snapshot(fallback) ?? lastSeenDomSignature
+  }
+
+  function resetForRoute(change: RouteChange | null): void {
+    const gen = ++conversationGeneration
+    // 初始启动（change = null）接受当前页面已有的 DOM：previousSignature = null
+    //（不存在"上一个会话"，任何 root 出现都是合法新内容）
+    const identity = change
+      ? change.current
+      : readRouteIdentity(() => provider.getConversationId())
+    const previousSignature = change === null ? null : snapshotPreviousDomState()
+    acceptedDomState.invalidate()
+    const isReady = isPhaseBDomReady(identity, previousSignature)
+    // Live Write Identity Guard 的本轮预期身份（写入路径核对用）
+    expectedRouteKey = routeIdentityKey(identity)
+
+    // ---------- Phase A — Identity transition：旧状态立即失效（规格 #17） ----------
     // 先 flush 旧会话的待写缓存：必须在 store.reset 之前序列化旧数据
     flushPendingSave()
+    // 新会话身份：旧会话的到顶证据必须失效（规格 #34/#48，A confirmed 不得残留 B）
+    topWatch.reset()
+    reachedTop = false
+    // 终止上一轮仍在等待的 transition（迟到的 ready 队列一并丢弃）
+    stopTransitionGate()
     // 停止旧 root 的观察 / 发现 / 启动扫描（迟到回调不得写入新 Store，#12/#67）
     stopStartupScan?.()
     stopStartupScan = null
@@ -676,12 +996,13 @@ export function bootstrap(): void {
     stopRootWatch?.()
     stopRootWatch = null
     activeRoot = null
-    const conversationId = provider.getConversationId()
-    const key = conversationId ?? `local-${routeEpoch}`
 
     spy.stop()
     debouncedSpyRefresh.cancel()
     provider.invalidateDomCache()
+    // Store key = Provider 会话 ID（缓存链路兼容：hydrator / 写回都以裸 ID 比对）；
+    // 非会话路由按 path 隔离（规格 #33：不再复用恒定的 local-0）
+    const key = identity.kind === 'conversation' ? identity.conversationId : `page:${identity.path}`
     store.reset(key)
     ui.handleReset()
     activeCachedId = null
@@ -692,26 +1013,47 @@ export function bootstrap(): void {
     // Handoff 入口 / 预览跟随新会话（A 的 checkpoint 不影响 B；B 无标记则隐藏入口）
     syncHandoffEntry()
 
-    // root 已存在 → 立即挂 scoped 观察器 + 稳定性退避扫描；
-    // 尚未挂载 → 短命 RootWatch 等待出现（cache-first 不受影响：缓存 hydrate 与 root 独立）
-    const root = provider.getConversationRoot()
-    if (root) attachConversationObserver(root)
-    else startRootWatch()
+    // ---------- Phase B — DOM readiness：确认后才接受新 Live DOM（规格 #17） ----------
+    transitioning = true
+    transitionReadyDone = false
+    routeChangedAtMs = performance.now()
+    lastReadyMs = null
+    lastRouteSource = change ? change.source : null
+    // 低干扰同步提示只在会话路由武装（首页 / 新建聊天不提示）
+    if (identity.kind === 'conversation') armTransitionHint()
+    transitionGate = beginConversationTransition({
+      probe: () => {
+        const signature = readConversationDomSignature(provider)
+        lastSeenDomSignature = signature
+        return signature
+      },
+      isReady: (signature) => gen === conversationGeneration && isReady(signature),
+      onReady: () => {
+        if (gen === conversationGeneration) finishPhaseB()
+      }
+    })
+    // RootWatch 作为 root 生命周期恢复信号（gate 未就绪时只 probe 不 attach；
+    // 就绪后由 finishPhaseB / 后续 found 直接 attach）
+    startRootWatch()
 
-    // cache-first：缓存读取与 Live DOM 初始化并行；命中即在历史挂载前恢复目录
-    if (conversationId && cacheStore.isAvailable()) {
-      void loadCachedConversation(conversationId)
+    // cache-first：缓存读取与 hydrate 不触碰 Live DOM，与 DOM 等待并行；
+    // 就绪后的调和通过 ready 队列执行
+    if (identity.kind === 'conversation' && cacheStore.isAvailable()) {
+      void loadCachedConversation(identity.conversationId)
     }
 
     // 新建聊天 / 首页：检查是否有待注入的 Handoff（无 pending 时零行为）
-    if (conversationId === null) {
+    if (identity.kind !== 'conversation') {
       void maybeInjectPendingHandoff()
     }
   }
 
-  const stopRouteWatcher = createRouteWatcher(() => resetForRoute())
+  const stopRouteWatcher = createRouteWatcher(
+    () => readRouteIdentity(() => provider.getConversationId()),
+    (change) => resetForRoute(change)
+  )
 
-  resetForRoute()
+  resetForRoute(null)
   void stopRouteWatcher
 
   // DEV 钩子：tn-debug=1 时暴露诊断信息（不含任何聊天正文）
@@ -755,8 +1097,34 @@ export function bootstrap(): void {
         checkpointCount: currentCheckpointConversationId()
           ? checkpointStore.count(currentCheckpointConversationId()!)
           : 0,
-        handoff: { ...handoffPendingMeta }
+        handoff: { ...handoffPendingMeta },
+        // 历史覆盖快照（纯数字 / 枚举，无正文无 turn ID）
+        historyCoverage: computeHistoryCoverage(store, reachedTop),
+        // 路由生命周期元数据（纯数字 / 枚举；不含会话 ID / URL，规格 #56/#57）
+        routeLifecycle: readRouteLifecycleDiagnostics()
       })
+    }
+
+    /** 路由生命周期元数据（纯数字 / 枚举；隐私合同：绝不包含会话 ID / URL） */
+    function readRouteLifecycleDiagnostics() {
+      const gate = transitionGate
+      const stats = gate ? gate.stats : lastTransitionStats
+      return {
+        generation: conversationGeneration,
+        conversationIdPresent: provider.getConversationId() !== null,
+        transitioning,
+        // transition 阶段枚举：fast → mutation-wait / recovery-poll → ready
+        //（真实用户报"侧边栏空"时可直接看到卡在哪个恢复阶段）
+        transitionMode: stats ? stats.mode : 'ready',
+        transitionProbeCount: stats?.probeCount ?? 0,
+        recoveryProbeCount: stats?.recoveryProbeCount ?? 0,
+        mutationWakeCount: stats?.mutationWakeCount ?? 0,
+        // DEBUG-only boolean：是否存在已接受的 Live 基线（绝不含 turn ID / 选择器）
+        acceptedSignaturePresent: acceptedDomState.present,
+        lastSource: lastRouteSource,
+        lastReadyMs,
+        ...stopRouteWatcher.metrics()
+      }
     }
 
     Object.defineProperty(globalThis, '__tnDebug', {      get: () => {
@@ -794,6 +1162,11 @@ export function bootstrap(): void {
             ageMs: handoffPendingMeta.ageMs,
             characters: handoffPendingMeta.characters
           },
+          // 历史覆盖快照（纯数字 / 枚举；供浏览器测试与诊断读取）
+          historyCoverage: computeHistoryCoverage(store, reachedTop),
+          // 路由生命周期（generation / 探测来源 / transition 状态 / 信号计数；
+          // 纯数字与枚举元数据，绝不包含会话 ID / URL —— 规格 #39/#56/#67）
+          routeLifecycle: readRouteLifecycleDiagnostics(),
           // 滚动几何（真实 ChatGPT 为 column-reverse：scrollTop ∈ [-extent, 0]）
           flexDirection: sc ? window.getComputedStyle(sc).flexDirection : null,
           scrollTop: sc ? sc.scrollTop : null,
@@ -812,6 +1185,10 @@ export function bootstrap(): void {
       indexer,
       cache: cacheStore,
       recoverLog: getRecoverLog,
+      topWatch,
+      // DEBUG 跳转钩子：与点击目录项同一 handleJump 路径（jump → 失败时 recoverAndJump）。
+      // 供诊断 / 浏览器测试在虚拟化频繁重建 DOM 时稳定触发恢复跳转
+      jump: (turnId: string) => void handleJump(turnId),
       resetPerformanceStats: () => perf.reset(),
       // 诊断导出（纯元数据，无聊天正文；见 utils/diagnostics.ts 隐私合同）：
       // 生成 JSON → 尝试写入剪贴板；剪贴板不可用时返回 JSON 字符串。绝不自动发送。

@@ -79,6 +79,10 @@
   <button data-act="add60">+60 轮</button>
   <button data-act="add150-dup">+150 轮（含重复“继续”）</button>
   <button data-act="prepend10">向上懒加载 10 轮</button>
+  <button data-act="deep40">长会话 40（懒加载·快速到顶）</button>
+  <button data-act="deep72">长会话 72（懒加载）</button>
+  <button data-act="deep120">长会话 120（懒加载+虚拟化）</button>
+  <button data-act="deep-stop">停止长会话模拟</button>
   <button data-act="virt-on">开启虚拟化卸载</button>
   <button data-act="virt-off">关闭虚拟化</button>
   <button data-act="theme">深/浅色切换</button>
@@ -99,11 +103,16 @@
   const routeLabel = document.getElementById('route')
   let turnCounter = 0
   let uuidCounter = 0
+  // 深度会话使用稳定 turn id（同一会话重进 id 不变）——缓存 hydrate / staleness
+  // 判定的前提；普通会话保持随机 id（模拟 ChatGPT 新会话新 id）
+  let stableTurnIds = false
   let turnSeq = [] // { root, userText, assistantText, p }
 
   function uuid(prefix) {
     uuidCounter++
-    return `${prefix}-${uuidCounter.toString().padStart(4, '0')}-${Math.random().toString(36).slice(2, 8)}`
+    return stableTurnIds
+      ? `${prefix}-deep-stable-${turnCounter.toString().padStart(4, '0')}`
+      : `${prefix}-${uuidCounter.toString().padStart(4, '0')}-${Math.random().toString(36).slice(2, 8)}`
   }
 
   // 构建单个真实结构 turn：
@@ -193,6 +202,8 @@
   }
 
   function clearThread() {
+    stopDeepSimulation()
+    stableTurnIds = false
     thread.textContent = ''
     turnSeq = []
     turnCounter = 0
@@ -211,7 +222,11 @@
     streamingTimer = setInterval(() => {
       if (i >= text.length) return clearInterval(streamingTimer)
       p.textContent += text[i++]
-      scroller.scrollTop = scroller.scrollHeight
+      // 与真实 ChatGPT 一致：仅当用户已停在底部附近时跟随输出滚动；
+      // 用户停在中间阅读时绝不移动视口（被动收获测试台的前提）
+      if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80) {
+        scroller.scrollTop = scroller.scrollHeight
+      }
     }, 45)
   }
 
@@ -268,6 +283,74 @@
     addTurns(8, 100)
   }
 
+  // ================= 长会话深度历史模拟（Passive History Harvest 测试台）=================
+  // 初始只挂载最近 12 轮并停在底部；用户向上滚动接近已挂载窗口顶部时
+  // 自动 prepend 更旧历史（模拟 ChatGPT lazy loading），同时按虚拟化窗口卸载远端 turn。
+  // TurnRail 侧对这些行为的响应必须是纯被动的：绝不代替用户滚动。
+  let pendingHistory = [] // 最旧在前
+  let deepLazyTimer = 0
+  let deepVirtTimer = 0
+  let deepTotal = 0
+
+  function stopDeepSimulation() {
+    if (deepLazyTimer) { clearInterval(deepLazyTimer); deepLazyTimer = 0 }
+    if (deepVirtTimer) { clearInterval(deepVirtTimer); deepVirtTimer = 0 }
+    pendingHistory = []
+  }
+
+  function deepApplyVirtualization() {
+    // 与 applyVirtualization 相同的窗口策略，但独立于 virt-on 开关
+    if (turnSeq.length === 0) return
+    const total = turnSeq.length
+    const ratio = scroller.scrollHeight > scroller.clientHeight
+      ? scroller.scrollTop / (scroller.scrollHeight - scroller.clientHeight)
+      : 0
+    const center = Math.round(ratio * (total - 1))
+    const start = Math.max(0, center - 40)
+    const end = Math.min(total, center + 40)
+    const mountedCount = turnSeq.filter((it) => it.root.isConnected).length
+    if (mountedCount !== end - start) {
+      thread.textContent = ''
+      for (let i = start; i < end; i++) thread.appendChild(turnSeq[i].root)
+      const newRatio = (center + 0.5) / total
+      scroller.scrollTop = newRatio * Math.max(1, scroller.scrollHeight - scroller.clientHeight)
+    }
+  }
+
+  function loadConversationDeep(total, withVirtualization) {
+    stopDeepSimulation()
+    clearThread()
+    stableTurnIds = true
+    deepTotal = total
+    const windowCount = 12
+    const all = []
+    for (let i = 1; i <= total; i++) {
+      all.push(makeTurn(`（长会话）Q${i}: 深度历史问题 ${i}，内容足够长以产生滚动距离。`, `（长会话回复 ${i}）这是对问题 ${i} 的模拟回答。`))
+    }
+    const mounted = all.slice(total - windowCount)
+    pendingHistory = all.slice(0, total - windowCount)
+    const frag = document.createDocumentFragment()
+    for (const it of mounted) { turnSeq.push(it); frag.appendChild(it.root) }
+    thread.appendChild(frag)
+    requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight })
+
+    // lazy loading：接近视觉顶部时 prepend 更旧历史（每次 8 轮）
+    deepLazyTimer = setInterval(() => {
+      if (pendingHistory.length === 0) { clearInterval(deepLazyTimer); deepLazyTimer = 0; return }
+      if (scroller.scrollTop > 160) return
+      const before = scroller.scrollHeight
+      const batch = pendingHistory.splice(0, 8)
+      turnSeq = batch.concat(turnSeq)
+      const frag2 = document.createDocumentFragment()
+      for (const it of batch) frag2.appendChild(it.root)
+      thread.prepend(frag2)
+      scroller.scrollTop += scroller.scrollHeight - before
+    }, 250)
+
+    // virtualization：按滚动位置维护 ±40 窗口（仅超长会话启用）
+    if (withVirtualization) deepVirtTimer = setInterval(deepApplyVirtualization, 300)
+  }
+
   document.body.addEventListener('click', (event) => {
     const act = event.target?.dataset?.act
     if (!act) return
@@ -281,6 +364,10 @@
       case 'add60': addTurns(60, turnSeq.length); break
       case 'add150-dup': addTurns(150, turnSeq.length, '继续'); break
       case 'prepend10': prependHistory(10); break
+      case 'deep40': setRoute('/c/mock-deep-3333-4444'); loadConversationDeep(40, false); break
+      case 'deep72': setRoute('/c/mock-deep-3333-4444'); loadConversationDeep(72, false); break
+      case 'deep120': setRoute('/c/mock-deep-3333-4444'); loadConversationDeep(120, true); break
+      case 'deep-stop': stopDeepSimulation(); break
       case 'virt-on': setVirtualization(true); break
       case 'virt-off': setVirtualization(false); break
       case 'theme': document.body.classList.toggle('dark'); break
@@ -292,6 +379,13 @@
   history.replaceState(null, '', '/c/mock-aaaa-1111-4444')
   routeLabel.textContent = 'route: /c/mock-aaaa-1111-4444'
   loadConversationA()
+
+  // 测试钩子（纯计数，无正文）
+  window.__deep = {
+    pendingHistoryCount: () => pendingHistory.length,
+    turnSeqCount: () => turnSeq.length,
+    mountedCount: () => turnSeq.filter((it) => it.root.isConnected).length
+  }
 </script>
 </body>
 </html>

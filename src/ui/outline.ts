@@ -2,6 +2,28 @@ import { createEl } from '../utils/dom'
 import type { ConversationTurn } from '../conversation/types'
 import type { ConversationHealthSnapshot } from '../health/types'
 
+/**
+ * 目录条目加载状态（规格 #29）：
+ * - 'preview-only'：Store 只有截断 preview（缓存 hydrate），正文从未完整收获 —— 真正待补全；
+ * - 'not-loaded'：无完整度记录且未挂载（保守兜底，正常数据流不出现）；
+ * - null：已完整收获（full）—— 即使被 virtualization 卸载也不再显示"未加载"，
+ *   因为 detached ≠ 未收获；点击仍可经 recoverAndJump 重新挂载跳转。
+ */
+export type TurnLoadFlag = 'preview-only' | 'not-loaded'
+
+export function turnLoadFlag(turn: ConversationTurn): TurnLoadFlag | null {
+  const user = turn.user
+  if (!user) return null
+  if (user.contentCompleteness === 'preview') return 'preview-only'
+  if (!user.element?.isConnected && user.contentCompleteness !== 'full') return 'not-loaded'
+  return null
+}
+
+const TURN_FLAG_LABEL: Record<TurnLoadFlag, string> = {
+  'preview-only': '仅预览',
+  'not-loaded': '未加载'
+}
+
 export interface OutlineHandlers {
   onJump: (turnId: string) => void
   onLoadHistory: () => void
@@ -31,6 +53,8 @@ export interface Outline {
   renderItems(turns: ConversationTurn[], query: string, detectFailed: boolean): void
   setActive(turnId: string | undefined): void
   setStatus(text: string): void
+  /** 静态历史覆盖状态（footer 低干扰文本，如"历史 72 · 部分"） */
+  setHistoryStatus(text: string): void
   setBusy(busy: boolean): void
   clearSearch(): void
   /** ☆/★ 状态同步（含 tooltip / aria-pressed） */
@@ -184,13 +208,17 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
   // 底部
   const foot = createEl('div', 'tn-panel-foot')
   const status = createEl('span', 'tn-status', '')
+  // 静态历史覆盖状态（低干扰：只反映当前实际 coverage，无动画、无后台任务进度）
+  const historyStatus = createEl('span', 'tn-history-status', '')
   const loadButton = document.createElement('button')
   loadButton.type = 'button'
   loadButton.className = 'tn-load-btn'
   loadButton.textContent = '加载全部历史'
-  loadButton.setAttribute('aria-label', '滚动加载当前会话的全部历史消息')
+  // 明确告知：这是唯一会主动滚动页面的操作，由用户显式授权
+  loadButton.title = '主动滚动聊天以加载更早历史，完成后会尝试恢复原阅读位置'
+  loadButton.setAttribute('aria-label', '加载全部历史（会暂时滚动聊天，完成后恢复阅读位置）')
   loadButton.addEventListener('click', () => handlers.onLoadHistory())
-  foot.append(status, loadButton)
+  foot.append(status, historyStatus, loadButton)
 
   element.append(head, search, health, list, handoffView, foot)
 
@@ -400,8 +428,9 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
       const q = createEl('span', 'tn-q', `Q${turn.index + 1}`)
       const itemTitle = createEl('span', 'tn-item-title', turn.title)
       item.append(q, itemTitle)
-      if (!turn.user?.element?.isConnected) {
-        item.appendChild(createEl('span', 'tn-flag', '未加载'))
+      const flag = turnLoadFlag(turn)
+      if (flag !== null) {
+        item.appendChild(createEl('span', 'tn-flag', TURN_FLAG_LABEL[flag]))
       }
       item.appendChild(createCheckpointButton(turn.id))
       if (turn.id === activeId) item.classList.add('tn-active')
@@ -431,6 +460,10 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     status.textContent = text
   }
 
+  function setHistoryStatus(text: string): void {
+    historyStatus.textContent = text
+  }
+
   function setBusy(value: boolean): void {
     loadButton.disabled = value
     loadButton.textContent = value ? '加载中…' : '加载全部历史'
@@ -441,5 +474,5 @@ export function createOutline(parent: HTMLElement, handlers: OutlineHandlers): O
     handlers.onSearchInput('')
   }
 
-  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setBusy, clearSearch, setCached, setCacheEnabled, setCheckpointLookup, showHandoffPreview, hideHandoffPreview, isHandoffPreviewOpen, setHandoffEntryVisible }
+  return { element, open, close, isOpen, setCount, setHealth, renderItems, setActive, setStatus, setHistoryStatus, setBusy, clearSearch, setCached, setCacheEnabled, setCheckpointLookup, showHandoffPreview, hideHandoffPreview, isHandoffPreviewOpen, setHandoffEntryVisible }
 }

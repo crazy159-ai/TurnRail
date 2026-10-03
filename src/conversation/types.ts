@@ -47,5 +47,15 @@ export interface DetachedTurn {
  * assistant 流式输出（高频、仅 assistant 文本）绝不触发健康重算等语义级工作，
  * 而 user prompt 变化（编辑 / 重解析）必须触发 —— 消费方依赖这一区分。
  * 同批两者都变时 indexer 以 'user-text' 优先上报。
+ *
+ * 'coverage' 表示 TurnRail 对某条消息的掌握程度变化（preview → full 升级），
+ * 用户语义并未改变 —— 即使文本与 preview 完全一致也必须上报，健康覆盖度 /
+ * 目录"仅预览"标记等消费者依赖它重算，绝不能因文本相同而被当成无变化。
  */
-export type ChangeKind = 'structure' | 'user-text' | 'assistant-text' | 'elements' | 'none'
+export type ChangeKind =
+  | 'structure'
+  | 'user-text'
+  | 'assistant-text'
+  | 'elements'
+  | 'coverage'
+  | 'none'

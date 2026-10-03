@@ -7,6 +7,10 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 
 全部处理在浏览器本地完成，**不上传、不泄露任何聊天内容**；用户主动缓存的导航元数据仅保存在本机扩展存储中（见下文「Local conversation cache」）。
 
+> TurnRail tracks ChatGPT SPA conversation changes without requiring a page refresh. Route identity changes immediately clear stale conversation state; live DOM data is accepted only after the new conversation is ready — and once valid new-conversation DOM appears, the transition is guaranteed to complete without any user interaction (no refresh, no tab switch).
+>
+> TurnRail 会自动跟随 ChatGPT 的 SPA 对话切换，无需刷新页面。检测到新的会话身份后会立即清除旧会话状态，并只在新会话 DOM 就绪后接受新的 Live 数据；即使新会话 DOM 迟到（慢加载 / React 原地换内容 / root 元素换代），也保证最终自动恢复，无需刷新、无需切换标签页。（见下文「Route Lifecycle」）
+
 ---
 
 ## Features
@@ -15,10 +19,15 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 - hover 轨道展开浮动目录面板（可 📌 固定），点击任意问题平滑跳转
 - 滚动时自动高亮当前问题（rail marker + 面板条目同步）
 - 新消息实时加入索引（MutationObserver + 去抖增量扫描）
-- 切换会话（SPA 路由）自动重建索引，旧目录不残留
+- 切换会话（SPA 路由）立即清除旧目录并由事件路径（非轮询）同步新会话，旧目录不残留；
+  新会话 Live 内容仅在 DOM 就绪确认后接受（见「Route Lifecycle」）
 - 长对话支持：
-  - 消息被虚拟化卸载后 metadata 保留（目录显示"未加载"标记）
-  - 「加载全部历史」：受控向上滚动渐进收获历史（有超时/迭代上限，结束恢复阅读位置）
+  - 消息被虚拟化卸载后 metadata 保留（已完整收获的条目不显示任何"未加载"标记；
+    仅缓存 preview 截断文本的条目显示"仅预览"）
+  - Passive History Harvest：被动收获 ChatGPT 当前已经加载到页面中的历史内容，
+    不会为了补全历史自动滚动你的聊天页面
+  - 「加载全部历史」：唯一由用户显式授权的滚动加载（有超时/迭代上限，结束恢复阅读位置，
+    按钮明确提示会滚动）
   - 点击未加载问题自动受控滚动查找（recover），失败安全回退
 - 目录内搜索（大小写不敏感子串匹配）
 - 🩺 Chat health check：完全本地的多信号启发式评估（0–100），结合对话长度、方案反转、纠错频率、主题漂移、跨轮依赖与复杂度，在风险叠加时提示整理阶段结论或新开聊天；**不声称知道 ChatGPT 实际上下文窗口，也不会自动替用户换聊**
@@ -86,6 +95,8 @@ lifecycle 日志，绝不以 warning / error 记录），也不会自动刷新�
 
 调试日志：在页面控制台执行 `localStorage.setItem('tn-debug', '1')` 并刷新（生产默认关闭）。
 性能指标：`__tnDebug.performance`（TTFR / TTLR / 扫描与 observer 分类计数），`__tn.resetPerformanceStats()` 重置。
+历史覆盖状态（DEBUG）：`__tnDebug.historyCoverage`（indexedTurns / previewUserTurns /
+reachedTop / state 等，纯数字）。
 生命周期诊断（DEBUG）：`__tnDebug.bootstrapCount`（同一页面 bootstrap 次数，正常恒为 1）、
 `__tnDebug.extensionVersion`、`__tnDebug.extensionIdHash`（extension ID 的短 hash，
 用于排查"同时装了开发版 + Release 版两个副本"类问题；绝不输出完整 ID）。
@@ -153,7 +164,9 @@ Store ──► Handoff 服务 (handoff/)   ← 仅用户点击时运行，不�
 | `providers/chatgpt.ts` | 站点适配层：多策略 selector、角色/文本提取、会话 ID、滚动容器定位 |
 | `conversation/indexer.ts` | 扫描 → 稳定 ID → 去重 → 调和 turn 列表（含未挂载 turn 的锚定保留） |
 | `conversation/store.ts` | 纯数据仓库 + 事件广播；UI 从 store 渲染，不把 DOM 当 store |
-| `conversation/historyCapture.ts` | 「加载全部历史」受控滚动捕获 |
+| `conversation/historyCapture.ts` | 「加载全部历史」受控滚动捕获（唯一被用户授权的主动滚动） |
+| `conversation/historyCoverage.ts` | 历史覆盖统计（纯函数：full/preview/missing + reachedTop → state） |
+| `content/passiveTopWatch.ts` | 被动到顶证据采集（只监听容器滚动，绝不写 scrollTop） |
 | `health/analyzer.ts` / `health/types.ts` | 本地聊天健康评估：六类可解释信号 → 风险/健康分级；不联网、不读取模型内部上下文状态 |
 | `navigation/scrollSpy.ts` | 阅读位置检测（active turn） |
 | `navigation/jump.ts` | 平滑跳转 + sticky header 补偿 + 一次性 outline 脉冲 |
@@ -170,10 +183,13 @@ Store ──► Handoff 服务 (handoff/)   ← 仅用户点击时运行，不�
 | `handoff/builder.ts` / `formatter.ts` | 纯函数确定性抽取（Checkpoint + Recent Tail + Current Objective，objective 同轮去重）与 markdown 渲染；checkpoint 超限保留最新；fence 安全截断 + 显式 warning |
 | `handoff/pendingStore.ts` / `injector.ts` | 短生命周期跨标签页通道（TTL / 身份安全消费：只删自己注入的那条）与新聊天页 composer 草稿注入（写入后回读验证，绝不发送） |
 | `content/observers.ts` | 两层 Observer：短命 Root Watch（root 缺失时等出现）+ scoped Conversation Observer（root 出现即断开 document 级监听） |
+| `content/routeIdentity.ts` | 路由身份纯数据定义与比较（conversation:<id> / page:<path>；不认识站点语义，ID 由 Provider 注入提取） |
+| `content/routeWatcher.ts` | SPA 路由身份检测：Navigation API `currententrychange` 主路径 + popstate + focus/visibility 恢复 + 廉价轮询兜底，严格去重（ISOLATED world 可靠，不 monkey patch history） |
+| `content/conversationTransition.ts` | 会话切换 DOM 就绪门：廉价签名（root + 首/尾 turn ID）判断新会话内容，短生命周期退避 + 事件恢复，就绪即停 |
 | `content/mutationPipeline.ts` | Mutation 分类器 + Dirty Turn 队列（streaming 忽略 / turn 内变化 / unknown 回退 full scan；40ms 批量去重） |
 | `content/startupScan.ts` | 启动稳定性退避扫描（100→2400ms，连续 2 次签名不变即停，替代固定 8×400ms） |
 | `utils/performance.ts` | PerformanceStats（TTFR / TTLR / full-vs-incremental / observer 分类；仅 tn-debug，无上传） |
-| `content/main.ts` / `bootstrap.ts` / `routeWatcher.ts` | 入口与生命周期、SPA 路由检测、缓存桥接、性能标记 |
+| `content/main.ts` / `bootstrap.ts` / `routeWatcher.ts` | 入口与两阶段路由生命周期（Phase A 身份切换 / Phase B DOM 就绪门）、generation 会话隔离、缓存桥接、性能标记 |
 
 ## Local conversation cache
 
@@ -309,6 +325,9 @@ TurnRail runs locally in your browser.
   诊断导出只含纯数字元数据（pending / 字符数 / age），绝不含交接文本
 - 聊天正文仅以 `textContent` 渲染进 Shadow DOM，绝不作为 HTML 注入（防 XSS）
 - Manifest 仅申请 `storage` 权限 + content script 匹配两条 host
+- **历史收获同样零网络**：不请求 ChatGPT 任何 API（公开或私有）、
+  不抓取内部接口、不上传任何数据 —— 只观察 ChatGPT 自己加载出来的 DOM；
+  收获的完整正文只存在于当前页面内存（Store），不写入长期缓存
 - 以上承诺由 `test/unit/privacyContract.test.ts` 自动强制（含 handoff 模块零
   console 输出、零网络原语、composer selector 边界）
 
@@ -344,15 +363,149 @@ TurnRail runs locally in your browser.
 
 ## How long conversation handling works（长对话策略）
 
-1. **Level 1（自动）**：消息挂载即收获入库；被虚拟化卸载后 metadata 保留、DOM 引用释放，
-   目录中标记"未加载"。索引随浏览逐渐完整。
-2. **Level 2（用户主动触发）**：点击「加载全部历史」→ 记录阅读锚点 → 渐进向上滚动 →
-   等待懒加载渲染 → 收获 → 连续无新增/到顶/达到迭代上限（300 次/45s）即停止 →
-   按锚点 + 内容增量精确恢复原阅读位置。
-3. **未挂载目标跳转**：点击"未加载"问题 → 判断方向 → 受控逐屏滚动 → 每步收获扫描 →
-   命中即跳转；带最大迭代（60 次/20s）与边界终止，失败恢复原位置并提示。
+1. **Passive indexing（自动、零干扰）**：消息挂载即收获入库；被虚拟化卸载后 metadata
+   保留、DOM 引用释放。卸载 ≠ 未收获：正文已完整读取的条目不显示任何标记；仅缓存
+   preview 截断文本的条目显示"仅预览"。用户正常浏览到哪里，索引就收获到哪里 ——
+   TurnRail 绝不为补全历史自动滚动页面。
+2. **Jump recovery（用户点击触发）**：点击未挂载的问题 → 判断方向 → 受控逐屏滚动 →
+   每步收获扫描 → 命中即跳转；带最大迭代（60 次/20s）与边界终止，失败恢复原位置并提示。
+3. **Load full history（用户显式授权）**：点击「加载全部历史」→ 记录阅读锚点 →
+   渐进向上滚动 → 等待懒加载渲染 → 收获 → 连续无新增/到顶/达到迭代上限（300 次/45s）
+   即停止 → 按锚点 + 内容增量精确恢复原阅读位置。这是唯一会主动滚动页面的后台级操作，
+   按钮文案与 tooltip 明确告知"会暂时滚动聊天"。
 4. **分支/编辑/regenerate**：以"当前可见 branch 为真实索引"；检测到大面积 turn 更换时
    丢弃失效的离线 metadata，不猜测不可见分支。
+
+## Passive History Harvest（被动历史收获）
+
+**产品原则：TurnRail 绝不为补全历史主动滚动当前聊天。**
+优先级永远是：用户阅读位置 > 用户滚动 > 用户输入 > 用户导航 > Handoff > Health >
+历史完整度。如果加载更早历史需要改变用户当前阅读位置，TurnRail 会等待用户显式点击
+「加载全部历史」，而不是自己动手。
+
+> TurnRail does not auto-scroll a conversation in the background.
+> If loading older ChatGPT history would require moving the user's current reading
+> position, TurnRail waits for explicit user action instead.
+
+ChatGPT 对长会话采用 lazy loading + DOM virtualization：当前视口只挂载部分历史 turn。
+TurnRail 的收获模型因此只有三种数据来源：
+
+- **Live Passive Harvest（自动）**：用户正常滚动 / 阅读 / 跳转 / 继续聊天时，
+  ChatGPT 自己挂载新的 DOM，TurnRail 经既有 MutationObserver → Indexer → Store
+  管道被动收获（preview → full 完整度升级会广播 `coverage` 事件，Health / Handoff
+  随之受益）。TurnRail 不制造任何新的 DOM churn，也没有任何后台定时器。
+- **Cache Hydration（自动）**：已缓存会话重新打开时先恢复目录（title / preview /
+  turn id）。preview ≠ full —— 截断文本的条目显示"仅预览"，等 Live 挂载升级。
+- **Explicit Full History Capture（用户点击）**：只有点击「加载全部历史」才运行
+  `captureFullHistory()` 受控滚动，按钮 busy 明确、结束后恢复阅读位置。
+
+**到顶证据（reachedTop）只在两种情况下成立**：显式捕获确认到顶，或用户自然停在
+视觉顶部且稳定窗口内没有新的懒加载（`src/content/passiveTopWatch.ts`，纯滚动监听、
+零滚动写入）。绝不以"很久没有新增"推测 complete。
+
+**为什么没有后台自动加载**：曾经实现过 Cooperative History Warmup（用户空闲时低优先级
+小批次滚动探索），真实使用证明程序化滚动当前聊天本身就是不可接受的副作用 —— 即使
+"滚过去再滚回来"，也会产生页面闪动、内容跳动、阅读干扰。相关调度器 / 空闲门控 /
+批量指标已全部移除。源码级合同 `BACKGROUND_TASK_MUST_NOT_SCROLL` 由
+`test/unit/passiveHistory.test.ts` 强制：除 jump / recover / manual capture /
+scrollAnchor / 几何层外，任何模块出现滚动写入即测试失败。
+
+完整正文不写入长期导航缓存（隐私边界不变）：页面刷新后，随用户再次浏览逐步重新收获。
+
+## Route Lifecycle（会话路由生命周期）
+
+TurnRail 在不刷新页面的前提下跟随 ChatGPT 的 SPA 会话切换。五条产品不变量
+（由 `src/content/bootstrap.ts` 的两阶段实现与测试合同共同强制）：
+
+```text
+ROUTE_IDENTITY_CHANGED   →  OLD_STATE_INVALID_IMMEDIATELY
+NEW_LIVE_DATA            →  ONLY_AFTER_DOM_READY
+STALE_ASYNC_WORK         →  NEVER_MUTATES_NEW_CONVERSATION
+VALID_NEW_DOM_APPEARS    →  TRANSITION_EVENTUALLY_READY
+TRANSITION_RECOVERY      →  OBSERVE_ONLY（不滚动 / 不解析正文 / 不 Health / 不 Handoff）
+```
+
+两条 Phase B 语义合并成一句：**绝不接受旧会话 DOM，但新会话 DOM 一旦出现
+绝不永久等待**（fast → slow 可以，fast → dead 禁止）。
+
+**为什么不能靠 history monkey patch**：content script 运行在 Chrome 扩展的
+ISOLATED world，ChatGPT 页面（MAIN world）调用 `history.pushState` 不会经过
+TurnRail 所在 world 的实例 wrapper —— 这正是旧实现"mock 测试通过、真实
+ChatGPT 切换不实时"的根因。TurnRail 不改 MAIN world、不新增任何权限
+（保持仅 `storage`），而是使用浏览器原生信号。
+
+**Phase A — Identity transition（身份切换，立即执行）**。路由身份一变化：
+路由代数（generation）递增，停止旧 root 的观察器 / 启动扫描 / RootWatch /
+被动到顶采集（`topWatch.reset()`，A 的 reachedTop 证据不残留 B），清空旧
+Store / UI / Health / History 状态 / Handoff 预览，Handoff 入口按新会话重建。
+旧目录立即消失，绝不继续展示 A 冒充 B。
+
+**Phase B — DOM readiness（DOM 就绪门）**。URL 变化不代表 DOM 已换成新会话
+（React 通常滞后 0~数百 ms，且可能复用同一个 conversation root 元素）。
+`src/content/conversationTransition.ts` 用廉价 DOM 签名（root 身份 + 首 / 尾
+turn 稳定 ID，来自 `provider.locateTurnRoots()`，无正文解析）判断新会话内容：
+root 换绑或首 / 尾 turn 变化即就绪；空对话（0 turn）同样适用，绝不等待
+`turnCount > 0`。探测按 0/16/50/100/200/400/800ms 短生命周期退避；耗尽后
+不强把旧 DOM 当新 DOM，也绝不进入永久死等，转入三路并存的恢复
+（全部只做廉价签名探测）：
+
+- **Mutation Wake** —— 仅 transition 存活期间的临时 `document.body`
+  MutationObserver（microtask 合并，一帧至多一次探测），DOM 终于换上新
+  会话时立即就绪；覆盖"root 不消失、仅原地换内容"且无 focus / visibility
+  变化的 late swap 窗口（B28）。ready / 路由再变即退订，绝不常驻；
+- **低频 Recovery Poll**（1500ms，仅 transitioning 期间）—— 即使 observer
+  未捕获目标变化也保证最终发现（B30 / B31）；
+- **focus / visibilitychange / RootWatch probeNow** 事件恢复。
+
+期间 UI 保持空目录或缓存目录；transitioning 超过 1.2s 时 footer 显示一次
+低干扰提示"正在同步当前对话…"（超过 10s 换为"尚未完成加载"），ready 立即
+清除。就绪后才挂会话 Observer、启动扫描、执行缓存调和。就绪后 gate 立即
+停止，绝不常驻。
+
+**previous 基线 = Accepted Live Signature**。gate 的就绪判定需要"上一会话"
+签名做对照，但它绝不在 route event 之后临时读取当前 DOM —— DOM 可能先于
+route event 换成新会话（合法顺序），临时读取会得到 previous == current 而
+永久等待。bootstrap 维护 `acceptedDomState`：Phase B 完成（新 DOM 已确认
+属于当前会话）与正常 structure 变化（新增消息 / lazy mount / virtualization）
+时记录快照，route change 时作为 previous 上报并立即失效；缓存 hydrate 不是
+Live 接受，绝不记录。accepted 缺失时按序回退：Store + activeRoot 的已接受
+状态 → gate 最近一次探测读到的签名 → null（仅初始启动）。
+
+**Live Write Identity Guard（防御纵深）**。所有 Live DOM → Store 的写入路径
+（mutation 管道 onDirty / onFullScan、startup scan）在写入前核对三件事：
+Phase B 已完成、root 仍连接、路由身份仍是本轮 reset 时的预期身份。即使未来
+RouteWatcher 时序再变，错会话 DOM 也不能进入 Store。
+
+**路由检测信号**（`src/content/routeWatcher.ts`）：
+
+- Navigation API `currententrychange` —— 主路径（事件驱动，feature detect，
+  只观察、绝不 `intercept()/preventDefault()/navigate()`）；
+- `popstate` —— 前进 / 后退；
+- `focus` / `visibilitychange(visible)` —— 恢复探测（后台 tab 计时器被节流，
+  用户切回时立即核对身份）；
+- 300ms 廉价身份轮询 —— correctness fallback（Navigation API 缺席或失效时
+  保证正确性），每次只做 O(1) 的 pathname + 会话 ID 比较，绝不触碰 DOM 扫描。
+
+**路由身份（Route Identity）**：会话路由的身份是会话 ID（由 Provider 提取），
+非会话路由的身份是 pathname。同一会话内的 query / hash / 临时参数变化
+（如 `/c/AAA?model=x → /c/AAA?model=y`）语义上是同一会话，不触发任何重置。
+多个信号看到同一次导航时严格去重，`onChange` 只触发一次。
+
+**会话隔离（generation 贯穿全部 async path）**：缓存读取、显式历史捕获、
+恢复跳转、Handoff 注入、延时回调都必须捕获并复核 generation —— 不一致即
+丢弃。A 会话的迟到 cache read 绝不 hydrate B（B26）；捕获 / 恢复中途切会话
+立即中止；Handoff 草稿绝不写入非目标页面。Health 缓存键包含
+`conversationKey`（即使两个会话修订号巧合相同也不会误复用）。
+
+**DEBUG 诊断**（`__tnDebug.routeLifecycle`，纯元数据，绝不含会话 ID / URL /
+turn ID）：`generation`、`transitioning`、`transitionMode`
+（fast / mutation-wait / recovery-poll / ready —— 真实用户报告"侧边栏空"时
+可直接看到卡在哪个恢复阶段）、探测计数（`transitionProbeCount` /
+`recoveryProbeCount` / `mutationWakeCount`）、`acceptedSignaturePresent`
+（boolean，是否存在已接受的 Live 基线）、`lastSource`
+（navigation-api / popstate / poll / focus / visibility）、`lastReadyMs`，
+以及信号计数（`navigationApiSignals` / `pollSignals` / `transitions` 等，
+用于确认真实使用中切换主要来自事件路径而非轮询）。
 
 ## Performance（v1.2）
 
@@ -398,6 +551,12 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 - 无原生 ID（`data-turn-key` / `data-chatgpt-search-message-ids` 均缺失）时，完全相同文本的问题
   在虚拟化滚动时可能出现序号漂移（ID 重新分配），目录顺序可能短暂重排。
 - 分支切换靠启发式检测（"大量卸载 + 大量全新 id"同时出现时重置离线索引），极端场景可能残留少量"未加载"条目。
+- TurnRail 不做后台自动历史加载（刻意的产品决策）：用户不浏览到的旧历史不会被自动收获，
+  coverage 保持 partial；Health 在低覆盖时显示低置信度并收敛建议强度。
+  需要完整历史时点击「加载全部历史」（唯一被授权的滚动加载）。
+  被动收获的完整正文只存在于页面内存，刷新页面后需随浏览重新收获（隐私设计，
+  完整正文不入长期缓存）；"已到顶"仅表示已确认到达当前会话视觉顶部，
+  绝不表示模型 context / 服务端数据完整。
 - 导航缓存只让"已见过的 turn"提前可见：缓存无法凭空提供未加载过的历史；partial 缓存在发现更多 turn 前保持 partial。
 - 缓存的分支 / edit / regenerate 行为是 best-effort：Live 与缓存零重叠（判定为另一分支）时丢弃缓存 turn 并以 Live 重建。
 - Handoff checkpoint 为纯内存标记：页面刷新后需重新标星（附着稳定 turnId，虚拟化卸载 / SPA 切换不受影响）；pending handoff 注入依赖新聊天页 `#prompt-textarea` selector，站点改版时需更新 `providers/chatgpt.ts`。
@@ -412,7 +571,7 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
 | --- | --- |
 | 右侧看不到轨道 | 当前不在会话页（新会话 0 提问时隐藏）；或 DOM 策略失效——看面板是否显示"无法识别" |
 | 轨道出现但点击无反应 | 控制台执行 `localStorage.setItem('tn-debug','1')` 后刷新，查看 `[TurnRail]` 日志 |
-| 部分问题带"未加载" | 该历史尚未被浏览器挂载：点击它自动查找，或用「加载全部历史」 |
+| 部分问题带"仅预览" | TurnRail 只有该轮的截断缓存 preview，尚未完整收获：自然浏览到该区域后自动升级（无需任何操作）；也可用「加载全部历史」立即补全 |
 | 跳转后目标仍被遮挡 | 极少见；目标样式变化导致 header 测量偏差，欢迎提 issue |
 | 缓存按钮突然变灰 | 开发过程中重新加载过 TurnRail：旧 ChatGPT 标签页失去 extension context（预期生命周期事件），导航与 Health 仍可用；刷新该 ChatGPT 页面即可恢复缓存 |
 
@@ -440,6 +599,15 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   （TTL 过期不注入 / consume 即删 / storage 失败无假成功 / 注入器零触碰合同）、
   privacy/handoff 合同（独立命名空间、TTL 窗口、零 console、selector 边界）、
   诊断 handoff 元数据纯数字白名单。
+  Route Lifecycle 增量：`test/unit/routeWatcher.test.ts`（RW1–RW9 —— Navigation API
+  主路径 / 轮询兜底 / popstate / 多信号严格去重 / 同会话 query 不重置 / A↔B 身份
+  判定 / cleanup / focus / visibility 恢复探测）与 `test/unit/conversationTransition.test.ts`
+  （旧/新签名就绪判定、root 复用原地换内容、空对话、退避耗尽不强认旧 DOM、
+  probeNow、stop 后零探测、廉价签名合同）；最终确定性恢复增量：TR1–TR5
+  （fast 耗尽 → recovery poll 武装 / recovery 交付 / Mutation Wake 就绪 /
+  stop 全清理 / 路由替换后旧 gate 零迟到触发）、生产 Mutation Wake 合并语义、
+  AS1/AS1b（accepted 快照 —— DOM 先于 route event 换代时 previous 仍取已接受
+  签名；same-root 原地换代判定）。
 - `test/browser/`：Playwright 浏览器冒烟测试，直接自动化下列既有测试资产（无需登录 ChatGPT）。
   v1.2.3 增量：console 分类统计（production 0 warn / 0 error；DEBUG 无 warning 级
   invalidated 输出、console.debug lifecycle 恰 1 条）、storage 调用计数断言
@@ -448,11 +616,37 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   预览内容边界（含 checkpoint / 不含超范围旧轮）、取消零 pending、确认继续 →
   pending 落盘 + 打开意图、新聊天页自动填入 composer（不发送）+ 消费删除、
   streaming 不影响 checkpoint、Health CTA 分档。
+  Passive History Harvest 增量：`test/browser/passiveHistory.spec.ts` ——
+  长会话（40/72/120 轮 mock）idle / 阅读 / streaming / composer 输入四类场景
+  绝不自主滚动、用户自然滚旧历史被动收获 + 自然到顶证据（reachedTop）、
+  缓存 preview 目录"仅预览"标记 → 自然升级 full → Health 覆盖度感知（文本相同时也重算）、
+  manual capture busy UI / 恢复阅读位置、源码级 BACKGROUND_TASK_MUST_NOT_SCROLL 合同
+  （`test/unit/passiveHistory.test.ts`）。
+  Route Lifecycle 增量：`test/browser/route.spec.ts`（B19–B31）——
+  B19 原生 `History.prototype` 导航（绕过任何实例 wrapper，等价 ISOLATED vs MAIN
+  world 的真实导航方式）由 Navigation API 事件路径同步（断言 `lastSource`，轮询
+  无法蒙混）、B20 URL 先行 / DOM 延迟 300ms 期间 Store 为空且不把旧 DOM 扫进新
+  会话、B21 root 复用原地换内容被签名识别、B22 rapid A→B→C 迟到 B 被完全取代、
+  B23 同会话 query/hash 变化零重置（generation / Health / fullScans 不动）、
+  B24 新聊天首条消息 `/ → /c/<id>` 免刷新切换且 Observer 正确重绑、B25 后退 /
+  前进正确跟随、B26 迟到 cache read 被 generation 守卫丢弃（A 缓存只在切回 A 时
+  恢复）、B27 reachedTop 不跨会话残留且 B 重新确认到顶；最终确定性恢复增量：
+  B28 late same-root swap（DOM 在 fast 窗口后 2.5s 才原地换 B，零交互自动恢复）、
+  B29 DOM 先换 / route event 后到（previous 取 accepted A 签名，立即就绪）、
+  B30 旧 root 保留 >2s 后移除并插入全新 root（wake / recovery 识别 root 换代）、
+  B31 DOM 延迟 4.5s 超 fast 窗口（不 focus / 不切 tab，transitioning 最终必然
+  false + 低干扰 footer 提示出现与清除）；外加 routeLifecycle
+  隐私合同（元数据不含会话 ID / URL）与全流程零错误、零后台滚动。
+  测试台：`test/mock/route.html`（确定性 turn id、chrome.storage 内存模拟、
+  native / wrapped / 延迟 DOM / 迟到原地换 / DOM 先换 / root 元素换代 /
+  root 复用 / 同会话 query / popstate 重建等路由动作）。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
 - `test/mock/index.html`：按 2026-09 真实 DOM 结构构建的高仿真测试台
-  （含流式输出、懒加载 prepend、虚拟化卸载、SPA 路由切换、重复文本、UI 噪声注入、深浅色）。
+  （含流式输出、懒加载 prepend、虚拟化卸载、SPA 路由切换、重复文本、UI 噪声注入、
+  深浅色，以及长会话深度历史模拟 deep40 / deep72 / deep120 —— 初始仅挂载最近 12 轮、
+  接近顶部自动懒加载、deep120 按 ±40 窗口虚拟化卸载）。
 - `test/mock/reverse.html`：column-reverse 滚动坐标系测试台（复刻真实 ChatGPT）。
 
 本地手动打开测试台（与 Playwright 内置 server 相同的跨平台 Node 实现）：
@@ -462,6 +656,7 @@ node scripts/serve-test-pages.mjs   # 在项目根目录，默认 http://127.0.0
 # fixture: http://127.0.0.1:8931/test/fixture/index.html
 # mock:    http://127.0.0.1:8931/test/mock/index.html
 # reverse: http://127.0.0.1:8931/test/mock/reverse.html
+# route:   http://127.0.0.1:8931/test/mock/route.html
 ```
 
 真实页面验收：控制台执行 `localStorage.setItem('tn-debug','1')` 并刷新，检查 `__tnDebug`：
@@ -469,5 +664,5 @@ node scripts/serve-test-pages.mjs   # 在项目根目录，默认 http://127.0.0
 
 已验证：fixture 6 项断言、12/162 轮索引与唯一性、点击跳转（目标为 userUnit）、滚动高亮
 （含顶/底边界）、hover 面板、搜索过滤、会话切换重建、首页/空会话隐藏、流式输出零重建、
-虚拟化卸载（153 个"未加载"标记保留）+ 未挂载目标恢复跳转（恢复日志 found=true）、
+虚拟化卸载（detached turn metadata 保留且不显示"未加载"）+ 未挂载目标恢复跳转（恢复日志 found=true）、
 `[data-thread-find-skip]` 正文清理、「加载全部历史」全流程、控制台零错误。
