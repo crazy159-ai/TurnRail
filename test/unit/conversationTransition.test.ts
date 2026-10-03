@@ -2,18 +2,22 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   beginConversationTransition,
+  createTransitionDomEvents,
   isConversationDomReady,
   readConversationDomSignature,
   TRANSITION_PROBE_DELAYS,
+  TRANSITION_RECOVERY_POLL_MS,
   type ConversationDomSignature,
+  type TransitionDomEvents,
   type TransitionEvents,
   type TransitionTimers
 } from '../../src/content/conversationTransition.ts'
 
 /**
- * Conversation Transition Gate 契约测试（规格 #16–#24）：
- * 旧/新 DOM 签名比较、短生命周期退避、give-up 后事件恢复、probeNow、
- * ready 后立即停止。全部注入假时钟与假事件，零真实等待。
+ * Conversation Transition Gate 契约测试（规格 #16–#24 + eventual recovery）：
+ * 旧/新 DOM 签名比较、短生命周期退避、fast 耗尽后 recovery poll / Mutation Wake、
+ * give-up 后事件恢复、probeNow、ready/stop 后全部停止。全部注入假时钟与假事件，
+ * 零真实等待。
  */
 
 // ---------- 假环境 ----------
@@ -21,6 +25,7 @@ import {
 interface TransitionFake {
   timers: TransitionTimers & { advance(ms: number): void; pendingCount(): number }
   events: TransitionEvents & { fireProbeTrigger(): void }
+  domEvents: TransitionDomEvents & { fireMutation(): void; subscribedCount(): number }
   probes: { count: number }
 }
 
@@ -29,6 +34,7 @@ function makeFake(): TransitionFake {
   let now = 0
   let seq = 0
   let listener: (() => void) | null = null
+  const domListeners = new Set<() => void>()
   const probes = { count: 0 }
 
   return {
@@ -73,6 +79,20 @@ function makeFake(): TransitionFake {
       },
       fireProbeTrigger() {
         listener?.()
+      }
+    },
+    domEvents: {
+      subscribe(l) {
+        domListeners.add(l)
+      },
+      unsubscribe(l) {
+        domListeners.delete(l)
+      },
+      fireMutation() {
+        for (const l of [...domListeners]) l()
+      },
+      subscribedCount() {
+        return domListeners.size
       }
     },
     probes
@@ -170,7 +190,7 @@ test('gate: DOM 延迟挂载 → 退避探测就绪（0/16ms 节奏，不等待 
   assert.equal(fake.probes.count, 2, '同步首探测 → 16ms 退避命中')
 })
 
-test('gate: 退避耗尽仍未就绪 → 停止轮询探测（不强把旧 DOM 当新 DOM），事件恢复补探测', () => {
+test('gate: 退避耗尽仍未就绪 → 停止 fast 探测（不强把旧 DOM 当新 DOM），事件恢复补探测', () => {
   const fake = makeFake()
   let readyCount = 0
   let current = sig('root-a', 12, 'a-1', 'a-12')
@@ -183,15 +203,18 @@ test('gate: 退避耗尽仍未就绪 → 停止轮询探测（不强把旧 DOM �
     isReady: (signature) => isConversationDomReady(sig('root-a', 12, 'a-1', 'a-12'), signature),
     onReady: () => readyCount++,
     timers: fake.timers,
-    events: fake.events
+    events: fake.events,
+    domEvents: fake.domEvents
   })
 
-  // 走完全部退避（0..800ms）：未就绪、无 onReady、计时清空
+  // 走完全部退避（0..800ms）：未就绪、无 onReady、fast 计时清空；
+  // recovery poll 武装（不进入永久死等，规格 #15/#18）
   fake.timers.advance(2000)
   assert.equal(readyCount, 0, '规格 #54：超时后保持 cache-only，绝不恢复旧 Store')
   assert.equal(fake.probes.count, TRANSITION_PROBE_DELAYS.length)
-  assert.equal(fake.timers.pendingCount(), 0)
+  assert.equal(fake.timers.pendingCount(), 1, 'recovery poll 必须已武装（TR1）')
   assert.equal(gate.ready, false)
+  assert.equal(gate.stats.mode, 'recovery-poll')
 
   // 事件恢复（focus / visibility）：补一次探测，仍未就绪则继续等待
   fake.events.fireProbeTrigger()
@@ -203,6 +226,7 @@ test('gate: 退避耗尽仍未就绪 → 停止轮询探测（不强把旧 DOM �
   fake.events.fireProbeTrigger()
   assert.equal(readyCount, 1)
   assert.equal(gate.ready, true)
+  assert.equal(fake.timers.pendingCount(), 0, 'ready 后 recovery 立即停止')
 })
 
 test('gate: probeNow（RootWatch 发现 root）→ 立即补一次探测', () => {
@@ -281,6 +305,220 @@ test('gate: 就绪后 probeNow / 事件 / 计时全部失效（onReady 恰好一
   fake.timers.advance(2000)
 
   assert.equal(readyCount, 1, 'onReady 绝不重复触发')
+})
+
+// ---------- TR1–TR5：fast 耗尽后的最终确定性恢复（规格 #15/#18） ----------
+
+/** 构造一个始终不就绪的 gate（DOM 停留在旧会话 A） */
+function beginStuckGate(
+  fake: TransitionFake,
+  current: { value: ConversationDomSignature },
+  onReady: () => void = () => undefined
+): ReturnType<typeof beginConversationTransition> {
+  return beginConversationTransition({
+    probe: () => {
+      fake.probes.count++
+      return current.value
+    },
+    isReady: (signature) =>
+      isConversationDomReady(sig('root-a', 12, 'a-1', 'a-12'), signature),
+    onReady,
+    timers: fake.timers,
+    events: fake.events,
+    domEvents: fake.domEvents
+  })
+}
+
+test('TR1: fast 退避全部耗尽仍未就绪 → recovery poll 武装（fast → slow，绝不 fast → dead）', () => {
+  const fake = makeFake()
+  const current = { value: sig('root-a', 12, 'a-1', 'a-12') }
+  let readyCount = 0
+
+  const gate = beginStuckGate(fake, current, () => readyCount++)
+
+  // 退避表为相对间隔：0+16+50+100+200+400+800 ≈ 1.57s 后耗尽
+  fake.timers.advance(1600)
+  assert.equal(fake.probes.count, TRANSITION_PROBE_DELAYS.length, 'fast 探测恰好退避表次数')
+  assert.equal(readyCount, 0)
+  assert.equal(fake.timers.pendingCount(), 1, 'recovery timer 必须已武装')
+  assert.equal(gate.stats.mode, 'recovery-poll')
+  assert.equal(gate.stats.recoveryProbeCount, 0, 'recovery 尚未开火')
+
+  // recovery 开火仍不就绪 → 继续武装，绝不停止
+  fake.timers.advance(TRANSITION_RECOVERY_POLL_MS)
+  assert.equal(fake.probes.count, TRANSITION_PROBE_DELAYS.length + 1)
+  assert.equal(gate.stats.recoveryProbeCount, 1)
+  assert.equal(fake.timers.pendingCount(), 1, '未就绪则 recovery 链式续期')
+
+  fake.timers.advance(10_000)
+  assert.equal(readyCount, 0, '旧 DOM 挂载期间绝不 ready')
+  assert.equal(gate.stats.mode, 'recovery-poll', '长时间等待仍保持在 recovery 模式')
+  assert.equal(
+    gate.stats.probeCount,
+    TRANSITION_PROBE_DELAYS.length + 1 + 6,
+    '低频持续探测（10s 内再开火 6 次，1.5s 间隔链）'
+  )
+  assert.equal(gate.stats.recoveryProbeCount, 7)
+})
+
+test('TR2: recovery poll 探测到新会话 DOM → onReady 恰一次并停止全部探测', () => {
+  const fake = makeFake()
+  const current = { value: sig('root-a', 12, 'a-1', 'a-12') }
+  let readyCount = 0
+
+  const gate = beginStuckGate(fake, current, () => readyCount++)
+
+  fake.timers.advance(1600) // fast 全部耗尽（~1.57s），未就绪
+  assert.equal(readyCount, 0)
+
+  // fast 窗口之后（late swap）DOM 才换成 B → recovery 下一跳完成交付
+  current.value = sig('root-b', 8, 'b-1', 'b-8')
+  fake.timers.advance(TRANSITION_RECOVERY_POLL_MS)
+
+  assert.equal(readyCount, 1, 'recovery 路径完成交付')
+  assert.equal(gate.stats.recoveryProbeCount, 1)
+  assert.equal(gate.ready, true)
+  assert.equal(fake.timers.pendingCount(), 0, 'ready 后零残留计时')
+  assert.equal(gate.stats.mode, 'ready')
+
+  const probesAtReady = fake.probes.count
+  fake.timers.advance(10_000)
+  fake.events.fireProbeTrigger()
+  gate.probeNow()
+  assert.equal(fake.probes.count, probesAtReady, 'ready 后零探测')
+  assert.equal(readyCount, 1, 'onReady 绝不重复')
+})
+
+test('TR3: Mutation Wake —— fast 阶段内 DOM 变化立即唤醒探测并就绪', () => {
+  const fake = makeFake()
+  const current = { value: sig('root-a', 12, 'a-1', 'a-12') }
+  let readyCount = 0
+
+  const gate = beginStuckGate(fake, current, () => readyCount++)
+
+  assert.equal(fake.domEvents.subscribedCount(), 1, 'begin 即订阅 Mutation Wake')
+  fake.timers.advance(100)
+  assert.equal(readyCount, 0)
+
+  // same-root 原地换内容（RootWatch 无法感知的场景）→ mutation 立即唤醒
+  current.value = sig('root-a', 8, 'b-1', 'b-8')
+  fake.domEvents.fireMutation()
+
+  assert.equal(readyCount, 1, 'mutation wake 路径完成交付')
+  assert.equal(gate.stats.mutationWakeCount, 1)
+  assert.equal(gate.stats.mode, 'ready')
+  assert.equal(fake.domEvents.subscribedCount(), 0, 'ready 即退订（短生命周期）')
+})
+
+test('TR4: stop() → fast/recovery 计时与 Mutation Wake 订阅全部清除，之后零探测零回调', () => {
+  const fake = makeFake()
+  const current = { value: sig('root-a', 12, 'a-1', 'a-12') }
+  let readyCount = 0
+
+  const gate = beginStuckGate(fake, current, () => readyCount++)
+
+  fake.timers.advance(1600) // fast 耗尽（~1.57s）→ recovery 武装
+  assert.equal(fake.timers.pendingCount(), 1)
+  gate.stop()
+
+  assert.equal(fake.timers.pendingCount(), 0, 'recovery timer 已取消')
+  assert.equal(fake.domEvents.subscribedCount(), 0, 'Mutation Wake 已退订')
+
+  const probesAtStop = fake.probes.count
+  current.value = sig('root-b', 8, 'b-1', 'b-8')
+  fake.timers.advance(10_000)
+  fake.domEvents.fireMutation()
+  fake.events.fireProbeTrigger()
+  gate.probeNow()
+
+  assert.equal(fake.probes.count, probesAtStop, 'stop 后任何信号零探测')
+  assert.equal(readyCount, 0)
+})
+
+test('TR5: 路由替换清理 —— A→B 未就绪即 B→C，B gate 的 recovery/wake 绝不触发', () => {
+  const fake = makeFake()
+  const current = { value: sig('root-a', 12, 'a-1', 'a-12') }
+  let bReadyCount = 0
+  let cReadyCount = 0
+
+  const gateB = beginStuckGate(fake, current, () => bReadyCount++)
+  fake.timers.advance(1600) // B 的 fast 耗尽 → recovery 武装
+
+  // 模拟 B→C 路由替换：B gate stop，C gate 接管（同一假时钟/事件环境）
+  gateB.stop()
+  const gateC = beginStuckGate(fake, current, () => cReadyCount++)
+
+  assert.equal(fake.timers.pendingCount(), 1, '只有 C 的当前调度在 pending（B 的已清除）')
+  assert.equal(fake.domEvents.subscribedCount(), 1, '只有 C 订阅 Mutation Wake')
+
+  const bProbes = gateB.stats.probeCount
+  current.value = sig('root-c', 6, 'c-1', 'c-6')
+
+  // B 的旧 recovery 周期与 mutation 信号：对 B 必须零效果
+  fake.domEvents.fireMutation()
+  assert.equal(bReadyCount, 0)
+  assert.equal(gateB.stats.probeCount, bProbes, '停止的 B gate 零新探测')
+  assert.equal(cReadyCount, 1, 'C gate 被 mutation wake 立即交付')
+  assert.equal(gateC.ready, true)
+
+  fake.timers.advance(10_000)
+  assert.equal(bReadyCount, 0, 'B 的 recovery 链已断，绝不迟到交付')
+  assert.equal(cReadyCount, 1)
+})
+
+// ---------- Mutation Wake 生产实现（合并语义 / 生命周期） ----------
+
+test('wake: 生产 domEvents —— 多次 mutation 合并为一次回调（microtask 节流），退订即断开', async () => {
+  const observed: Array<{ target: Node; options: unknown }> = []
+  let disconnectCount = 0
+  let mutationCallback: () => void = () => undefined
+  const targetNode = {} as Node
+  const domEvents = createTransitionDomEvents({
+    target: () => targetNode,
+    schedule: (cb) => queueMicrotask(cb),
+    observerFactory: (cb) => {
+      mutationCallback = cb
+      return {
+        observe(t, options) {
+          observed.push({ target: t, options })
+        },
+        disconnect() {
+          disconnectCount++
+        }
+      }
+    }
+  })
+
+  let callCount = 0
+  const listener = (): void => {
+    callCount++
+  }
+  domEvents.subscribe(listener)
+
+  assert.equal(observed.length, 1, 'subscribe 即观察')
+  assert.equal(observed[0]!.target, targetNode)
+  assert.deepEqual(observed[0]!.options, { childList: true, subtree: true })
+
+  // 一次 swap 的 mutation 风暴：合并为一次回调
+  mutationCallback()
+  mutationCallback()
+  mutationCallback()
+  await Promise.resolve() // 让 queueMicrotask 的 flush 执行
+  await Promise.resolve()
+  assert.equal(callCount, 1, '一帧至多一次 probe 触发')
+
+  // 新一批 mutation → 再次触发
+  mutationCallback()
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.equal(callCount, 2)
+
+  domEvents.unsubscribe(listener)
+  assert.equal(disconnectCount, 1, 'unsubscribe 即 disconnect')
+  mutationCallback()
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.equal(callCount, 2, '退订后 mutation 零回调')
 })
 
 // ---------- readConversationDomSignature（廉价探测合同） ----------

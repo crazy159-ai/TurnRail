@@ -20,7 +20,8 @@ import {
   isConversationDomReady,
   isSameDomSignature,
   type ConversationDomSignature,
-  type ConversationTransitionGate
+  type ConversationTransitionGate,
+  type TransitionGateStats
 } from './conversationTransition'
 import { createMutationPipeline } from './mutationPipeline'
 import { startStartupScan } from './startupScan'
@@ -797,12 +798,48 @@ export function bootstrap(): void {
   /** 本轮路由的 Phase B 已完成（ready 或无需等待）；此后 RootWatch 直接 attach */
   let transitionReadyDone = false
   let transitionGate: ConversationTransitionGate | null = null
+  /** 最近一次完成的 transition 统计快照（gate 停止后诊断 continuity 用） */
+  let lastTransitionStats: TransitionGateStats | null = null
   /** 就绪前延迟执行的任务（缓存 reconcile 等 DOM 相关步骤） */
   let readyCallbacks: Array<() => void> = []
   /** 最近一次路由变化的探测来源与就绪耗时（DEBUG 诊断元数据） */
   let lastRouteSource: RouteChangeSource | null = null
   let routeChangedAtMs = 0
   let lastReadyMs: number | null = null
+
+  // ---------- Transition 低干扰提示（UI fallback，规格 #40-#42） ----------
+  // transitioning 超过 1.2s 且仍在会话路由时 footer 提示一次"正在同步"；
+  // 超过 10s 换为"尚未完成加载"（recovery 仍在继续，绝不要求用户刷新）。
+  // 无 toast / 无 spinner / 不闪烁；ready 立即清除，且只清除自己设置的文案。
+  const TRANSITION_HINT_MS = 1200
+  const TRANSITION_SLOW_HINT_MS = 10_000
+  let transitionHintTimer: number | null = null
+  let transitionHintShown = false
+
+  function clearTransitionHint(): void {
+    if (transitionHintTimer !== null) {
+      window.clearTimeout(transitionHintTimer)
+      transitionHintTimer = null
+    }
+    if (transitionHintShown) {
+      transitionHintShown = false
+      ui.setStatus('')
+    }
+  }
+
+  function armTransitionHint(): void {
+    clearTransitionHint()
+    transitionHintTimer = window.setTimeout(() => {
+      transitionHintTimer = null
+      if (!transitioning) return
+      transitionHintShown = true
+      ui.setStatus('正在同步当前对话…')
+      transitionHintTimer = window.setTimeout(() => {
+        transitionHintTimer = null
+        if (transitioning) ui.setStatus('当前对话尚未完成加载')
+      }, TRANSITION_SLOW_HINT_MS - TRANSITION_HINT_MS)
+    }, TRANSITION_HINT_MS)
+  }
 
   /** 就绪前排队、就绪后立即执行（路由再变时整队丢弃，见 resetForRoute） */
   function runWhenTransitionReady(fn: () => void): void {
@@ -822,6 +859,8 @@ export function bootstrap(): void {
     transitionReadyDone = true
     transitioning = false
     if (routeChangedAtMs > 0) lastReadyMs = Math.round(performance.now() - routeChangedAtMs)
+    clearTransitionHint()
+    lastTransitionStats = transitionGate?.stats ?? null
     transitionGate?.stop()
     transitionGate = null
     const root = provider.getConversationRoot()
@@ -855,7 +894,6 @@ export function bootstrap(): void {
     transitionGate = null
     readyCallbacks = []
   }
-
   function resetForRoute(change: RouteChange | null): void {
     const gen = ++conversationGeneration
     // 初始启动（change = null）接受当前页面已有的 DOM：previousSignature = null
@@ -906,6 +944,8 @@ export function bootstrap(): void {
     routeChangedAtMs = performance.now()
     lastReadyMs = null
     lastRouteSource = change ? change.source : null
+    // 低干扰同步提示只在会话路由武装（首页 / 新建聊天不提示）
+    if (identity.kind === 'conversation') armTransitionHint()
     transitionGate = beginConversationTransition({
       probe: () => readConversationDomSignature(provider),
       isReady: (signature) => gen === conversationGeneration && isReady(signature),
@@ -988,10 +1028,18 @@ export function bootstrap(): void {
 
     /** 路由生命周期元数据（纯数字 / 枚举；隐私合同：绝不包含会话 ID / URL） */
     function readRouteLifecycleDiagnostics() {
+      const gate = transitionGate
+      const stats = gate ? gate.stats : lastTransitionStats
       return {
         generation: conversationGeneration,
         conversationIdPresent: provider.getConversationId() !== null,
         transitioning,
+        // transition 阶段枚举：fast → mutation-wait / recovery-poll → ready
+        //（真实用户报"侧边栏空"时可直接看到卡在哪个恢复阶段）
+        transitionMode: stats ? stats.mode : 'ready',
+        transitionProbeCount: stats?.probeCount ?? 0,
+        recoveryProbeCount: stats?.recoveryProbeCount ?? 0,
+        mutationWakeCount: stats?.mutationWakeCount ?? 0,
         lastSource: lastRouteSource,
         lastReadyMs,
         ...stopRouteWatcher.metrics()

@@ -21,12 +21,19 @@ import type { ChatProvider } from '../providers/types'
  * 读取（规格 #23），禁止 parseTurn(includeText) / indexer.scan / Health /
  * Handoff —— 直到 ready 为止。
  *
+ * 最终确定性恢复（VALID_NEW_DOM_EVENTUALLY_APPEARS → TRANSITION_EVENTUALLY_READY）：
  * 短生命周期（规格 #24/#53）：0/16/50/100/200/400/800ms 退避探测；耗尽后
- * 绝不强把旧 DOM 当新 DOM，转入事件恢复 —— focus / visibilitychange(visible)
- * 各补一次 probe，root 生命周期信号由 bootstrap 的 RootWatch 驱动 probeNow()。
- * ready 后立即停止，绝不常驻；正确性优先于"立刻显示"（规格 #54：超时后
- * UI 保持 empty / cache-only，由恢复信号继续驱动）。
+ * 绝不强把旧 DOM 当新 DOM，也不会进入永久死等 —— 转入三路并存的事件恢复：
+ *   1. Mutation Wake —— 仅 transition 存活期间的临时 document.body 观察器
+ *      （microtask 合并，一帧至多一次 probe），DOM 终于换上新会话时立即就绪；
+ *   2. 低频 Recovery Poll（默认 1500ms，仅 transitioning 期间）—— 即使
+ *      observer 未捕获目标变化也保证最终发现（只做廉价签名 probe）；
+ *   3. focus / visibilitychange(visible) / RootWatch probeNow 事件恢复。
+ * ready 后全部立即停止，绝不常驻；正确性优先于"立刻显示"（规格 #54），
+ * 但绝不允许"fast 窗口耗尽 = 永久卡死"（same-root late swap P0 修复）。
  */
+
+/** 运行时-only 新会话内容签名（纯 DOM 位置 / 稳定 ID，无正文提取） */
 
 /** 运行时-only 新会话内容签名（纯 DOM 位置 / 稳定 ID，无正文提取） */
 export interface ConversationDomSignature {
@@ -90,6 +97,84 @@ export interface TransitionEvents {
   removeProbeTriggers(listener: () => void): void
 }
 
+/**
+ * Transition Mutation Wake（短命 DOM 唤醒源注入）。
+ * 只在 transition 存活期间 subscribe（begin → ready/stop 即 unsubscribe）：
+ * 生产实现是临时 MutationObserver（document.body, childList+subtree），
+ * 绝不常驻 —— 与"禁止常驻 body observer"不冲突（生命周期以百 ms 计）。
+ */
+export interface TransitionDomEvents {
+  subscribe(listener: () => void): void
+  unsubscribe(listener: () => void): void
+}
+
+/**
+ * 生产 Mutation Wake：观察 document.body 的 childList 变化。
+ * 一次 conversation swap 可能产生大量 MutationRecord，必须合并 ——
+ * microtask 内至多一次回调（无长期 timer，无 rAF 依赖）。
+ * 依赖全部可注入（单元测试在 Node 无 DOM 环境验证合并语义）；
+ * 默认环境下无 MutationObserver / document 时 subscribe 为 no-op，
+ * 行为由单元测试注入的假 domEvents 覆盖。
+ */
+export interface TransitionDomEventsOptions {
+  /** 观察目标（默认 document.body） */
+  target?: () => Node
+  /** 回调调度（默认 queueMicrotask：一帧至多一次 probe，无长期 timer） */
+  schedule?: (callback: () => void) => void
+  /** observer 构造注入（默认 new MutationObserver） */
+  observerFactory?: (callback: () => void) => {
+    observe(target: Node, options: { childList: boolean; subtree: boolean }): void
+    disconnect(): void
+  }
+}
+
+/** 最小 observer 接口（生产 MutationObserver 结构兼容；测试可注入假实现） */
+interface TransitionDomObserver {
+  observe(target: Node, options: { childList: boolean; subtree: boolean }): void
+  disconnect(): void
+}
+
+export function createTransitionDomEvents(
+  options?: TransitionDomEventsOptions
+): TransitionDomEvents {
+  let observer: TransitionDomObserver | null = null
+  let listener: (() => void) | null = null
+  let scheduled = false
+  const flush = (): void => {
+    scheduled = false
+    listener?.()
+  }
+  return {
+    subscribe(l) {
+      listener = l
+      if (observer) return
+      const factory: ((callback: () => void) => TransitionDomObserver) | null =
+        options?.observerFactory ??
+        (typeof MutationObserver === 'undefined'
+          ? null
+          : (callback: () => void) => new MutationObserver(callback))
+      if (!factory || (options?.target === undefined && typeof document === 'undefined')) {
+        return
+      }
+      observer = factory(() => {
+        if (scheduled) return
+        scheduled = true
+        ;(options?.schedule ?? queueMicrotask)(flush)
+      })
+      observer.observe(options?.target ? options.target() : document.body, {
+        childList: true,
+        subtree: true
+      })
+    },
+    unsubscribe() {
+      listener = null
+      observer?.disconnect()
+      observer = null
+      scheduled = false
+    }
+  }
+}
+
 export interface ConversationTransitionOptions {
   /** 廉价签名探测（每次调用一次 getConversationRoot + locateTurnRoots） */
   probe(): ConversationDomSignature
@@ -101,6 +186,24 @@ export interface ConversationTransitionOptions {
   delays?: number[]
   timers?: TransitionTimers
   events?: TransitionEvents
+  /** Mutation Wake 注入（默认生产实现：临时 body observer + microtask 合并） */
+  domEvents?: TransitionDomEvents
+  /** fast 退避耗尽后的低频恢复探测间隔 ms；0 = 停用（仅事件恢复） */
+  recoveryPollMs?: number
+}
+
+/** transition 阶段（DEBUG routeLifecycle.transitionMode；纯枚举，无身份信息） */
+export type TransitionMode = 'fast' | 'mutation-wait' | 'recovery-poll' | 'ready'
+
+/** 探测统计（纯数字诊断；不含任何会话内容） */
+export interface TransitionGateStats {
+  mode: TransitionMode
+  /** 全部路径的 probe 总次数（fast + recovery + wake + 事件 + probeNow） */
+  probeCount: number
+  /** 其中由 recovery poll 触发的次数 */
+  recoveryProbeCount: number
+  /** Mutation Wake 触发（合并后）的次数 */
+  mutationWakeCount: number
 }
 
 export interface ConversationTransitionGate {
@@ -110,6 +213,8 @@ export interface ConversationTransitionGate {
   stop(): void
   /** 就绪后为 true */
   readonly ready: boolean
+  /** 探测统计快照（DEBUG 诊断读取；stop 后冻结） */
+  readonly stats: TransitionGateStats
 }
 
 function defaultTransitionTimers(): TransitionTimers {
@@ -141,20 +246,40 @@ function defaultTransitionEvents(): TransitionEvents {
 /** 短生命周期退避表：覆盖真实 ChatGPT 的 DOM 交换窗口（规格 #24） */
 export const TRANSITION_PROBE_DELAYS = [0, 16, 50, 100, 200, 400, 800]
 
+/**
+ * fast 退避耗尽后的低频恢复探测间隔（规格 #15）。
+ * 只在 transitioning 期间运行；负载边界：每次仅一次廉价签名读取
+ * （getConversationRoot + locateTurnRoots），1.5s 一次可接受。
+ */
+export const TRANSITION_RECOVERY_POLL_MS = 1500
+
 export function beginConversationTransition(
   options: ConversationTransitionOptions
 ): ConversationTransitionGate {
   const delays = options.delays ?? TRANSITION_PROBE_DELAYS
   const timers = options.timers ?? defaultTransitionTimers()
   const events = options.events ?? defaultTransitionEvents()
+  const domEvents = options.domEvents ?? createTransitionDomEvents()
+  const recoveryPollMs = options.recoveryPollMs ?? TRANSITION_RECOVERY_POLL_MS
 
   let stopped = false
   let ready = false
   let scheduleIndex = 0
+  let recoveryArmed = false
   let pendingHandle: unknown = null
+  let probeCount = 0
+  let recoveryProbeCount = 0
+  let mutationWakeCount = 0
+
+  const currentMode = (): TransitionMode => {
+    if (ready) return 'ready'
+    if (scheduleIndex < delays.length) return 'fast'
+    return recoveryArmed ? 'recovery-poll' : 'mutation-wait'
+  }
 
   const runProbe = (): boolean => {
     if (stopped || ready) return false
+    probeCount++
     const signature = options.probe()
     if (!options.isReady(signature)) return false
     ready = true
@@ -168,14 +293,18 @@ export function beginConversationTransition(
       timers.clearTimeout(pendingHandle)
       pendingHandle = null
     }
+    recoveryArmed = false
     events.removeProbeTriggers(onProbeTrigger)
+    domEvents.unsubscribe(onDomMutation)
   }
 
   const scheduleNext = (): void => {
     if (stopped || ready) return
     if (scheduleIndex >= delays.length) {
-      // 退避耗尽：不强把旧 DOM 当新 DOM；转入事件恢复（focus / visibility /
-      // RootWatch probeNow），由恢复信号继续驱动单次探测（规格 #54）
+      // 退避耗尽：不强把旧 DOM 当新 DOM，也绝不进入永久死等 ——
+      // Mutation Wake（DOM 一变即探测）+ 低频 Recovery Poll 兜底
+      // （规格 #15/#18：fast → slow，fast → dead 禁止）
+      armRecoveryPoll()
       return
     }
     const delay = delays[scheduleIndex++]!
@@ -186,12 +315,36 @@ export function beginConversationTransition(
     }, delay)
   }
 
+  /** 低频恢复探测：链式 setTimeout（复用 TransitionTimers；stop/ready 即断链） */
+  const armRecoveryPoll = (): void => {
+    if (stopped || ready || recoveryArmed || recoveryPollMs <= 0) return
+    recoveryArmed = true
+    pendingHandle = timers.setTimeout(() => {
+      pendingHandle = null
+      recoveryArmed = false
+      recoveryProbeCount++
+      if (runProbe()) return
+      scheduleRecovery()
+    }, recoveryPollMs)
+  }
+  const scheduleRecovery = armRecoveryPoll
+
   const onProbeTrigger = (): void => {
     // 事件恢复路径：每次信号补一次探测；未就绪则继续等下一个信号
     runProbe()
   }
 
+  const onDomMutation = (): void => {
+    // Mutation Wake：DOM 终于变化（可能是 same-root 原地换内容）→ 立即探测。
+    // 合并由 domEvents 生产实现负责（microtask，一帧至多一次）
+    if (stopped || ready) return
+    mutationWakeCount++
+    runProbe()
+  }
+
   events.addProbeTriggers(onProbeTrigger)
+  // Mutation Wake 生命周期 = transition 生命周期（begin 订阅，ready/stop 退订）
+  domEvents.subscribe(onDomMutation)
   // 首探测在 begin 时同步执行（对应退避表的 0ms 项，delays[0]）；
   // 未就绪再按 delays[1..] 退避调度
   if (!runProbe()) {
@@ -210,8 +363,17 @@ export function beginConversationTransition(
     },
     get ready(): boolean {
       return ready
+    },
+    get stats(): TransitionGateStats {
+      return {
+        mode: currentMode(),
+        probeCount,
+        recoveryProbeCount,
+        mutationWakeCount
+      }
     }
   }
 }
 
 export { isSameDomSignature }
+

@@ -12,6 +12,10 @@ export interface TnDebug {
     generation: number
     conversationIdPresent: boolean
     transitioning: boolean
+    transitionMode: 'fast' | 'mutation-wait' | 'recovery-poll' | 'ready'
+    transitionProbeCount: number
+    recoveryProbeCount: number
+    mutationWakeCount: number
     lastSource: string | null
     lastReadyMs: number | null
     detected: number
