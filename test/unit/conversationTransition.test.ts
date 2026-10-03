@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   beginConversationTransition,
+  createAcceptedDomState,
   createTransitionDomEvents,
   isConversationDomReady,
   readConversationDomSignature,
@@ -519,6 +520,47 @@ test('wake: 生产 domEvents —— 多次 mutation 合并为一次回调（micr
   await Promise.resolve()
   await Promise.resolve()
   assert.equal(callCount, 2, '退订后 mutation 零回调')
+})
+
+// ---------- AS1：Accepted Live DOM Signature（previous 基线语义） ----------
+
+test('AS1: accepted 快照 —— DOM 先于 route event 换代时，previous 必须仍是已接受的 A 签名', () => {
+  const accepted = createAcceptedDomState()
+  const sigA = sig('root-a', 12, 'a-1', 'a-12')
+  accepted.record(sigA)
+  assert.equal(accepted.present, true)
+
+  // route event 到达前 DOM 已被换成 B（合法顺序 Order B）：
+  // 临时读当前 DOM 会得到 previous == current → gate 永久等待（P0 根因 2）
+  const wrongCurrentDom = sig('root-a', 24, 'b-1', 'b-24')
+  assert.equal(
+    accepted.snapshot(() => wrongCurrentDom),
+    sigA,
+    'previous 必须取已接受快照，绝不读 route-event 后的当前 DOM'
+  )
+
+  // route change 消费基线后失效：新会话 ready 前不存在 accepted
+  accepted.invalidate()
+  assert.equal(accepted.present, false)
+  assert.equal(accepted.snapshot(() => wrongCurrentDom), wrongCurrentDom, '失效后回退 fallback')
+  assert.equal(accepted.snapshot(null), null, '无 accepted 且无 fallback → null')
+})
+
+test('AS1b: same-root 原地换代 —— accepted 基线让 gate 正确判定 B 就绪且不误放 A', () => {
+  const accepted = createAcceptedDomState()
+  accepted.record(sig('root-shared', 12, 'a-1', 'a-12'))
+  const previous = accepted.snapshot(null)
+
+  assert.equal(
+    isConversationDomReady(previous, sig('root-shared', 24, 'b-1', 'b-24')),
+    true,
+    '首/尾稳定 ID 变化 → B 就绪'
+  )
+  assert.equal(
+    isConversationDomReady(previous, sig('root-shared', 12, 'a-1', 'a-12')),
+    false,
+    '仍是 A 的 DOM → 绝不 ready'
+  )
 })
 
 // ---------- readConversationDomSignature（廉价探测合同） ----------

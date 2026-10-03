@@ -377,3 +377,48 @@ export function beginConversationTransition(
 
 export { isSameDomSignature }
 
+// ---------- Accepted Live DOM Signature（上一会话已接受状态的基线） ----------
+
+/**
+ * 已接受 Live DOM 状态追踪（规格：previousSignature 必须来自"上一会话最后一次
+ * 已接受的 Live 状态"，绝不在 route event 之后临时读取当前 DOM）。
+ *
+ * 为什么不能临时读：route event 送达时 DOM 可能已经换成新会话（DOM 先于
+ * route event 的合法顺序）—— previous == current 导致 gate 判定"内容没变"
+ * 而永久等待。本 tracker 在 Phase B 完成与正常 structure 变化时记录快照，
+ * route change 时作为 previous 基线上报并立即失效。
+ *
+ * fallback 语义（极端情况 accepted 缺失，如首次 ready 前连续路由切换）：
+ * 必须来自 Store / activeRoot 的已接受状态，同样不读 route-change 后的
+ * 当前 DOM —— 否则 any-root-ready 可能放行仍挂载的旧会话 DOM。
+ */
+export interface AcceptedDomState {
+  /** 记录一次"已确认接受"的 Live DOM 状态（Phase B 完成时） */
+  record(signature: ConversationDomSignature): void
+  /** route change：取出基线（accepted → fallback），随后立即失效 */
+  snapshot(
+    fallback: (() => ConversationDomSignature | null) | null
+  ): ConversationDomSignature | null
+  /** 失效（新会话 ready 前不存在任何已接受状态） */
+  invalidate(): void
+  /** DEBUG 诊断：是否存在已接受的 Live 基线（纯 boolean） */
+  readonly present: boolean
+}
+
+export function createAcceptedDomState(): AcceptedDomState {
+  let accepted: ConversationDomSignature | null = null
+  return {
+    record(signature) {
+      accepted = signature
+    },
+    snapshot(fallback) {
+      return accepted ?? (fallback ? fallback() : null)
+    },
+    invalidate() {
+      accepted = null
+    },
+    get present(): boolean {
+      return accepted !== null
+    }
+  }
+}

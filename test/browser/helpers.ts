@@ -16,6 +16,7 @@ export interface TnDebug {
     transitionProbeCount: number
     recoveryProbeCount: number
     mutationWakeCount: number
+    acceptedSignaturePresent: boolean
     lastSource: string | null
     lastReadyMs: number | null
     detected: number

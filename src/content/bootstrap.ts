@@ -16,9 +16,11 @@ import { createRouteWatcher, type RouteChange, type RouteChangeSource } from './
 import { readRouteIdentity } from './routeIdentity'
 import {
   beginConversationTransition,
+  createAcceptedDomState,
   readConversationDomSignature,
   isConversationDomReady,
   isSameDomSignature,
+  type AcceptedDomState,
   type ConversationDomSignature,
   type ConversationTransitionGate,
   type TransitionGateStats
@@ -630,6 +632,12 @@ export function bootstrap(): void {
     if (kind === 'structure' || kind === 'coverage') refreshHistoryCoverageUi()
     if (kind === 'structure') spy.refresh()
     else if (kind === 'elements') debouncedSpyRefresh()
+    // 正常会话结构变化（新增消息 / lazy mount / virtualization）同步刷新
+    // accepted 基线，防止它漂移成"过时的上一会话描述"（廉价路径，不解析正文）。
+    // hydrate 不是 Live 接受（hydrating 抑制）；未 ready / root 断连时不成立。
+    if (kind === 'structure' && !hydrating && transitionReadyDone && activeRoot?.isConnected) {
+      acceptedDomState.record(readConversationDomSignature(provider))
+    }
     // 自动保存只在 turn 结构变化时调度：assistant 流式输出（text）不触发写盘
     if (kind === 'structure' && !hydrating) {
       checkCacheStaleness()
@@ -798,6 +806,20 @@ export function bootstrap(): void {
   /** 本轮路由的 Phase B 已完成（ready 或无需等待）；此后 RootWatch 直接 attach */
   let transitionReadyDone = false
   let transitionGate: ConversationTransitionGate | null = null
+  /**
+   * 上一会话"已接受 Live DOM"基线（规格：previous baseline 必须来自已接受
+   * 状态，绝不在 route event 后临时读当前 DOM —— DOM 可能先于 route event
+   * 换成新会话，临时读取会把 previous == current 而永久等待）。
+   * Phase B 完成 / 正常 structure 变化时记录；route change 时作为 previous
+   * 上报并立即失效；缓存 hydrate 不是 Live 接受，绝不记录。
+   */
+  const acceptedDomState: AcceptedDomState = createAcceptedDomState()
+  /**
+   * gate 最近一次探测读到的 DOM 签名（最终 fallback 证据）：ready 前连续
+   * 路由切换时，accepted 与 Store fallback 都可能为空，而"最近看到的旧
+   * DOM"仍是防止 any-root-ready 放行旧会话的有效证据。
+   */
+  let lastSeenDomSignature: ConversationDomSignature | null = null
   /** 最近一次完成的 transition 统计快照（gate 停止后诊断 continuity 用） */
   let lastTransitionStats: TransitionGateStats | null = null
   /** 就绪前延迟执行的任务（缓存 reconcile 等 DOM 相关步骤） */
@@ -866,6 +888,8 @@ export function bootstrap(): void {
     const root = provider.getConversationRoot()
     if (root) attachConversationObserver(root)
     else startRootWatch()
+    // 新 DOM 已确认属于当前会话 → 建立下一轮路由的 previous 基线（廉价签名）
+    acceptedDomState.record(readConversationDomSignature(provider))
     const queue = readyCallbacks
     readyCallbacks = []
     for (const fn of queue) fn()
@@ -894,6 +918,25 @@ export function bootstrap(): void {
     transitionGate = null
     readyCallbacks = []
   }
+  /**
+   * route change 的 previous 基线（绝不读 route-event 后的当前 DOM）：
+   * accepted（上一会话最后已接受状态）→ Store + activeRoot 已接受状态
+   * → gate 最近一次探测读到的签名 → null（真的一无所知，仅初始启动）。
+   * 在 Phase A 拆卸之前调用：activeRoot / Store 此刻仍属上一会话。
+   */
+  function snapshotPreviousDomState(): ConversationDomSignature | null {
+    const fallback =
+      activeRoot !== null && store.turns.length > 0
+        ? () => ({
+            root: activeRoot,
+            turnCount: store.turns.length,
+            firstTurnId: store.turns[0]?.id ?? null,
+            lastTurnId: store.turns[store.turns.length - 1]?.id ?? null
+          })
+        : null
+    return acceptedDomState.snapshot(fallback) ?? lastSeenDomSignature
+  }
+
   function resetForRoute(change: RouteChange | null): void {
     const gen = ++conversationGeneration
     // 初始启动（change = null）接受当前页面已有的 DOM：previousSignature = null
@@ -901,8 +944,8 @@ export function bootstrap(): void {
     const identity = change
       ? change.current
       : readRouteIdentity(() => provider.getConversationId())
-    const previousSignature =
-      change === null ? null : readConversationDomSignature(provider)
+    const previousSignature = change === null ? null : snapshotPreviousDomState()
+    acceptedDomState.invalidate()
     const isReady = isPhaseBDomReady(identity, previousSignature)
 
     // ---------- Phase A — Identity transition：旧状态立即失效（规格 #17） ----------
@@ -947,7 +990,11 @@ export function bootstrap(): void {
     // 低干扰同步提示只在会话路由武装（首页 / 新建聊天不提示）
     if (identity.kind === 'conversation') armTransitionHint()
     transitionGate = beginConversationTransition({
-      probe: () => readConversationDomSignature(provider),
+      probe: () => {
+        const signature = readConversationDomSignature(provider)
+        lastSeenDomSignature = signature
+        return signature
+      },
       isReady: (signature) => gen === conversationGeneration && isReady(signature),
       onReady: () => {
         if (gen === conversationGeneration) finishPhaseB()
@@ -1040,6 +1087,8 @@ export function bootstrap(): void {
         transitionProbeCount: stats?.probeCount ?? 0,
         recoveryProbeCount: stats?.recoveryProbeCount ?? 0,
         mutationWakeCount: stats?.mutationWakeCount ?? 0,
+        // DEBUG-only boolean：是否存在已接受的 Live 基线（绝不含 turn ID / 选择器）
+        acceptedSignaturePresent: acceptedDomState.present,
         lastSource: lastRouteSource,
         lastReadyMs,
         ...stopRouteWatcher.metrics()
