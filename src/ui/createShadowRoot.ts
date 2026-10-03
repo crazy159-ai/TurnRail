@@ -157,12 +157,14 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
   }
 
   let outlineDirty = false
-  // 健康重算以 Store 的 semanticRevision + coverageRevision 组合为键：
+  // 健康重算以 conversationKey + semanticRevision + coverageRevision 组合为键（规格 #28）：
   // - assistant 流式（assistant-text）与纯元素绑定（elements）不推进任何修订号，
   //   物理上不会触发重算 —— 流式优化合同由事件语义保证，无需拼接全文 signature；
   // - coverage（preview → full）即使文本与 preview 完全相同也推进 coverageRevision，
   //   健康覆盖度 / 置信度必须随之重算 —— 缓存的低置信度提示随之解除；
-  // - 历史上用"末轮全文 signature"去重，既复制 prompt 又漏检早期 turn 的修改。
+  // - 历史上用"末轮全文 signature"去重，既复制 prompt 又漏检早期 turn 的修改；
+  // - conversationKey 前缀保证跨会话绝无误复用：即使两个会话的修订号巧合相同
+  //   （A:3:2 vs B:3:2），key 也必然不同 —— Health 状态严格会话隔离。
   let lastHealthKey = ''
   let lastHealthSnapshot: ConversationHealthSnapshot | null = null
 
@@ -174,7 +176,7 @@ export function createNavigationUi(provider: ChatProvider, handlers: NavigationU
       lastHealthSnapshot = null
       return
     }
-    const key = `${store.semanticRevision}:${store.coverageRevision}`
+    const key = `${store.conversationKey}:${store.semanticRevision}:${store.coverageRevision}`
     if (key === lastHealthKey) return
     lastHealthKey = key
     perf.markHealthAnalyze()

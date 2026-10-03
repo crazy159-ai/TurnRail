@@ -42,9 +42,13 @@ export interface PassiveTopWatchOptions {
 }
 
 export interface PassiveTopWatch {
-  /** 绑定当前滚动容器（幂等；容器变化后需重新调用） */
+  /** 绑定当前滚动容器（幂等；换绑时自动清理旧容器的待确认计时） */
   watch(): void
-  /** 解绑并取消全部待确认计时（路由切换 / 已确认） */
+  /** 同一会话 root 暂时丢失：解绑容器并取消待确认计时（保留 confirmed 证据） */
+  detach(): void
+  /** 新会话身份：解绑 + 取消计时 + 清除到顶证据（confirmed 必须失效，规格 #34/#48） */
+  reset(): void
+  /** 兼容别名 = detach（路由切换必须使用 reset()，否则 A 的到顶证据残留到 B） */
   stop(): void
 }
 
@@ -139,7 +143,12 @@ export function createPassiveTopWatch(options: PassiveTopWatchOptions): PassiveT
     watch(): void {
       if (confirmed) return
       const sc = options.getContainer()
-      if (!sc || sc === container) return
+      if (!sc) return
+      if (sc === container) return
+      // 换绑封板（规格 #35）：旧容器的待确认计时与计数快照不得影响新容器 ——
+      // clear timers + clear pendingTurnCount + detach 旧 listener 后再绑定
+      clearTimers()
+      pendingTurnCount = null
       detach?.()
       container = sc
       const onScrollPassive = (): void => onScroll()
@@ -147,6 +156,18 @@ export function createPassiveTopWatch(options: PassiveTopWatchOptions): PassiveT
       detach = () => sc.removeEventListener('scroll', onScrollPassive)
     },
 
+    /** 同一会话 root 暂时丢失：解绑 + 取消计时，保留到顶证据（confirmed） */
+    detach(): void {
+      stopInternal()
+    },
+
+    /** 新会话身份：在 detach 基础上清除到顶证据，B 会话的采集从头开始 */
+    reset(): void {
+      confirmed = false
+      stopInternal()
+    },
+
+    /** 兼容别名：语义 = detach（到顶证据的生命周期由 reset() 显式管理） */
     stop(): void {
       stopInternal()
     }

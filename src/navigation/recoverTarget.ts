@@ -8,6 +8,15 @@ import { isAtVisualBottom, isAtVisualTop, moveTowardVisualBottom, moveTowardVisu
 
 export type RecoverResult = 'jumped' | 'not-found' | 'busy'
 
+export interface RecoverOptions {
+  /**
+   * 会话过期检测（规格 #25/#26：generation 贯穿全部 async path）。
+   * 每次循环迭代前调用；返回 true = 路由已切换，立即中止 —— 迟到的恢复
+   * 绝不把旧会话 DOM 扫进新会话 Store，也绝不把旧阅读位置恢复到新容器。
+   */
+  isStale?: () => boolean
+}
+
 let recoverRunning = false
 
 /** DEBUG：最近一次恢复过程的迭代日志（诊断用） */
@@ -31,7 +40,8 @@ export async function recoverAndJump(
   indexer: ConversationIndexer,
   store: ConversationStore,
   turnId: string,
-  onProgress?: (message: string) => void
+  onProgress?: (message: string) => void,
+  options?: RecoverOptions
 ): Promise<RecoverResult> {
   const turn = store.getTurn(turnId)
   if (!turn) return 'not-found'
@@ -59,6 +69,8 @@ export async function recoverAndJump(
 
     for (let i = 0; i < maxIters; i++) {
       if (Date.now() > deadline) break
+      // 路由已切换：立即中止，跳过恢复滚动与收尾扫描（规格 #26）
+      if (options?.isStale?.()) return 'not-found'
 
       indexer.scan()
       const found = indexer.findMountedTurn(turnId)
