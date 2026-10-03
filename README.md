@@ -7,6 +7,10 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 
 全部处理在浏览器本地完成，**不上传、不泄露任何聊天内容**；用户主动缓存的导航元数据仅保存在本机扩展存储中（见下文「Local conversation cache」）。
 
+> TurnRail tracks ChatGPT SPA conversation changes without requiring a page refresh. Route identity changes immediately clear stale conversation state; live DOM data is accepted only after the new conversation is ready.
+>
+> TurnRail 会自动跟随 ChatGPT 的 SPA 对话切换，无需刷新页面。检测到新的会话身份后会立即清除旧会话状态，并只在新会话 DOM 就绪后接受新的 Live 数据。（见下文「Route Lifecycle」）
+
 ---
 
 ## Features
@@ -15,7 +19,8 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 - hover 轨道展开浮动目录面板（可 📌 固定），点击任意问题平滑跳转
 - 滚动时自动高亮当前问题（rail marker + 面板条目同步）
 - 新消息实时加入索引（MutationObserver + 去抖增量扫描）
-- 切换会话（SPA 路由）自动重建索引，旧目录不残留
+- 切换会话（SPA 路由）立即清除旧目录并由事件路径（非轮询）同步新会话，旧目录不残留；
+  新会话 Live 内容仅在 DOM 就绪确认后接受（见「Route Lifecycle」）
 - 长对话支持：
   - 消息被虚拟化卸载后 metadata 保留（已完整收获的条目不显示任何"未加载"标记；
     仅缓存 preview 截断文本的条目显示"仅预览"）
@@ -178,10 +183,13 @@ Store ──► Handoff 服务 (handoff/)   ← 仅用户点击时运行，不�
 | `handoff/builder.ts` / `formatter.ts` | 纯函数确定性抽取（Checkpoint + Recent Tail + Current Objective，objective 同轮去重）与 markdown 渲染；checkpoint 超限保留最新；fence 安全截断 + 显式 warning |
 | `handoff/pendingStore.ts` / `injector.ts` | 短生命周期跨标签页通道（TTL / 身份安全消费：只删自己注入的那条）与新聊天页 composer 草稿注入（写入后回读验证，绝不发送） |
 | `content/observers.ts` | 两层 Observer：短命 Root Watch（root 缺失时等出现）+ scoped Conversation Observer（root 出现即断开 document 级监听） |
+| `content/routeIdentity.ts` | 路由身份纯数据定义与比较（conversation:<id> / page:<path>；不认识站点语义，ID 由 Provider 注入提取） |
+| `content/routeWatcher.ts` | SPA 路由身份检测：Navigation API `currententrychange` 主路径 + popstate + focus/visibility 恢复 + 廉价轮询兜底，严格去重（ISOLATED world 可靠，不 monkey patch history） |
+| `content/conversationTransition.ts` | 会话切换 DOM 就绪门：廉价签名（root + 首/尾 turn ID）判断新会话内容，短生命周期退避 + 事件恢复，就绪即停 |
 | `content/mutationPipeline.ts` | Mutation 分类器 + Dirty Turn 队列（streaming 忽略 / turn 内变化 / unknown 回退 full scan；40ms 批量去重） |
 | `content/startupScan.ts` | 启动稳定性退避扫描（100→2400ms，连续 2 次签名不变即停，替代固定 8×400ms） |
 | `utils/performance.ts` | PerformanceStats（TTFR / TTLR / full-vs-incremental / observer 分类；仅 tn-debug，无上传） |
-| `content/main.ts` / `bootstrap.ts` / `routeWatcher.ts` | 入口与生命周期、SPA 路由检测、缓存桥接、性能标记 |
+| `content/main.ts` / `bootstrap.ts` / `routeWatcher.ts` | 入口与两阶段路由生命周期（Phase A 身份切换 / Phase B DOM 就绪门）、generation 会话隔离、缓存桥接、性能标记 |
 
 ## Local conversation cache
 
@@ -404,6 +412,66 @@ scrollAnchor / 几何层外，任何模块出现滚动写入即测试失败。
 
 完整正文不写入长期导航缓存（隐私边界不变）：页面刷新后，随用户再次浏览逐步重新收获。
 
+## Route Lifecycle（会话路由生命周期）
+
+TurnRail 在不刷新页面的前提下跟随 ChatGPT 的 SPA 会话切换。三条产品不变量
+（由 `src/content/bootstrap.ts` 的两阶段实现与测试合同共同强制）：
+
+```text
+ROUTE_IDENTITY_CHANGED   →  OLD_STATE_INVALID_IMMEDIATELY
+NEW_LIVE_DATA            →  ONLY_AFTER_DOM_READY
+STALE_ASYNC_WORK         →  NEVER_MUTATES_NEW_CONVERSATION
+```
+
+**为什么不能靠 history monkey patch**：content script 运行在 Chrome 扩展的
+ISOLATED world，ChatGPT 页面（MAIN world）调用 `history.pushState` 不会经过
+TurnRail 所在 world 的实例 wrapper —— 这正是旧实现"mock 测试通过、真实
+ChatGPT 切换不实时"的根因。TurnRail 不改 MAIN world、不新增任何权限
+（保持仅 `storage`），而是使用浏览器原生信号。
+
+**Phase A — Identity transition（身份切换，立即执行）**。路由身份一变化：
+路由代数（generation）递增，停止旧 root 的观察器 / 启动扫描 / RootWatch /
+被动到顶采集（`topWatch.reset()`，A 的 reachedTop 证据不残留 B），清空旧
+Store / UI / Health / History 状态 / Handoff 预览，Handoff 入口按新会话重建。
+旧目录立即消失，绝不继续展示 A 冒充 B。
+
+**Phase B — DOM readiness（DOM 就绪门）**。URL 变化不代表 DOM 已换成新会话
+（React 通常滞后 0~数百 ms，且可能复用同一个 conversation root 元素）。
+`src/content/conversationTransition.ts` 用廉价 DOM 签名（root 身份 + 首 / 尾
+turn 稳定 ID，来自 `provider.locateTurnRoots()`，无正文解析）判断新会话内容：
+root 换绑或首 / 尾 turn 变化即就绪；空对话（0 turn）同样适用，绝不等待
+`turnCount > 0`。探测按 0/16/50/100/200/400/800ms 短生命周期退避，耗尽后
+不强把旧 DOM 当新 DOM，转入 focus / visibilitychange / RootWatch 事件恢复；
+期间 UI 保持空目录或缓存目录。就绪后才挂会话 Observer、启动扫描、执行缓存
+调和。就绪后 gate 立即停止，绝不常驻。
+
+**路由检测信号**（`src/content/routeWatcher.ts`）：
+
+- Navigation API `currententrychange` —— 主路径（事件驱动，feature detect，
+  只观察、绝不 `intercept()/preventDefault()/navigate()`）；
+- `popstate` —— 前进 / 后退；
+- `focus` / `visibilitychange(visible)` —— 恢复探测（后台 tab 计时器被节流，
+  用户切回时立即核对身份）；
+- 300ms 廉价身份轮询 —— correctness fallback（Navigation API 缺席或失效时
+  保证正确性），每次只做 O(1) 的 pathname + 会话 ID 比较，绝不触碰 DOM 扫描。
+
+**路由身份（Route Identity）**：会话路由的身份是会话 ID（由 Provider 提取），
+非会话路由的身份是 pathname。同一会话内的 query / hash / 临时参数变化
+（如 `/c/AAA?model=x → /c/AAA?model=y`）语义上是同一会话，不触发任何重置。
+多个信号看到同一次导航时严格去重，`onChange` 只触发一次。
+
+**会话隔离（generation 贯穿全部 async path）**：缓存读取、显式历史捕获、
+恢复跳转、Handoff 注入、延时回调都必须捕获并复核 generation —— 不一致即
+丢弃。A 会话的迟到 cache read 绝不 hydrate B（B26）；捕获 / 恢复中途切会话
+立即中止；Handoff 草稿绝不写入非目标页面。Health 缓存键包含
+`conversationKey`（即使两个会话修订号巧合相同也不会误复用）。
+
+**DEBUG 诊断**（`__tnDebug.routeLifecycle`，纯元数据，绝不含会话 ID / URL /
+turn ID）：`generation`、`transitioning`、`lastSource`
+（navigation-api / popstate / poll / focus / visibility）、`lastReadyMs`，
+以及信号计数（`navigationApiSignals` / `pollSignals` / `transitions` 等，
+用于确认真实使用中切换主要来自事件路径而非轮询）。
+
 ## Performance（v1.2）
 
 TurnRail minimizes work on ChatGPT pages by:
@@ -496,6 +564,11 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   （TTL 过期不注入 / consume 即删 / storage 失败无假成功 / 注入器零触碰合同）、
   privacy/handoff 合同（独立命名空间、TTL 窗口、零 console、selector 边界）、
   诊断 handoff 元数据纯数字白名单。
+  Route Lifecycle 增量：`test/unit/routeWatcher.test.ts`（RW1–RW9 —— Navigation API
+  主路径 / 轮询兜底 / popstate / 多信号严格去重 / 同会话 query 不重置 / A↔B 身份
+  判定 / cleanup / focus / visibility 恢复探测）与 `test/unit/conversationTransition.test.ts`
+  （旧/新签名就绪判定、root 复用原地换内容、空对话、退避耗尽不强认旧 DOM、
+  probeNow、stop 后零探测、廉价签名合同）。
 - `test/browser/`：Playwright 浏览器冒烟测试，直接自动化下列既有测试资产（无需登录 ChatGPT）。
   v1.2.3 增量：console 分类统计（production 0 warn / 0 error；DEBUG 无 warning 级
   invalidated 输出、console.debug lifecycle 恰 1 条）、storage 调用计数断言
@@ -510,6 +583,18 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   缓存 preview 目录"仅预览"标记 → 自然升级 full → Health 覆盖度感知（文本相同时也重算）、
   manual capture busy UI / 恢复阅读位置、源码级 BACKGROUND_TASK_MUST_NOT_SCROLL 合同
   （`test/unit/passiveHistory.test.ts`）。
+  Route Lifecycle 增量：`test/browser/route.spec.ts`（B19–B27）——
+  B19 原生 `History.prototype` 导航（绕过任何实例 wrapper，等价 ISOLATED vs MAIN
+  world 的真实导航方式）由 Navigation API 事件路径同步（断言 `lastSource`，轮询
+  无法蒙混）、B20 URL 先行 / DOM 延迟 300ms 期间 Store 为空且不把旧 DOM 扫进新
+  会话、B21 root 复用原地换内容被签名识别、B22 rapid A→B→C 迟到 B 被完全取代、
+  B23 同会话 query/hash 变化零重置（generation / Health / fullScans 不动）、
+  B24 新聊天首条消息 `/ → /c/<id>` 免刷新切换且 Observer 正确重绑、B25 后退 /
+  前进正确跟随、B26 迟到 cache read 被 generation 守卫丢弃（A 缓存只在切回 A 时
+  恢复）、B27 reachedTop 不跨会话残留且 B 重新确认到顶；外加 routeLifecycle
+  隐私合同（元数据不含会话 ID / URL）与全流程零错误、零后台滚动。
+  测试台：`test/mock/route.html`（确定性 turn id、chrome.storage 内存模拟、
+  native / wrapped / 延迟 DOM / root 复用 / 同会话 query / popstate 重建等路由动作）。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
@@ -526,6 +611,7 @@ node scripts/serve-test-pages.mjs   # 在项目根目录，默认 http://127.0.0
 # fixture: http://127.0.0.1:8931/test/fixture/index.html
 # mock:    http://127.0.0.1:8931/test/mock/index.html
 # reverse: http://127.0.0.1:8931/test/mock/reverse.html
+# route:   http://127.0.0.1:8931/test/mock/route.html
 ```
 
 真实页面验收：控制台执行 `localStorage.setItem('tn-debug','1')` 并刷新，检查 `__tnDebug`：
