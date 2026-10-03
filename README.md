@@ -7,9 +7,9 @@ A lightweight conversation navigator for long AI chats. Works on chatgpt.com · 
 
 全部处理在浏览器本地完成，**不上传、不泄露任何聊天内容**；用户主动缓存的导航元数据仅保存在本机扩展存储中（见下文「Local conversation cache」）。
 
-> TurnRail tracks ChatGPT SPA conversation changes without requiring a page refresh. Route identity changes immediately clear stale conversation state; live DOM data is accepted only after the new conversation is ready.
+> TurnRail tracks ChatGPT SPA conversation changes without requiring a page refresh. Route identity changes immediately clear stale conversation state; live DOM data is accepted only after the new conversation is ready — and once valid new-conversation DOM appears, the transition is guaranteed to complete without any user interaction (no refresh, no tab switch).
 >
-> TurnRail 会自动跟随 ChatGPT 的 SPA 对话切换，无需刷新页面。检测到新的会话身份后会立即清除旧会话状态，并只在新会话 DOM 就绪后接受新的 Live 数据。（见下文「Route Lifecycle」）
+> TurnRail 会自动跟随 ChatGPT 的 SPA 对话切换，无需刷新页面。检测到新的会话身份后会立即清除旧会话状态，并只在新会话 DOM 就绪后接受新的 Live 数据；即使新会话 DOM 迟到（慢加载 / React 原地换内容 / root 元素换代），也保证最终自动恢复，无需刷新、无需切换标签页。（见下文「Route Lifecycle」）
 
 ---
 
@@ -414,14 +414,19 @@ scrollAnchor / 几何层外，任何模块出现滚动写入即测试失败。
 
 ## Route Lifecycle（会话路由生命周期）
 
-TurnRail 在不刷新页面的前提下跟随 ChatGPT 的 SPA 会话切换。三条产品不变量
+TurnRail 在不刷新页面的前提下跟随 ChatGPT 的 SPA 会话切换。五条产品不变量
 （由 `src/content/bootstrap.ts` 的两阶段实现与测试合同共同强制）：
 
 ```text
 ROUTE_IDENTITY_CHANGED   →  OLD_STATE_INVALID_IMMEDIATELY
 NEW_LIVE_DATA            →  ONLY_AFTER_DOM_READY
 STALE_ASYNC_WORK         →  NEVER_MUTATES_NEW_CONVERSATION
+VALID_NEW_DOM_APPEARS    →  TRANSITION_EVENTUALLY_READY
+TRANSITION_RECOVERY      →  OBSERVE_ONLY（不滚动 / 不解析正文 / 不 Health / 不 Handoff）
 ```
+
+两条 Phase B 语义合并成一句：**绝不接受旧会话 DOM，但新会话 DOM 一旦出现
+绝不永久等待**（fast → slow 可以，fast → dead 禁止）。
 
 **为什么不能靠 history monkey patch**：content script 运行在 Chrome 扩展的
 ISOLATED world，ChatGPT 页面（MAIN world）调用 `history.pushState` 不会经过
@@ -440,10 +445,36 @@ Store / UI / Health / History 状态 / Handoff 预览，Handoff 入口按新会�
 `src/content/conversationTransition.ts` 用廉价 DOM 签名（root 身份 + 首 / 尾
 turn 稳定 ID，来自 `provider.locateTurnRoots()`，无正文解析）判断新会话内容：
 root 换绑或首 / 尾 turn 变化即就绪；空对话（0 turn）同样适用，绝不等待
-`turnCount > 0`。探测按 0/16/50/100/200/400/800ms 短生命周期退避，耗尽后
-不强把旧 DOM 当新 DOM，转入 focus / visibilitychange / RootWatch 事件恢复；
-期间 UI 保持空目录或缓存目录。就绪后才挂会话 Observer、启动扫描、执行缓存
-调和。就绪后 gate 立即停止，绝不常驻。
+`turnCount > 0`。探测按 0/16/50/100/200/400/800ms 短生命周期退避；耗尽后
+不强把旧 DOM 当新 DOM，也绝不进入永久死等，转入三路并存的恢复
+（全部只做廉价签名探测）：
+
+- **Mutation Wake** —— 仅 transition 存活期间的临时 `document.body`
+  MutationObserver（microtask 合并，一帧至多一次探测），DOM 终于换上新
+  会话时立即就绪；覆盖"root 不消失、仅原地换内容"且无 focus / visibility
+  变化的 late swap 窗口（B28）。ready / 路由再变即退订，绝不常驻；
+- **低频 Recovery Poll**（1500ms，仅 transitioning 期间）—— 即使 observer
+  未捕获目标变化也保证最终发现（B30 / B31）；
+- **focus / visibilitychange / RootWatch probeNow** 事件恢复。
+
+期间 UI 保持空目录或缓存目录；transitioning 超过 1.2s 时 footer 显示一次
+低干扰提示"正在同步当前对话…"（超过 10s 换为"尚未完成加载"），ready 立即
+清除。就绪后才挂会话 Observer、启动扫描、执行缓存调和。就绪后 gate 立即
+停止，绝不常驻。
+
+**previous 基线 = Accepted Live Signature**。gate 的就绪判定需要"上一会话"
+签名做对照，但它绝不在 route event 之后临时读取当前 DOM —— DOM 可能先于
+route event 换成新会话（合法顺序），临时读取会得到 previous == current 而
+永久等待。bootstrap 维护 `acceptedDomState`：Phase B 完成（新 DOM 已确认
+属于当前会话）与正常 structure 变化（新增消息 / lazy mount / virtualization）
+时记录快照，route change 时作为 previous 上报并立即失效；缓存 hydrate 不是
+Live 接受，绝不记录。accepted 缺失时按序回退：Store + activeRoot 的已接受
+状态 → gate 最近一次探测读到的签名 → null（仅初始启动）。
+
+**Live Write Identity Guard（防御纵深）**。所有 Live DOM → Store 的写入路径
+（mutation 管道 onDirty / onFullScan、startup scan）在写入前核对三件事：
+Phase B 已完成、root 仍连接、路由身份仍是本轮 reset 时的预期身份。即使未来
+RouteWatcher 时序再变，错会话 DOM 也不能进入 Store。
 
 **路由检测信号**（`src/content/routeWatcher.ts`）：
 
@@ -467,7 +498,11 @@ root 换绑或首 / 尾 turn 变化即就绪；空对话（0 turn）同样适用
 `conversationKey`（即使两个会话修订号巧合相同也不会误复用）。
 
 **DEBUG 诊断**（`__tnDebug.routeLifecycle`，纯元数据，绝不含会话 ID / URL /
-turn ID）：`generation`、`transitioning`、`lastSource`
+turn ID）：`generation`、`transitioning`、`transitionMode`
+（fast / mutation-wait / recovery-poll / ready —— 真实用户报告"侧边栏空"时
+可直接看到卡在哪个恢复阶段）、探测计数（`transitionProbeCount` /
+`recoveryProbeCount` / `mutationWakeCount`）、`acceptedSignaturePresent`
+（boolean，是否存在已接受的 Live 基线）、`lastSource`
 （navigation-api / popstate / poll / focus / visibility）、`lastReadyMs`，
 以及信号计数（`navigationApiSignals` / `pollSignals` / `transitions` 等，
 用于确认真实使用中切换主要来自事件路径而非轮询）。
@@ -520,7 +555,7 @@ Debug 指标：`localStorage.setItem('tn-debug','1')` 后查看 `__tnDebug.perfo
   coverage 保持 partial；Health 在低覆盖时显示低置信度并收敛建议强度。
   需要完整历史时点击「加载全部历史」（唯一被授权的滚动加载）。
   被动收获的完整正文只存在于页面内存，刷新页面后需随浏览重新收获（隐私设计，
-  完整正文不入长期缓存）；"已补全"仅表示已确认到达当前会话视觉顶部，
+  完整正文不入长期缓存）；"已到顶"仅表示已确认到达当前会话视觉顶部，
   绝不表示模型 context / 服务端数据完整。
 - 导航缓存只让"已见过的 turn"提前可见：缓存无法凭空提供未加载过的历史；partial 缓存在发现更多 turn 前保持 partial。
 - 缓存的分支 / edit / regenerate 行为是 best-effort：Live 与缓存零重叠（判定为另一分支）时丢弃缓存 turn 并以 Live 重建。
@@ -568,7 +603,11 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   主路径 / 轮询兜底 / popstate / 多信号严格去重 / 同会话 query 不重置 / A↔B 身份
   判定 / cleanup / focus / visibility 恢复探测）与 `test/unit/conversationTransition.test.ts`
   （旧/新签名就绪判定、root 复用原地换内容、空对话、退避耗尽不强认旧 DOM、
-  probeNow、stop 后零探测、廉价签名合同）。
+  probeNow、stop 后零探测、廉价签名合同）；最终确定性恢复增量：TR1–TR5
+  （fast 耗尽 → recovery poll 武装 / recovery 交付 / Mutation Wake 就绪 /
+  stop 全清理 / 路由替换后旧 gate 零迟到触发）、生产 Mutation Wake 合并语义、
+  AS1/AS1b（accepted 快照 —— DOM 先于 route event 换代时 previous 仍取已接受
+  签名；same-root 原地换代判定）。
 - `test/browser/`：Playwright 浏览器冒烟测试，直接自动化下列既有测试资产（无需登录 ChatGPT）。
   v1.2.3 增量：console 分类统计（production 0 warn / 0 error；DEBUG 无 warning 级
   invalidated 输出、console.debug lifecycle 恰 1 条）、storage 调用计数断言
@@ -583,7 +622,7 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   缓存 preview 目录"仅预览"标记 → 自然升级 full → Health 覆盖度感知（文本相同时也重算）、
   manual capture busy UI / 恢复阅读位置、源码级 BACKGROUND_TASK_MUST_NOT_SCROLL 合同
   （`test/unit/passiveHistory.test.ts`）。
-  Route Lifecycle 增量：`test/browser/route.spec.ts`（B19–B27）——
+  Route Lifecycle 增量：`test/browser/route.spec.ts`（B19–B31）——
   B19 原生 `History.prototype` 导航（绕过任何实例 wrapper，等价 ISOLATED vs MAIN
   world 的真实导航方式）由 Navigation API 事件路径同步（断言 `lastSource`，轮询
   无法蒙混）、B20 URL 先行 / DOM 延迟 300ms 期间 Store 为空且不把旧 DOM 扫进新
@@ -591,10 +630,16 @@ npm run test:browser # Playwright 浏览器冒烟测试（Chromium；首次需 n
   B23 同会话 query/hash 变化零重置（generation / Health / fullScans 不动）、
   B24 新聊天首条消息 `/ → /c/<id>` 免刷新切换且 Observer 正确重绑、B25 后退 /
   前进正确跟随、B26 迟到 cache read 被 generation 守卫丢弃（A 缓存只在切回 A 时
-  恢复）、B27 reachedTop 不跨会话残留且 B 重新确认到顶；外加 routeLifecycle
+  恢复）、B27 reachedTop 不跨会话残留且 B 重新确认到顶；最终确定性恢复增量：
+  B28 late same-root swap（DOM 在 fast 窗口后 2.5s 才原地换 B，零交互自动恢复）、
+  B29 DOM 先换 / route event 后到（previous 取 accepted A 签名，立即就绪）、
+  B30 旧 root 保留 >2s 后移除并插入全新 root（wake / recovery 识别 root 换代）、
+  B31 DOM 延迟 4.5s 超 fast 窗口（不 focus / 不切 tab，transitioning 最终必然
+  false + 低干扰 footer 提示出现与清除）；外加 routeLifecycle
   隐私合同（元数据不含会话 ID / URL）与全流程零错误、零后台滚动。
   测试台：`test/mock/route.html`（确定性 turn id、chrome.storage 内存模拟、
-  native / wrapped / 延迟 DOM / root 复用 / 同会话 query / popstate 重建等路由动作）。
+  native / wrapped / 延迟 DOM / 迟到原地换 / DOM 先换 / root 元素换代 /
+  root 复用 / 同会话 query / popstate 重建等路由动作）。
 - `test/fixture/index.html`：按真实 DOM 构建的最小 fixture，断言
   `turns.length === 1`、`turn.id === user-id-1`、`turn.user.text === "Hello"`、
   `turn.assistant.id === assistant-id-1`、`turn.assistant.text === "Hi"` 等 6 项。
