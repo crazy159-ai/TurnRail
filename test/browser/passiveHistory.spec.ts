@@ -164,7 +164,7 @@ test('P5 - 被动收获：用户自己滚旧历史 → 索引增长；自然到�
     .poll(async () => (await readDebug(page)).historyCoverage?.reachedTop, { timeout: 15_000 })
     .toBe(true)
   expect((await readDebug(page)).historyCoverage?.state).toBe('complete')
-  expect(await page.locator('.tn-history-status').textContent()).toBe('历史 40 · 已补全')
+  expect(await page.locator('.tn-history-status').textContent()).toBe('历史 40 · 已到顶')
 
   const errCount = await page.evaluate(() => (globalThis as any).__tnErrCount ?? 0)
   expect(errCount).toBe(0)

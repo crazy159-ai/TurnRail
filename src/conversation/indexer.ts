@@ -497,7 +497,7 @@ export class ConversationIndexer {
     store.commit(kind)
     // 混合变更封板（规格 #36）：非 structure 主事件与 coverage 升级同批时，
     // 主事件不推进 coverageRevision（如 user-text + preview→full 同时发生）——
-    // 补推一次 coverage，保证覆盖修订号与"历史 N · 部分/已补全"footer 不被吞掉
+    // 补推一次 coverage，保证覆盖修订号与"历史 N · 部分/已到顶"footer 不被吞掉
     if (kind !== 'structure' && kind !== 'coverage' && coverageChanged) {
       store.commit('coverage')
     }

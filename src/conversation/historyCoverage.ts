@@ -47,7 +47,9 @@ export function computeHistoryCoverage(
   else state = 'partial'
 
   return {
-    indexedTurns: store.turns.length,
+    // History 计数 == Outline 问题数（user turn 数，非全部 turn）：
+    // assistant-only turn 不构成目录条目，也不该计入"历史 N"
+    indexedTurns: userTurns.length,
     fullUserTurns: userTurns.length - previewUserTurns,
     previewUserTurns,
     fullAssistantTurns,
@@ -60,6 +62,8 @@ export function computeHistoryCoverage(
 /** 静态覆盖状态 → footer 低干扰文案（无正文；unknown / 空会话返回空串隐藏） */
 export function historyCoverageLabel(coverage: HistoryCoverage): string {
   if (coverage.indexedTurns === 0 || coverage.state === 'unknown') return ''
-  const suffix = coverage.state === 'complete' ? '已补全' : '部分'
+  // complete 语义 = 已确认到达当前会话视觉顶部（reachedTop），
+  // 不声称"所有正文已补全"（preview 补全仍可经自然浏览继续发生）
+  const suffix = coverage.state === 'complete' ? '已到顶' : '部分'
   return `历史 ${coverage.indexedTurns} · ${suffix}`
 }

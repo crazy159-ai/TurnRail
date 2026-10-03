@@ -193,7 +193,7 @@ test('coverage: historyCoverageLabel 静态低干扰文案', () => {
   const indexer = new ConversationIndexer(fakeProvider([turn]), store)
   indexer.scan()
   assert.equal(historyCoverageLabel(computeHistoryCoverage(store, false)), '历史 1 · 部分')
-  assert.equal(historyCoverageLabel(computeHistoryCoverage(store, true)), '历史 1 · 已补全')
+  assert.equal(historyCoverageLabel(computeHistoryCoverage(store, true)), '历史 1 · 已到顶')
 })
 
 test('coverageRevision: coverage 事件推进、semanticRevision 不动；structure 双推进', () => {
