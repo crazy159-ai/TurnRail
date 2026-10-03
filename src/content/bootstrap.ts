@@ -13,7 +13,7 @@ import { isRecoverRunning, recoverAndJump, getRecoverLog } from '../navigation/r
 import { createNavigationUi } from '../ui/createShadowRoot'
 import { watchConversationRoot, observeConversationTurns } from './observers'
 import { createRouteWatcher, type RouteChange, type RouteChangeSource } from './routeWatcher'
-import { readRouteIdentity } from './routeIdentity'
+import { readRouteIdentity, routeIdentityKey } from './routeIdentity'
 import {
   beginConversationTransition,
   createAcceptedDomState,
@@ -509,6 +509,33 @@ export function bootstrap(): void {
   /** streaming / 流式输出导致的布局漂移 → 去抖 geometry refresh（不触发索引） */
   const debouncedSpyRefresh = debounce(() => spy.refresh(), 300)
 
+  // ---------- Live Write Identity Guard（防御纵深，规格 #19-#22） ----------
+  // RouteWatcher 已经很快，但所有 Live DOM → Store 的写入路径仍加最后一道门：
+  // 即使未来时序再变，错会话 DOM 也绝不能进入 Store。全部为 O(1) 检查。
+  /** 本轮路由 reset 时的身份 key；写入守卫据此核对"身份未被再次切换" */
+  let expectedRouteKey: string | null = null
+
+  function isExpectedRouteStillCurrent(): boolean {
+    return (
+      expectedRouteKey !== null &&
+      routeIdentityKey(readRouteIdentity(() => provider.getConversationId())) ===
+        expectedRouteKey
+    )
+  }
+
+  /**
+   * Live DOM 已确认可接受：Phase B 完成 + root 仍连接 + 路由身份仍是本轮预期。
+   * 三条同时成立才允许 indexer 写入（onDirty / onFullScan / startup scan 共用）。
+   */
+  function isLiveDomAccepted(): boolean {
+    return (
+      transitionReadyDone &&
+      activeRoot !== null &&
+      activeRoot.isConnected &&
+      isExpectedRouteStillCurrent()
+    )
+  }
+
   // selector 由 Provider 下发（bootstrap 不 import 站点 SELECTORS，边界见 Provider 契约）
   const mutationHints = provider.getMutationHints()
 
@@ -535,12 +562,13 @@ export function bootstrap(): void {
     },
     {
       onDirty: (roots) => {
-        // root 已断连（路由切换窗口内的迟到回调）→ 丢弃，防止 A 会话数据写入 B Store（#12/#67）
-        if (!activeRoot?.isConnected) return
+        // root 已断连（路由切换窗口内的迟到回调）→ 丢弃；路由身份已再变 → 同样丢弃，
+        // 防止 A 会话数据写入 B Store（#12/#67 + Live Write Identity Guard）
+        if (!isLiveDomAccepted()) return
         indexer.scanDirty(roots)
       },
       onFullScan: () => {
-        if (!activeRoot?.isConnected) return
+        if (!isLiveDomAccepted()) return
         indexer.scan(true)
       },
       onAssistantStream: () => {
@@ -599,6 +627,8 @@ export function bootstrap(): void {
     let deferHandle: number | null = window.setTimeout(() => {
       deferHandle = null
       if (gen !== conversationGeneration) return
+      // Live Write Identity Guard：路由身份已再变（迟到的宏任务）→ 绝不扫描
+      if (!isLiveDomAccepted()) return
       topWatch.watch()
       indexer.scan(true)
       if (provider.lastLocatedCount > 0) {
@@ -607,7 +637,7 @@ export function bootstrap(): void {
       }
       stabilityStop = startStartupScan({
         scan: () => {
-          if (gen !== conversationGeneration) return null
+          if (gen !== conversationGeneration || !isLiveDomAccepted()) return null
           indexer.scan()
           if (provider.lastLocatedCount > 0) perf.markFirstLiveScan()
           return { turnCount: store.turns.length, lastTurnId: store.turns[store.turns.length - 1]?.id }
@@ -947,6 +977,8 @@ export function bootstrap(): void {
     const previousSignature = change === null ? null : snapshotPreviousDomState()
     acceptedDomState.invalidate()
     const isReady = isPhaseBDomReady(identity, previousSignature)
+    // Live Write Identity Guard 的本轮预期身份（写入路径核对用）
+    expectedRouteKey = routeIdentityKey(identity)
 
     // ---------- Phase A — Identity transition：旧状态立即失效（规格 #17） ----------
     // 先 flush 旧会话的待写缓存：必须在 store.reset 之前序列化旧数据
