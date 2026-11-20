@@ -313,6 +313,8 @@ node scripts/serve-test-pages.mjs   # 在项目根目录，默认 http://127.0.0
 真实页面验收：控制台执行 `localStorage.setItem('tn-debug','1')` 并刷新，检查 `__tnDebug`：
 `conversationRoot > 0`、`turnRoots > 0`、`userUnits > 0`、`storeTurns > 0`、`markers > 0`。
 
+bot test
+
 已验证：fixture 6 项断言、12/162 轮索引与唯一性、点击跳转（目标为 userUnit）、滚动高亮
 （含顶/底边界）、hover 面板、搜索过滤、会话切换重建、首页/空会话隐藏、流式输出零重建、
 虚拟化卸载（153 个"未加载"标记保留）+ 未挂载目标恢复跳转（恢复日志 found=true）、
